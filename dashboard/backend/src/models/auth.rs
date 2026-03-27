@@ -110,7 +110,54 @@ pub struct AuthResponseInfo {
 }
 
 #[derive(Debug, Serialize, Deserialize, Clone)]
-
 pub struct AuthQueryInfo {
     pub user_id: ObjectId,
+}
+
+
+#[derive(Debug, Serialize, Deserialize, Clone)]
+pub struct AuthBindQRCodeResponse {
+    pub secret_id: ObjectId,
+    pub qr_url: String,
+}
+
+
+#[derive(Debug, Clone)]
+pub struct AuthTempSecret {
+    pub id: ObjectId,
+    pub secret: String,
+}
+
+
+#[derive(Debug, Clone)]
+pub struct AuthVerifyTOTP {
+    pub username: String,
+    pub totp: String,
+    pub verify_type: AuthVerifyTOTPType,
+    pub addr: String,
+}
+
+impl AuthVerifyTOTP {
+    pub fn new(username: impl Into<String>, totp: impl Into<String>, verify_type: AuthVerifyTOTPType, addr: impl Into<String>) -> Self {
+        Self {
+            username: username.into(),
+            totp: totp.into(),
+            verify_type,
+            addr: addr.into(),
+        }
+    }
+}
+
+
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum AuthVerifyTOTPType {
+    Login,
+    WantBind,
+}
+
+#[derive(Debug, Serialize, Deserialize, Clone)]
+pub struct AuthToVerifyBindQRCodePostBody {
+    pub totp: String,
+    pub id: ObjectId
 }

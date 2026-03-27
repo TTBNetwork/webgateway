@@ -11,19 +11,17 @@ use axum::{
 use shared::database::get_database;
 
 use crate::{
-    database::auth::Authentication,
-    foundation::RemoteAddr,
-    models::{
-        auth::{AuthJWTInfoExtract, AuthPostBody, AuthQueryInfo, AuthResponse, AuthResponseInfo, AuthToBindQRCodePostBody},
+    auth::{bind::{generate_random_to_key, get_secret_from_key, remove_key}, totp::get_totp_url}, database::{auth::Authentication, log::WebLogManager}, foundation::RemoteAddr, models::{
+        auth::{AuthBindQRCodeResponse, AuthJWTInfoExtract, AuthPostBody, AuthQueryInfo, AuthResponse, AuthResponseInfo, AuthToBindQRCodePostBody, AuthToVerifyBindQRCodePostBody, AuthVerifyTOTP},
         log::LogAddr,
-    },
-    response::APIResponse,
+    }, response::APIResponse
 };
 
 // use totp give a token
 mod foundation;
 mod jwt;
 mod totp;
+mod bind;
 
 pub use foundation::{DEFAULT_ADMIN_USERNAME, generate_random_secret};
 pub use jwt::{get_user_info_from_verify_jwt, sign_jwt};
@@ -51,7 +49,7 @@ async fn inner_login(body: AuthPostBody, addr: &LogAddr) -> APIResponse<AuthResp
         return APIResponse::error(None, 401, "Invalid username or totp code");
     }
     match get_database()
-        .verify_totp(&body.username, &body.totp, addr)
+        .verify_totp(AuthVerifyTOTP { username:body.username.clone(), totp: body.totp, verify_type: crate::models::auth::AuthVerifyTOTPType::Login, addr: addr.0.clone() })
         .await
     {
         Ok(true) => match sign_jwt(&body.username).await {
@@ -122,21 +120,92 @@ pub async fn get_bind_qrcode(
     AuthJWTInfoExtract(info): AuthJWTInfoExtract,
     RemoteAddr(addr): RemoteAddr,
     Json(body): Json<AuthToBindQRCodePostBody>,
-) -> APIResponse<()> {
-    // let res = get_database()
-    //     .bind_totp(&info.user.username, &body.secret, &LogAddr::from(addr))
-    //     .await;
-    // match res {
-    //     Ok(_) => APIResponse::ok(()),
-    //     Err(e) => APIResponse::error(None, 500, e.to_string()),
-    // }
+) -> APIResponse<AuthBindQRCodeResponse> {
+    // verify totp
+    if body.totp.trim().is_empty() {
+        return APIResponse::error(None, 401, "Invalid TOTP code");
+    }
 
-    APIResponse::ok(())
+    match get_database().verify_totp(AuthVerifyTOTP {
+        username: info.user.username.clone(),
+        totp: body.totp,
+        verify_type: crate::models::auth::AuthVerifyTOTPType::WantBind,
+        addr: addr.to_string(),
+    })
+    .await
+    {
+        Ok(true) => {},
+        Ok(false) => return APIResponse::error(None, 401, "Invalid TOTP code"),
+        Err(e) => return APIResponse::error(None, 500, e.to_string())
+    }
+
+    let secret = generate_random_to_key();
+    let url = match get_totp_url(info.user.username, secret.secret) {
+        Ok(res) => res,
+        Err(e) => return APIResponse::error(None, 500, e.to_string()),
+    };
+
+    let _ = get_database()
+            .add_web_log(
+                &info.user.id,
+                &crate::models::log::LogContent::Raw(
+                    "auth.user.totp.bind.want.qr_code".to_string(),
+                ),
+                &LogAddr(addr.to_string()),
+            )
+            .await;
+
+    APIResponse::ok(AuthBindQRCodeResponse {
+        secret_id: secret.id,
+        qr_url: url   
+    })
+}
+
+pub async fn verify_bind_qrcode(
+    AuthJWTInfoExtract(info): AuthJWTInfoExtract,
+    RemoteAddr(addr): RemoteAddr,
+    Json(body): Json<AuthToVerifyBindQRCodePostBody>,
+) -> APIResponse<()> {
+    if body.totp.trim().is_empty() {
+        return APIResponse::error(None, 401, "Invalid TOTP code");
+    }
+    let secret = match get_secret_from_key(body.id) {
+        Some(res) => res,
+        None => return APIResponse::error(None, 404, "Secret not found"),
+    };
+
+    let totp_code = match get_totp_code(info.user.username, secret.as_str()) {
+        Ok(res) => res,
+        Err(e) => return APIResponse::error(None, 500, e.to_string()),
+    };
+
+    let result = totp_code.eq(&body.totp);
+    let _ = get_database().add_web_log(&info.user.id, &crate::models::log::LogContent::Raw(
+        format!("auth.user.totp.bind.verify.qr_code.{}", match result {
+            true => "success",
+            false => "fail",
+        })
+    ), &LogAddr(addr.to_string())).await;
+    match result {
+        true => {
+            let r = get_database()
+                .add_client_secret(&info.user.id, secret)
+                .await;
+            if r.is_ok() {
+                remove_key(body.id);
+            }
+            APIResponse::result(r)
+        }
+        false => APIResponse::error(None, 401, "Invalid TOTP code"),
+    }
 }
 
 pub fn get_router() -> Router {
     Router::new()
         .route("/login", post(login))
         .route("/info", get(get_userinfo))
+        .route("/totp/qrcode/get", post(get_bind_qrcode))
+        .route("/totp/qrcode/verify", post(verify_bind_qrcode))
+        .route("/refresh", get(refresh_token))
         .route("/", get(info))
 }
