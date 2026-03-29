@@ -5,6 +5,7 @@ import Switchbar from '../../components/Switchbar.vue';
 import { pushQuery } from '../../constant';
 import { computed } from 'vue';
 import Log from './settings/Log.vue';
+import Console from './settings/Console.vue';
 const options = [
     {
         text: '控制台管理',
@@ -28,5 +29,8 @@ const query = computed(() => useRoute().query);
     </Panel>
     <div v-if="query?.tab == 'log'">
         <Log></Log>
+    </div>
+    <div v-if="query?.tab == 'console'">
+        <Console />
     </div>
 </template>

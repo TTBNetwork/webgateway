@@ -1,0 +1,9 @@
+#!/bin/bash
+current_dir=$(basename "$PWD")
+
+if [[ "$current_dir" == "dev" ]]; then
+    cd ..
+fi
+cd mnt
+
+cargo run

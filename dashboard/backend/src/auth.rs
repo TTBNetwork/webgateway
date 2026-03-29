@@ -12,7 +12,7 @@ use shared::database::get_database;
 
 use crate::{
     auth::{bind::{generate_random_to_key, get_secret_from_key, remove_key}, totp::get_totp_url}, database::{auth::Authentication, log::WebLogManager}, foundation::RemoteAddr, models::{
-        auth::{AuthBindQRCodeResponse, AuthJWTInfoExtract, AuthPostBody, AuthQueryInfo, AuthResponse, AuthResponseInfo, AuthToBindQRCodePostBody, AuthToVerifyBindQRCodePostBody, AuthVerifyTOTP},
+        auth::{AuthBindQRCodeResponse, AuthJWTInfoExtract, AuthPostBody, AuthQueryInfo, AuthResponse, AuthInfo, AuthToBindQRCodePostBody, AuthToVerifyBindQRCodePostBody, AuthVerifyTOTP},
         log::LogAddr,
     }, response::APIResponse
 };
@@ -61,27 +61,17 @@ async fn inner_login(body: AuthPostBody, addr: &LogAddr) -> APIResponse<AuthResp
     }
 }
 
-pub async fn info(AuthJWTInfoExtract(info): AuthJWTInfoExtract) -> APIResponse<AuthResponseInfo> {
-    APIResponse::ok(AuthResponseInfo {
-        id: info.user.id,
-        username: info.user.username,
-        created_at: info.user.created_at,
-        updated_at: info.user.updated_at,
-    })
+pub async fn info(AuthJWTInfoExtract(info): AuthJWTInfoExtract) -> APIResponse<AuthInfo> {
+    APIResponse::ok(AuthInfo::from(info.user))
 }
 
 pub async fn get_userinfo(
     AuthJWTInfoExtract(_): AuthJWTInfoExtract,
     Query(info): Query<AuthQueryInfo>,
-) -> APIResponse<AuthResponseInfo> {
+) -> APIResponse<AuthInfo> {
     let user = get_database().get_user_from_id(&info.user_id).await;
     match user {
-        Ok(user) => APIResponse::ok(AuthResponseInfo {
-            id: user.id,
-            username: user.username,
-            created_at: user.created_at,
-            updated_at: user.updated_at,
-        }),
+        Ok(user) => APIResponse::ok(AuthInfo::from(user)),
         Err(_) => APIResponse::error(None, 404, "User not found"),
     }
 }
@@ -200,6 +190,12 @@ pub async fn verify_bind_qrcode(
     }
 }
 
+async fn all_users(
+    AuthJWTInfoExtract(_): AuthJWTInfoExtract,
+) -> APIResponse<Vec<AuthInfo>> {
+    APIResponse::result(get_database().get_info_of_users().await)
+}
+
 pub fn get_router() -> Router {
     Router::new()
         .route("/login", post(login))
@@ -207,5 +203,6 @@ pub fn get_router() -> Router {
         .route("/totp/qrcode/get", post(get_bind_qrcode))
         .route("/totp/qrcode/verify", post(verify_bind_qrcode))
         .route("/refresh", get(refresh_token))
+        .route("/users", get(all_users))
         .route("/", get(info))
 }

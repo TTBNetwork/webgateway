@@ -1,7 +1,7 @@
 use crate::{
     auth::{DEFAULT_ADMIN_USERNAME, generate_random_secret, get_totp_code},
     database::log::WebLogManager,
-    models::{auth::{AuthVerifyTOTP, AuthVerifyTOTPType, DatabaseAuthentication}, log::LogAddr},
+    models::{auth::{AuthVerifyTOTP, AuthVerifyTOTPType, DatabaseAuthentication, AuthInfo}, log::LogAddr},
 };
 use anyhow::{Result, anyhow};
 use shared::{
@@ -12,7 +12,6 @@ use sqlx::FromRow;
 use tracing::{self, Level, event};
 
 /// 用户表的所有列名，用于查询时复用
-const USER_COLUMNS: &str = "id, username, totp_secret, jwt_secret, created_at, updated_at, last_login, last_ip, addresses, bound";
 
 #[async_trait::async_trait]
 pub trait Authentication {
@@ -29,6 +28,7 @@ pub trait Authentication {
     async fn get_user_from_id(&self, id: &ObjectId) -> Result<DatabaseAuthentication>;
     async fn get_user_all_secrets(&self, id: &ObjectId) -> Result<Vec<String>>;
     async fn add_client_secret(&self, id: &ObjectId, secret: impl Into<String> + Send) -> Result<()>;
+    async fn get_info_of_users(&self) -> Result<Vec<AuthInfo>>;
 }
 
 const INIT_SQL: &str = r#"
@@ -56,6 +56,14 @@ CREATE TABLE IF NOT EXISTS users_client_secrets (
 CREATE UNIQUE INDEX IF NOT EXISTS users_username_idx ON users (LOWER(username));
 CREATE INDEX IF NOT EXISTS users_client_secrets_user_id_idx ON users_client_secrets (user_id);
 CREATE INDEX IF NOT EXISTS users_client_secrets_secret_idx ON users_client_secrets (secret);
+
+CREATE OR REPLACE VIEW users_info AS
+SELECT
+    id, username, totp_secret, jwt_secret,
+    created_at, updated_at, last_login, last_ip, addresses,
+    (SELECT COUNT(*) FROM users_client_secrets WHERE user_id = users.id) AS client_secrets_count,
+    EXISTS (SELECT 1 FROM users_client_secrets cs WHERE cs.user_id = users.id) AS bound_totp
+FROM users;
 "#;
 
 #[async_trait::async_trait]
@@ -111,13 +119,10 @@ impl Authentication for Database {
     }
 
     async fn get_user(&self, username: &str) -> Result<DatabaseAuthentication> {
-        let row = sqlx::query(&format!(
-            r#"
-            SELECT {} FROM users
+        let row = sqlx::query(r#"
+            SELECT * FROM users_info
             WHERE LOWER(username) = LOWER($1)
-            "#,
-            USER_COLUMNS
-        ))
+            "#)
         .bind(username)
         .fetch_optional(&self.pool)
         .await?
@@ -127,14 +132,11 @@ impl Authentication for Database {
     }
 
     async fn get_first_user(&self) -> Result<DatabaseAuthentication> {
-        let row = sqlx::query(&format!(
-            r#"
-            SELECT {} FROM users
+        let row = sqlx::query(r#"
+            SELECT * FROM users_info
             ORDER BY created_at ASC
             LIMIT 1
-            "#,
-            USER_COLUMNS
-        ))
+            "#)
         .fetch_optional(&self.pool)
         .await?
         .ok_or_else(|| anyhow!("No users found"))?;
@@ -148,14 +150,20 @@ impl Authentication for Database {
         let addr = LogAddr(auth.addr.to_string());
         let user = match self.get_user(username).await {
             Ok(user) => user,
-            Err(_) => return Ok(false), // 用户不存在视为验证失败
+            Err(e) => return {
+                event!(Level::ERROR, "Failed to get user '{}': {}", username, e);
+                Ok(false)
+            }, // 用户不存在视为验证失败
         };
 
         // lianjie
         let client_secrets = self.get_user_all_secrets(&user.id).await?;
-        let secrets = [user.totp_secret.clone()].iter().cloned().chain(client_secrets).collect::<Vec<_>>();
+        let mut secrets = vec![user.totp_secret.clone()];
+        if auth.verify_type == AuthVerifyTOTPType::Login {
+            secrets.extend(client_secrets);
+        }
         for secret in secrets {
-            if get_totp_code(username, secret)?.eq(totp) {
+            if  get_totp_code(username, secret)?.eq(totp) {
                 get_database()
                     .add_web_log(
                         &user.id,
@@ -186,13 +194,10 @@ impl Authentication for Database {
     }
 
     async fn get_user_from_id(&self, user_id: &ObjectId) -> Result<DatabaseAuthentication> {
-        let row = sqlx::query(&format!(
-            r#"
-            SELECT {} FROM users
+        let row = sqlx::query(r#"
+            SELECT * FROM users_info
             WHERE id = $1
-            "#,
-            USER_COLUMNS
-        ))
+            "#)
         .bind(user_id)
         .fetch_optional(&self.pool)
         .await?
@@ -227,5 +232,18 @@ impl Authentication for Database {
         .await?;
 
         Ok(())
+    }
+
+    async fn get_info_of_users(&self) -> Result<Vec<AuthInfo>> {
+        let rows = sqlx::query_as::<_, AuthInfo>(
+            r#"
+            SELECT 
+                *
+            FROM users_info
+            "#
+        ).fetch_all(&self.pool)
+        .await?;
+
+        Ok(rows)
     }
 }

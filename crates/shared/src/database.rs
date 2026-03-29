@@ -195,14 +195,6 @@ pub async fn init_database(url: &str, max_connections: u32) -> anyhow::Result<()
                     e
                 );
             }
-            // for _ in 0..10 {
-            //     let db_time = get_database().get_database_time().unwrap();
-            //     let current_time = Utc::now();
-            //     event!(tracing::Level::INFO, "Database time is {}", db_time);
-            //     event!(tracing::Level::INFO, "time is {}", current_time);
-            //     event!(tracing::Level::INFO, "time offset is {:?}", (db_time - current_time).abs());
-            //     tokio::time::sleep(tokio::time::Duration::from_secs(1)).await;
-            // }
             tokio::time::sleep(tokio::time::Duration::from_secs(10)).await;
         }
     });

@@ -45,7 +45,19 @@ pub struct DatabaseAuthentication {
     pub last_login: Option<DateTime<Utc>>,
     pub last_ip: Option<String>,
     pub addresses: Vec<String>,
-    pub bound: bool,
+    pub bound_totp: bool,
+}
+
+impl From<DatabaseAuthentication> for AuthInfo {
+    fn from(auth: DatabaseAuthentication) -> Self {
+        Self {
+            id: auth.id,
+            username: auth.username,
+            created_at: auth.created_at,
+            updated_at: auth.updated_at,
+            bound_totp: auth.bound_totp,
+        }
+    }
 }
 
 impl<'r> FromRow<'r, PgRow> for DatabaseAuthentication {
@@ -59,8 +71,8 @@ impl<'r> FromRow<'r, PgRow> for DatabaseAuthentication {
             last_login: row.try_get("last_login")?,
             last_ip: row.try_get("last_ip")?,
             addresses: row.try_get("addresses")?,
-            bound: row.try_get("bound")?,
             jwt_secret: row.try_get("jwt_secret")?,
+            bound_totp: row.try_get("bound_totp")?,
         })
     }
 }
@@ -102,12 +114,26 @@ where
 }
 
 #[derive(Debug, Serialize, Deserialize, Clone)]
-pub struct AuthResponseInfo {
+pub struct AuthInfo {
     pub id: ObjectId,
     pub username: String,
     pub created_at: DateTime<Utc>,
     pub updated_at: DateTime<Utc>,
+    pub bound_totp: bool,
 }
+
+impl<'r> FromRow<'r, PgRow> for AuthInfo {
+    fn from_row(row: &'r PgRow) -> std::result::Result<Self, sqlx::Error> {
+        Ok(Self {
+            id: row.try_get("id")?,
+            username: row.try_get("username")?,
+            created_at: row.try_get("created_at")?,
+            updated_at: row.try_get("updated_at")?,
+            bound_totp: row.try_get("bound_totp")?,
+        })
+    }
+}
+
 
 #[derive(Debug, Serialize, Deserialize, Clone)]
 pub struct AuthQueryInfo {

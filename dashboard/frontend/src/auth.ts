@@ -1,6 +1,6 @@
 import { got, router } from './constant';
 import addPresentation from './plugins/presentation';
-import type { APIResponse, AuthResponse } from './types';
+import type { APIResponse, AuthResponse, UserInfo } from './types';
 
 export async function login(username: string, totp: string): Promise<boolean> {
     const response: APIResponse<AuthResponse> = await (
@@ -45,21 +45,39 @@ export async function checkToken(): Promise<boolean> {
         return false;
     }
     try {
-        const resp = (await (
-            await got.get('auth', {
-                headers: {
-                    Authorization: `Bearer ${getLocalToken()?.token}`,
-                },
-            })
-        ).json()) as APIResponse;
-        return resp.status == 200;
+        await info();
+        return true;
     } catch (e) {
         localStorage.removeItem('token');
         return false;
     }
 }
 
+export async function info(): Promise<UserInfo> {
+    const resp = (await (
+        await got.get('auth', {
+            headers: {
+                Authorization: `Bearer ${getLocalToken()?.token}`,
+            },
+        })
+    ).json()) as APIResponse<UserInfo>;
+    if (resp.status == 200) {
+        return resp.data;
+    }
+    throw new Error(resp.message);
+}
+
 export async function logout() {
     localStorage.removeItem('token');
     router.push('/login');
+}
+
+export async function getAllUsers() {
+    return (await (
+        await got.get('auth/users', {
+            headers: {
+                Authorization: `Bearer ${getLocalToken()?.token}`,
+            },
+        })
+    ).json()) as APIResponse<UserInfo[]>;
 }
