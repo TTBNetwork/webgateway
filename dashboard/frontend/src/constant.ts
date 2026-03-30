@@ -104,6 +104,7 @@ router.beforeEach(async (to, _, next) => {
 
 export function pushQuery(query: Record<string, any>) {
     router.push({
+        path: router.currentRoute.value.path,
         query: {
             ...router.currentRoute.value.query,
             ...query,

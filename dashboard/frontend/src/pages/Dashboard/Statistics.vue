@@ -6,7 +6,7 @@ import { pushQuery } from '../../constant';
 import { computed } from 'vue';
 import Metrics from './statistics/metrics.vue';
 import QPS from './statistics/QPS.vue';
-import { get_access_map } from '../../apis/access';
+// import { get_access_map } from '../../apis/access';
 // import AccessMap from './statistics/AccessMap.vue';
 // import AccessStatistics from './statistics/AccessStatistics.vue';
 const options = [
@@ -24,7 +24,7 @@ const options = [
     },
 ];
 const query = computed(() => useRoute().query);
-get_access_map(1, 'china');
+// get_access_map(1, 'china');
 </script>
 
 <template>
