@@ -10,7 +10,7 @@ export interface Presentation {
     id: symbol;
 }
 
-const defaultFadeOut = 5000;
+const defaultFadeOut = 500000;
 
 export const presentations = ref<Presentation[]>([]);
 export function addPresentation(

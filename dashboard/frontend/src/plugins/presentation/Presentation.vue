@@ -77,6 +77,7 @@ import { presentations, removePresentation } from './index';
     transition: box-shadow 300ms cubic-bezier(0.4, 0, 0.2, 1);
     border-radius: 4px;
     padding: 6px 16px;
+    align-items: center;
 }
 .alert .icon {
     color: rgb(255, 77, 79);
@@ -99,7 +100,7 @@ import { presentations, removePresentation } from './index';
     transition: fill 200ms cubic-bezier(0.4, 0, 0.2, 1);
 }
 .text {
-    padding: 8px 0px;
+    padding: 6px 0px;
     min-width: 0px;
     overflow: auto;
 }
