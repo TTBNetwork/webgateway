@@ -20,6 +20,17 @@ pub struct AuthToBindQRCodePostBody {
     pub totp: String,
 }
 
+#[derive(Debug, Serialize, Deserialize, Clone)]
+pub struct AuthToRefreshBindQRCodePostBody {
+    pub secret_id: ObjectId,
+}
+
+#[derive(Debug, Serialize, Deserialize, Clone)]
+pub struct AuthToVerifyBindQRCodePostBody {
+    pub secret_id: ObjectId,
+    pub totp: String,
+}
+
 
 #[derive(Debug, Serialize, Deserialize, Clone)]
 pub struct AuthResponse {
@@ -180,10 +191,4 @@ impl AuthVerifyTOTP {
 pub enum AuthVerifyTOTPType {
     Login,
     WantBind,
-}
-
-#[derive(Debug, Serialize, Deserialize, Clone)]
-pub struct AuthToVerifyBindQRCodePostBody {
-    pub totp: String,
-    pub id: ObjectId
 }

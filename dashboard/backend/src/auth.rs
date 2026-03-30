@@ -11,8 +11,8 @@ use axum::{
 use shared::database::get_database;
 
 use crate::{
-    auth::{bind::{generate_random_to_key, get_secret_from_key, remove_key}, totp::get_totp_url}, database::{auth::Authentication, log::WebLogManager}, foundation::RemoteAddr, models::{
-        auth::{AuthBindQRCodeResponse, AuthJWTInfoExtract, AuthPostBody, AuthQueryInfo, AuthResponse, AuthInfo, AuthToBindQRCodePostBody, AuthToVerifyBindQRCodePostBody, AuthVerifyTOTP},
+    auth::{bind::{generate_random_to_key, get_secret_from_key, refresh, remove_key}, totp::get_totp_url}, database::{auth::Authentication, log::WebLogManager}, foundation::RemoteAddr, models::{
+        auth::{AuthBindQRCodeResponse, AuthInfo, AuthJWTInfoExtract, AuthPostBody, AuthQueryInfo, AuthResponse, AuthToBindQRCodePostBody, AuthToVerifyBindQRCodePostBody, AuthVerifyTOTP, AuthToRefreshBindQRCodePostBody},
         log::LogAddr,
     }, response::APIResponse
 };
@@ -151,6 +151,43 @@ pub async fn get_bind_qrcode(
     })
 }
 
+pub async fn refresh_bind_qrcode(
+    AuthJWTInfoExtract(info): AuthJWTInfoExtract,
+    RemoteAddr(addr): RemoteAddr,
+    Json(body): Json<AuthToRefreshBindQRCodePostBody>,
+) -> APIResponse<AuthBindQRCodeResponse> {
+    let id = body.secret_id;
+    if get_secret_from_key(id).is_none() {
+        return APIResponse::error(None, 403, "Totp is invalid");
+    }
+
+    let secret = match refresh(id) {
+        Ok(secret) => secret,
+        Err(e) => return APIResponse::error(None, 500, e.to_string()),
+    };
+
+    let url = match get_totp_url(info.user.username, secret.secret) {
+        Ok(res) => res,
+        Err(e) => return APIResponse::error(None, 500, e.to_string()),
+    };
+
+    let _ = get_database()
+            .add_web_log(
+                &info.user.id,
+                &crate::models::log::LogContent::Raw(
+                    "auth.user.totp.bind.want.qr_code".to_string(),
+                ),
+                &LogAddr(addr.to_string()),
+            )
+            .await;
+
+    APIResponse::ok(AuthBindQRCodeResponse {
+        secret_id: secret.id,
+        qr_url: url   
+    })
+
+}
+
 pub async fn verify_bind_qrcode(
     AuthJWTInfoExtract(info): AuthJWTInfoExtract,
     RemoteAddr(addr): RemoteAddr,
@@ -159,7 +196,7 @@ pub async fn verify_bind_qrcode(
     if body.totp.trim().is_empty() {
         return APIResponse::error(None, 401, "Invalid TOTP code");
     }
-    let secret = match get_secret_from_key(body.id) {
+    let secret = match get_secret_from_key(body.secret_id) {
         Some(res) => res,
         None => return APIResponse::error(None, 404, "Secret not found"),
     };
@@ -168,7 +205,7 @@ pub async fn verify_bind_qrcode(
         Ok(res) => res,
         Err(e) => return APIResponse::error(None, 500, e.to_string()),
     };
-
+    println!("totp code: {}, {}", totp_code, body.totp);
     let result = totp_code.eq(&body.totp);
     let _ = get_database().add_web_log(&info.user.id, &crate::models::log::LogContent::Raw(
         format!("auth.user.totp.bind.verify.qr_code.{}", match result {
@@ -182,7 +219,7 @@ pub async fn verify_bind_qrcode(
                 .add_client_secret(&info.user.id, secret)
                 .await;
             if r.is_ok() {
-                remove_key(body.id);
+                remove_key(body.secret_id);
             }
             APIResponse::result(r)
         }
@@ -202,6 +239,7 @@ pub fn get_router() -> Router {
         .route("/info", get(get_userinfo))
         .route("/totp/qrcode/get", post(get_bind_qrcode))
         .route("/totp/qrcode/verify", post(verify_bind_qrcode))
+        .route("/totp/qrcode/refresh", post(refresh_bind_qrcode))
         .route("/refresh", get(refresh_token))
         .route("/users", get(all_users))
         .route("/", get(info))

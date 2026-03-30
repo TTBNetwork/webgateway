@@ -10,7 +10,7 @@
                     userInfo?.bound_totp ? '是' : '否'
                 }}</span>
             </div>
-            <Button>绑定动态密码</Button>
+            <Button @click="addDialog(BindTotp)">绑定动态密码</Button>
         </div>
     </Panel>
     <Users />
@@ -23,6 +23,8 @@ import { info } from '../../../auth';
 import type { UserInfo } from '../../../types';
 import Users from '../../../components/console/users.vue';
 import Button from '../../../components/Button.vue';
+import { addDialog } from '../../../plugins/dialog';
+import BindTotp from '../../../components/console/bindTotp.vue';
 const userInfo = ref<UserInfo>();
 onMounted(async () => {
     userInfo.value = await info();

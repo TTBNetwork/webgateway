@@ -1,6 +1,7 @@
 import { got, router } from './constant';
 import addPresentation from './plugins/presentation';
 import type { APIResponse, AuthResponse, UserInfo } from './types';
+import type { BindTotpResponse } from './types/auth';
 
 export async function login(username: string, totp: string): Promise<boolean> {
     const response: APIResponse<AuthResponse> = await (
@@ -81,3 +82,48 @@ export async function getAllUsers() {
         })
     ).json()) as APIResponse<UserInfo[]>;
 }
+
+export async function bindTotp(totp: string) {
+    return (await (
+        await got.post('auth/totp/qrcode/get', {
+            headers: {
+                Authorization: `Bearer ${getLocalToken()?.token}`,
+            },
+            json: {
+                totp,
+            },
+        })
+    ).json()) as APIResponse<BindTotpResponse>;
+}
+
+export async function refreshBindTotpQrcode(id: string) {
+    return (await (
+        await got.post('auth/totp/qrcode/refresh', {
+            headers: {
+                Authorization: `Bearer ${getLocalToken()?.token}`,
+            },
+            json: {
+                secret_id: id,
+            },
+        })
+    ).json()) as APIResponse<BindTotpResponse>;
+}
+
+export async function verifyBindTotp(totp: string, id: string) {
+    return (await (
+        await got.post('auth/totp/qrcode/verify', {
+            headers: {
+                Authorization: `Bearer ${getLocalToken()?.token}`,
+            },
+            json: {
+                secret_id: id,
+                totp,
+            },
+        })
+    ).json()) as APIResponse<BindTotpResponse>;
+}
+
+/*route("/totp/qrcode/get", post(get_bind_qrcode))
+        .route("/totp/qrcode/verify", post(verify_bind_qrcode))
+        
+        */

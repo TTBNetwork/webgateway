@@ -2858,6 +2858,18 @@ punycode@^2.1.0:
   resolved "https://registry.yarnpkg.com/punycode/-/punycode-2.3.1.tgz#027422e2faec0b25e1549c3e1bd8309b9133b6e5"
   integrity sha512-vYt7UD1U9Wg6138shLtLOvdAu+8DsC/ilFtEVHcH+wydcSpNE20AfSOduf6MkRFahL5FY7X1oU7nKVZFtfq8Fg==
 
+qrcode-generator@^1.4.4:
+  version "1.5.2"
+  resolved "https://registry.yarnpkg.com/qrcode-generator/-/qrcode-generator-1.5.2.tgz#43faea8061a60d2b4ca5e9b0c0c0fb99e2d93e3a"
+  integrity sha512-pItrW0Z9HnDBnFmgiNrY1uxRdri32Uh9EjNYLPVC2zZ3ZRIIEqBoDgm4DkvDwNNDHTK7FNkmr8zAa77BYc9xNw==
+
+qrcode-vue3@^1.7.1:
+  version "1.7.1"
+  resolved "https://registry.yarnpkg.com/qrcode-vue3/-/qrcode-vue3-1.7.1.tgz#d2cf627f9ffefd48d7ffb1dc0402a831781890df"
+  integrity sha512-Xa82NslFJUqsnQbLtc1qO+xPEOeFaTRxktg3ugRd2Pk116kta1X+7GLSEPQj9gor8jWVyfmLmhYZHuANnRZoLQ==
+  dependencies:
+    qrcode-generator "^1.4.4"
+
 quansync@^0.2.11:
   version "0.2.11"
   resolved "https://registry.yarnpkg.com/quansync/-/quansync-0.2.11.tgz#f9c3adda2e1272e4f8cf3f1457b04cbdb4ee692a"
