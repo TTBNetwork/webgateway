@@ -52,6 +52,7 @@ pub fn init_config() -> anyhow::Result<()> {
             MainConfig::default()
         },
     };
+    println!("config: {:?}", config);
     CONFIG.set(config).unwrap();
 
     Ok(())
