@@ -66,10 +66,13 @@ fn config_max_connections() -> u32 {
 fn config_database_url() -> String {
     // from run env
     let env = std::env::var("DATABASE_URL");
-    if let Ok(v) = env {
-        return v;
+    match env {
+        Ok(res) => res,
+        Err(e) => {
+            event!(Level::WARN, "DATABASE_URL is not set. Error: {e:?}");
+            "".to_string()
+        }
     }
-    "".to_string()
 }
 
 pub static CONFIG: OnceLock<MainConfig> = OnceLock::new();
