@@ -185,7 +185,6 @@ onUnmounted(() => {
 <style scoped>
 /* 确保 Panel 有足够的高度，否则图表可能不显示 */
 .panel.qps-root {
-    min-width: 0%;
     min-width: 322px;
     /* width: 100%; */
     height: auto; /* 根据布局调整 */

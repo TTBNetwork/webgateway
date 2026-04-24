@@ -7,8 +7,8 @@ import { computed } from 'vue';
 import Metrics from './statistics/metrics.vue';
 import QPS from './statistics/QPS.vue';
 // import { get_access_map } from '../../apis/access';
-// import AccessMap from './statistics/AccessMap.vue';
-// import AccessStatistics from './statistics/AccessStatistics.vue';
+import AccessMap from './statistics/AccessMap.vue';
+import AccessStatistics from './statistics/AccessStatistics.vue';
 const options = [
     {
         text: '近 24 小时',
@@ -39,10 +39,10 @@ const query = computed(() => useRoute().query);
         <Metrics :in_days="+(query?.in_days || 1)" />
         <QPS />
     </div>
-    <!-- <div class="statistics-overview">
+    <div class="statistics-overview">
         <AccessMap></AccessMap>
         <AccessStatistics></AccessStatistics>
-    </div> -->
+    </div>
 </template>
 
 <style>

@@ -62,7 +62,7 @@ services:
       - /etc/localtime:/etc/localtime:ro
     environment:
       TZ: ${TZ:-Asia/Shanghai}
-          DATABASE_URL: ${DATABASE_URL:-postgresql://${POSTGRES_ENCODE_USER:-${POSTGRES_USER:-root}}:${POSTGRES_ENCODE_PASSWORD:-${POSTGRES_PASSWORD}}@webgateway-pg:5432/postgres}
+      DATABASE_URL: ${DATABASE_URL:-postgresql://${POSTGRES_ENCODE_USER:-${POSTGRES_USER:-root}}:${POSTGRES_ENCODE_PASSWORD:-${POSTGRES_PASSWORD}}@webgateway-pg:5432/postgres}
     networks:
       webgateway:
         ipv4_address: ${SUBNET_PREFIX}.4

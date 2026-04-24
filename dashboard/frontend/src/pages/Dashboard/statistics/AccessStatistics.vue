@@ -1,5 +1,5 @@
 <template>
-    <Panel>
+    <Panel class="access-statistics-root">
         <div class="title">
             <div>访问情况</div>
             <div></div>
@@ -14,3 +14,10 @@ import { defineAsyncComponent } from 'vue';
 import Panel from '../../../components/Panel.vue';
 const vchart = defineAsyncComponent(() => import('vue-echarts'));
 </script>
+
+<style>
+.access-statistics-root.panel {
+    min-width: 322px;
+    height: auto; /* 根据布局调整 */
+}
+</style>

@@ -182,7 +182,18 @@ pub static DATABASE: OnceLock<Database> = OnceLock::new();
 
 #[inline]
 pub async fn init_database(url: &str, max_connections: u32) -> anyhow::Result<()> {
-    let database = Database::new(url, max_connections).await?;
+    let database = match Database::new(url, max_connections).await {
+        Ok(res) => res,
+        Err(e) => {
+            event!(
+                tracing::Level::ERROR,
+                "Failed to connect to database: {:?}",
+                e
+            );
+            eprintln("Failed to connect to database url: {:?}", url);
+            return Err(e)
+        }
+    }?;
     DATABASE.set(database).unwrap();
 
     tokio::spawn(async move {
