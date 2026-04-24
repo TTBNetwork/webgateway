@@ -47,7 +47,10 @@ pub fn init_config() -> anyhow::Result<()> {
                 MainConfig::default()
             }
         },
-        Err(_) => MainConfig::default(),
+        Err(_) => {
+            event!(Level::INFO, "config.toml not found, use default config");
+            MainConfig::default()
+        },
     };
     CONFIG.set(config).unwrap();
 
