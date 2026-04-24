@@ -4,7 +4,7 @@ use serde::{Deserialize, Serialize};
 use shared::default::{default_dashboard_api_port, default_database_max_connections};
 use tracing::{Level, event};
 
-#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct MainConfig {
     #[serde(default = "config_dashboard_api_port")]
     pub port: u16,
@@ -17,6 +17,17 @@ pub struct MainConfig {
     pub max_connections: u32,
     #[serde(rename = "token_expires", default = "config_token_expires")]
     pub token_exp: u64,
+}
+
+impl Default for MainConfig {
+    fn default() -> Self {
+        Self {
+            database: config_database_url(),
+            max_connections: config_max_connections(),
+            port: config_dashboard_api_port(),
+            token_exp: config_token_expires(),
+        }
+    }
 }
 
 fn config_token_expires() -> u64 {
