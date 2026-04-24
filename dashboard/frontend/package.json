@@ -11,11 +11,11 @@
     "dependencies": {
         "echarts": "^6.0.0",
         "ky": "^1.14.3",
-        "qrcode-vue3": "^1.7.1",
         "vue": "^3.5.25",
         "vue-debounce": "^5.0.1",
         "vue-echarts": "^8.0.1",
-        "vue-i18n": "^11.3.0"
+        "vue-i18n": "^11.3.0",
+        "vue3-next-qrcode": "^4.0.0"
     },
     "devDependencies": {
         "@eslint/css": "^0.14.1",

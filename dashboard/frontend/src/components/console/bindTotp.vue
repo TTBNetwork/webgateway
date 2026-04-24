@@ -11,9 +11,9 @@
                     />
                 </div>
                 <div v-if="state == 'qrcode'" class="qrcode">
-                    <QRCodeVue3
-                        :value="`${bindTotpResponse?.qr_url}`"
-                    ></QRCodeVue3>
+                    <QRCodeClient
+                        :text="`${bindTotpResponse?.qr_url}`"
+                    ></QRCodeClient>
                     <InputEdit
                         label="动态密码"
                         placeholder="请输入绑定后的动态密码"
@@ -43,7 +43,7 @@ import { addDialog } from '../../plugins/dialog';
 import DraftContent from '../../plugins/dialog/templates/DraftContent.vue';
 import { bindTotp, refreshBindTotpQrcode, verifyBindTotp } from '../../auth';
 import addPresentation from '../../plugins/presentation';
-import QRCodeVue3 from 'qrcode-vue3';
+import { QRCodeClient } from 'vue3-next-qrcode';
 
 const emit = defineEmits(['close']);
 const state = ref<BindTotpState>('input');
