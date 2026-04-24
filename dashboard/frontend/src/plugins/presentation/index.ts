@@ -22,7 +22,7 @@ export function addPresentation(
     const id = Symbol();
     const taskId = setTimeout(() => {
         removePresentation(id);
-    }, out);
+    }, out) as any as number;
     presentations.value.push({
         id,
         message,
