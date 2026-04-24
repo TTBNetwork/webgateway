@@ -13,8 +13,7 @@ inputs:
 
   github_token:
     description: "GitHub token"
-    required: false
-    default: ${{ secrets.GITHUB_TOKEN }}
+    required: true
 
   node-version: # 新增：Node.js 版本输入
     description: "Node.js version to use"

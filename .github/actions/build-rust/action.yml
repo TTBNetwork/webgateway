@@ -11,7 +11,7 @@ inputs:
     default: "stable"
   github_token:
     description: "GitHub token"
-    required: false
+    required: true
     default: ""
 
 runs:
