@@ -190,10 +190,10 @@ pub async fn init_database(url: &str, max_connections: u32) -> anyhow::Result<()
                 "Failed to connect to database: {:?}",
                 e
             );
-            eprintln("Failed to connect to database url: {:?}", url);
-            return Err(e)
+            eprintln!("Failed to connect to database url: {:?}", url);
+            return Err(e.into())
         }
-    }?;
+    };
     DATABASE.set(database).unwrap();
 
     tokio::spawn(async move {
