@@ -251,13 +251,20 @@ async fn inner_handle(
     if let Some(v) = req.extensions_mut() {
         v.extend(origin_req.extensions().clone())
     }
-    req = req.uri(pool.get_path().map_or_else(
+    req = req.uri({
+        let current_uri = pool.get_path().map_or_else(
         || origin_req.uri().path().to_string(),
         |v| {
             let a = v.join(&origin_req.uri().path()[1..]).unwrap();
             a.path().to_string()
         },
-    ));
+    );
+    if let Some(query) = origin_req.uri().query() {
+        format!("{}?{}", current_uri, query)
+    } else {
+        current_uri
+    }
+    });
 
     // insert custom headers
     let headers = req.headers_mut().unwrap();
