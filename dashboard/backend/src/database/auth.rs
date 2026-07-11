@@ -1,7 +1,10 @@
 use crate::{
     auth::{DEFAULT_ADMIN_USERNAME, generate_random_secret, get_totp_code},
     database::log::WebLogManager,
-    models::{auth::{AuthVerifyTOTP, AuthVerifyTOTPType, DatabaseAuthentication, AuthInfo}, log::LogAddr},
+    models::{
+        auth::{AuthInfo, AuthVerifyTOTP, AuthVerifyTOTPType, DatabaseAuthentication},
+        log::LogAddr,
+    },
 };
 use anyhow::{Result, anyhow};
 use shared::{
@@ -27,7 +30,11 @@ pub trait Authentication {
     async fn verify_totp(&self, auth: AuthVerifyTOTP) -> Result<bool>;
     async fn get_user_from_id(&self, id: &ObjectId) -> Result<DatabaseAuthentication>;
     async fn get_user_all_secrets(&self, id: &ObjectId) -> Result<Vec<String>>;
-    async fn add_client_secret(&self, id: &ObjectId, secret: impl Into<String> + Send) -> Result<()>;
+    async fn add_client_secret(
+        &self,
+        id: &ObjectId,
+        secret: impl Into<String> + Send,
+    ) -> Result<()>;
     async fn get_info_of_users(&self) -> Result<Vec<AuthInfo>>;
 }
 
@@ -119,10 +126,12 @@ impl Authentication for Database {
     }
 
     async fn get_user(&self, username: &str) -> Result<DatabaseAuthentication> {
-        let row = sqlx::query(r#"
+        let row = sqlx::query(
+            r#"
             SELECT * FROM users_info
             WHERE LOWER(username) = LOWER($1)
-            "#)
+            "#,
+        )
         .bind(username)
         .fetch_optional(&self.pool)
         .await?
@@ -132,11 +141,13 @@ impl Authentication for Database {
     }
 
     async fn get_first_user(&self) -> Result<DatabaseAuthentication> {
-        let row = sqlx::query(r#"
+        let row = sqlx::query(
+            r#"
             SELECT * FROM users_info
             ORDER BY created_at ASC
             LIMIT 1
-            "#)
+            "#,
+        )
         .fetch_optional(&self.pool)
         .await?
         .ok_or_else(|| anyhow!("No users found"))?;
@@ -150,10 +161,12 @@ impl Authentication for Database {
         let addr = LogAddr(auth.addr.to_string());
         let user = match self.get_user(username).await {
             Ok(user) => user,
-            Err(e) => return {
-                event!(Level::ERROR, "Failed to get user '{}': {}", username, e);
-                Ok(false)
-            }, // 用户不存在视为验证失败
+            Err(e) => {
+                return {
+                    event!(Level::ERROR, "Failed to get user '{}': {}", username, e);
+                    Ok(false)
+                };
+            } // 用户不存在视为验证失败
         };
 
         // lianjie
@@ -163,29 +176,33 @@ impl Authentication for Database {
             secrets.extend(client_secrets);
         }
         for secret in secrets {
-            if  get_totp_code(username, secret)?.eq(totp) {
+            if get_totp_code(username, secret)?.eq(totp) {
                 get_database()
                     .add_web_log(
                         &user.id,
                         &crate::models::log::LogContent::Raw(
-                            match auth.verify_type{
+                            match auth.verify_type {
                                 AuthVerifyTOTPType::Login => "auth.user.login.success",
                                 AuthVerifyTOTPType::WantBind => "auth.user.want_bind.success",
-                            }.to_string()
+                            }
+                            .to_string(),
                         ),
-                        &addr)                    .await?;
+                        &addr,
+                    )
+                    .await?;
                 return Ok(true);
             }
         }
 
-            get_database()
+        get_database()
             .add_web_log(
                 &user.id,
                 &crate::models::log::LogContent::Raw(
-                    match auth.verify_type{
-                                AuthVerifyTOTPType::Login => "auth.user.login.fail",
-                                AuthVerifyTOTPType::WantBind => "auth.user.want_bind.fail",
-                            }.to_string()
+                    match auth.verify_type {
+                        AuthVerifyTOTPType::Login => "auth.user.login.fail",
+                        AuthVerifyTOTPType::WantBind => "auth.user.want_bind.fail",
+                    }
+                    .to_string(),
                 ),
                 &addr,
             )
@@ -194,10 +211,12 @@ impl Authentication for Database {
     }
 
     async fn get_user_from_id(&self, user_id: &ObjectId) -> Result<DatabaseAuthentication> {
-        let row = sqlx::query(r#"
+        let row = sqlx::query(
+            r#"
             SELECT * FROM users_info
             WHERE id = $1
-            "#)
+            "#,
+        )
         .bind(user_id)
         .fetch_optional(&self.pool)
         .await?
@@ -220,13 +239,18 @@ impl Authentication for Database {
         Ok(rows.into_iter().map(|row| row.0).collect())
     }
 
-    async fn add_client_secret(&self, user_id: &ObjectId, secret: impl Into<String> + Send) -> Result<()> {
+    async fn add_client_secret(
+        &self,
+        user_id: &ObjectId,
+        secret: impl Into<String> + Send,
+    ) -> Result<()> {
         let _ = sqlx::query(
             r#"
             INSERT INTO users_client_secrets (user_id, secret)
             VALUES ($1, $2)
             "#,
-        ).bind(user_id)
+        )
+        .bind(user_id)
         .bind(secret.into())
         .execute(&self.pool)
         .await?;
@@ -240,8 +264,9 @@ impl Authentication for Database {
             SELECT 
                 *
             FROM users_info
-            "#
-        ).fetch_all(&self.pool)
+            "#,
+        )
+        .fetch_all(&self.pool)
         .await?;
 
         Ok(rows)

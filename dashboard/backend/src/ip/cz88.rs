@@ -1,7 +1,7 @@
 use std::{collections::HashMap, net::IpAddr, path::PathBuf, sync::LazyLock};
 
 use anyhow::Result;
-use ipdb::{Reader};
+use ipdb::Reader;
 
 use crate::ip::{LookupResult, ROOT};
 
@@ -37,15 +37,10 @@ static CITY_CODE_MAPPINGS: LazyLock<HashMap<String, String>> = LazyLock::new(|| 
 
 impl Instance {
     pub fn new(instance: Reader) -> Self {
-        Self {
-            instance,
-        }
+        Self { instance }
     }
 
-    fn lookup(
-        &self,
-        ip: IpAddr,
-    ) -> Result<LookupResult> {
+    fn lookup(&self, ip: IpAddr) -> Result<LookupResult> {
         let res = self.instance.find_city_info(&ip.to_string(), "CN")?;
         Ok(LookupResult {
             ip,
@@ -58,23 +53,26 @@ impl Instance {
                 Some(res.region_name.to_string())
             } else {
                 None
-            }
+            },
         })
     }
 }
 
-static INSTANCE: LazyLock<Instance> = LazyLock::new(|| {
-    Instance::new(ipdb::Reader::open_file(&*FILE).unwrap())
-});
+static INSTANCE: LazyLock<Instance> =
+    LazyLock::new(|| Instance::new(ipdb::Reader::open_file(&*FILE).unwrap()));
 
 pub fn lookup(ip: IpAddr) -> Result<LookupResult> {
     INSTANCE.lookup(ip).map(|mut v| {
         v.country = v.country.as_ref().map(|country| {
-            COUNTRY_CODE_MAPPINGS.get(country).unwrap_or(country).to_string()
+            COUNTRY_CODE_MAPPINGS
+                .get(country)
+                .unwrap_or(country)
+                .to_string()
         });
-        v.city = v.city.as_ref().map(|city| {
-            CITY_CODE_MAPPINGS.get(city).unwrap_or(city).to_string()
-        });
+        v.city = v
+            .city
+            .as_ref()
+            .map(|city| CITY_CODE_MAPPINGS.get(city).unwrap_or(city).to_string());
         v
     })
 }

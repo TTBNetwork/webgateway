@@ -35,7 +35,9 @@ pub trait DatabaseAccessLogsRepository {
     async fn get_qps_per_second(&self, count: usize) -> anyhow::Result<ResponseQPS>;
     async fn get_qps_per_5s(&self, count: usize) -> anyhow::Result<ResponseQPS>;
     async fn get_access_info(&self, in_days: usize) -> anyhow::Result<AccessInfo>;
-    async fn get_today_metrics_info_of_websites(&self) -> anyhow::Result<Vec<TodayMetricsInfoOfWebsite>>;
+    async fn get_today_metrics_info_of_websites(
+        &self,
+    ) -> anyhow::Result<Vec<TodayMetricsInfoOfWebsite>>;
     async fn get_requests_of_ips(&self, in_days: usize) -> anyhow::Result<HashMap<String, usize>>;
 }
 
@@ -120,16 +122,21 @@ impl DatabaseAccessLogsRepository for Database {
         let rows = sqlx::query_as::<_, (String, i64)>(
             "SELECT remote_addr, COUNT(id) FROM access_request_logs 
              WHERE requested_at > NOW() - INTERVAL '1 day' * $1 
-             GROUP BY remote_addr"
+             GROUP BY remote_addr",
         )
         .bind(in_days as i64)
         .fetch_all(&self.pool)
         .await?;
-    
-        Ok(rows.into_iter().map(|(addr, count)| (addr, count as usize)).collect())
+
+        Ok(rows
+            .into_iter()
+            .map(|(addr, count)| (addr, count as usize))
+            .collect())
     }
 
-    async fn get_today_metrics_info_of_websites(&self) -> anyhow::Result<Vec<TodayMetricsInfoOfWebsite>> {
+    async fn get_today_metrics_info_of_websites(
+        &self,
+    ) -> anyhow::Result<Vec<TodayMetricsInfoOfWebsite>> {
         let rows = sqlx::query_as::<_, TodayMetricsInfoOfWebsite>
             (r#"
                 WITH

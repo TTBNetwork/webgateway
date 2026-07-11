@@ -14,7 +14,7 @@ services:
   postgres:
     container_name: webgateway-pg
     restart: unless-stopped
-    image: ${IMAGE_PREFIX:-ghcr.io/tianxiu2b2t}/postgres:${POSTGRES_TAG:-latest}
+    image: ${POSTGRES_IMAGE_PREFIX:-${IMAGE_PREFIX:-ghcr.io/tianxiu2b2t}}/postgres:${POSTGRES_TAG:-latest}
     volumes:
       - ${DATA_DIR:-./data}/pg:/var/lib/postgresql
       - /etc/localtime:/etc/localtime:ro

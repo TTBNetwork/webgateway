@@ -334,7 +334,6 @@ impl AccessInsertResponseSize {
     }
 }
 
-
 // Website Access Info
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct WebsiteAccessInfo {
@@ -373,11 +372,9 @@ impl<'r> FromRow<'r, PgRow> for TodayMetricsInfoOfWebsite {
             e5xx_requests: row.try_get::<i64, _>("e5xx_requests")? as usize,
             total_requests_size: row.try_get::<USize, _>("total_requests_size")?.into(),
             total_response_size: row.try_get::<USize, _>("total_response_size")?.into(),
-        }
-        )
+        })
     }
 }
-
 
 #[derive(Debug, Clone, Serialize, Default)]
 pub enum QueryAccessMapType {

@@ -20,13 +20,18 @@ impl CityInstance {
     }
 
     pub fn lookup(&self, ip: IpAddr) -> anyhow::Result<LookupResult> {
-        let result = self.reader.lookup(ip).map_err(|e| anyhow::anyhow!(format!("{e:?}")))?;
-        let iso_code = result.country.and_then(|v| v.iso_code.map(|v| v.to_string()));
+        let result = self
+            .reader
+            .lookup(ip)
+            .map_err(|e| anyhow::anyhow!(format!("{e:?}")))?;
+        let iso_code = result
+            .country
+            .and_then(|v| v.iso_code.map(|v| v.to_string()));
         let city = result.subdivisions.and_then(|v| {
             // v.and_then(|v| v.iso_code) find iso_code is not null else return None
             v.iter().find_map(|v| v.iso_code.map(|v| v.to_string()))
         });
-        Ok(LookupResult { 
+        Ok(LookupResult {
             ip,
             country: iso_code,
             city,
@@ -50,11 +55,16 @@ impl CountryInstance {
     }
 
     pub fn lookup(&self, ip: IpAddr) -> anyhow::Result<LookupResult> {
-        let result = self.reader.lookup(ip).map_err(|e| anyhow::anyhow!(format!("{e:?}")))?;
+        let result = self
+            .reader
+            .lookup(ip)
+            .map_err(|e| anyhow::anyhow!(format!("{e:?}")))?;
         // println!("Country: {ip:?} {:?}", result);
-        let iso_code = result.country.and_then(|v| v.iso_code.map(|v| v.to_string()));
+        let iso_code = result
+            .country
+            .and_then(|v| v.iso_code.map(|v| v.to_string()));
         let city = result.continent.and_then(|v| v.code.map(|v| v.to_string()));
-        Ok(LookupResult { 
+        Ok(LookupResult {
             ip,
             country: iso_code,
             city,
@@ -63,7 +73,8 @@ impl CountryInstance {
 }
 
 static CITY_FILE: LazyLock<PathBuf> = LazyLock::new(|| ROOT.clone().join("GeoLite2-City.mmdb"));
-static CHINA_COUNTRY_FILE: LazyLock<PathBuf> = LazyLock::new(|| ROOT.clone().join("China_Country.mmdb"));
+static CHINA_COUNTRY_FILE: LazyLock<PathBuf> =
+    LazyLock::new(|| ROOT.clone().join("China_Country.mmdb"));
 
 static CITY_INSTANCE: LazyLock<CityInstance> = LazyLock::new(|| {
     let content = std::fs::read(CITY_FILE.clone()).unwrap();

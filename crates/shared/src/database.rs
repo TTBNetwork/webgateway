@@ -191,7 +191,7 @@ pub async fn init_database(url: &str, max_connections: u32) -> anyhow::Result<()
                 e
             );
             eprintln!("Failed to connect to database url: {:?}", url);
-            return Err(e.into())
+            return Err(e.into());
         }
     };
     DATABASE.set(database).unwrap();

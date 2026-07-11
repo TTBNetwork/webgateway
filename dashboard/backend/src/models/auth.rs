@@ -31,7 +31,6 @@ pub struct AuthToVerifyBindQRCodePostBody {
     pub totp: String,
 }
 
-
 #[derive(Debug, Serialize, Deserialize, Clone)]
 pub struct AuthResponse {
     pub token: String,
@@ -145,12 +144,10 @@ impl<'r> FromRow<'r, PgRow> for AuthInfo {
     }
 }
 
-
 #[derive(Debug, Serialize, Deserialize, Clone)]
 pub struct AuthQueryInfo {
     pub user_id: ObjectId,
 }
-
 
 #[derive(Debug, Serialize, Deserialize, Clone)]
 pub struct AuthBindQRCodeResponse {
@@ -158,13 +155,11 @@ pub struct AuthBindQRCodeResponse {
     pub qr_url: String,
 }
 
-
 #[derive(Debug, Clone)]
 pub struct AuthTempSecret {
     pub id: ObjectId,
     pub secret: String,
 }
-
 
 #[derive(Debug, Clone)]
 pub struct AuthVerifyTOTP {
@@ -175,7 +170,12 @@ pub struct AuthVerifyTOTP {
 }
 
 impl AuthVerifyTOTP {
-    pub fn new(username: impl Into<String>, totp: impl Into<String>, verify_type: AuthVerifyTOTPType, addr: impl Into<String>) -> Self {
+    pub fn new(
+        username: impl Into<String>,
+        totp: impl Into<String>,
+        verify_type: AuthVerifyTOTPType,
+        addr: impl Into<String>,
+    ) -> Self {
         Self {
             username: username.into(),
             totp: totp.into(),
@@ -184,8 +184,6 @@ impl AuthVerifyTOTP {
         }
     }
 }
-
-
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum AuthVerifyTOTPType {

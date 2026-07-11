@@ -4,6 +4,7 @@ use std::{
     time::Duration,
 };
 
+use anyhow::{Context, anyhow};
 use dashmap::DashMap;
 use http_body::Body;
 use hyper::{Request, Response, StatusCode, Version, body::Incoming, client, service::service_fn};
@@ -150,25 +151,8 @@ pub async fn handle(
                         host,
                         id: req_id,
                     };
-                    let resp = wrapper_inner_handle(req, state).await;
-                    match resp {
-                        CResponseResult::Backend(resp) => {
-                            access::add_response_log(
-                                &ResponseLog::new(
-                                    req_id,
-                                    resp.version(),
-                                    resp.headers(),
-                                    resp.status().as_u16(),
-                                    resp.body().size_hint(),
-                                    Some(get_database().get_database_time().unwrap()),
-                                    website_id,
-                                )
-                                .unwrap(),
-                            );
-                            return Ok(resp);
-                        }
-                        resp => resp,
-                    }
+                    wrapper_inner_core_handle(req, state).await
+                    // wrapper_inner_core_handle(req, state).await
                 }
                 None => CResponseResult::NotFoundGateway,
             }
@@ -176,8 +160,7 @@ pub async fn handle(
         Err(_) => CResponseResult::BadRequest,
     };
 
-    // let resp = wrapper_inner_handle(req, base_state, host, &req_id).await;
-
+    let mut responsed_at = None;
     let final_resp = match resp {
         CResponseResult::NotFoundGateway => Response::builder()
             .status(StatusCode::NOT_FOUND)
@@ -196,7 +179,10 @@ pub async fn handle(
             .status(StatusCode::BAD_REQUEST)
             .body(CResponse::new_from_string("Bad Request"))
             .unwrap(),
-        CResponseResult::Backend(_) => unreachable!(),
+        CResponseResult::Backend(resp) => {
+            responsed_at = Some(get_database().get_database_time().unwrap());
+            resp
+        }
     };
     access::add_response_log(
         &ResponseLog::new(
@@ -205,7 +191,7 @@ pub async fn handle(
             final_resp.headers(),
             final_resp.status().as_u16(),
             final_resp.size_hint(),
-            None,
+            responsed_at,
             website_id,
         )
         .unwrap(),
@@ -213,11 +199,12 @@ pub async fn handle(
     Ok(final_resp)
 }
 
-async fn wrapper_inner_handle(
+
+async fn wrapper_inner_core_handle(
     req: Request<StatisticsIncoming>,
     state: ClientState,
 ) -> CResponseResult {
-    let resp = timeout(Duration::from_secs(60), inner_handle(req, state)).await;
+    let resp = timeout(Duration::from_secs(60), inner_core_handle(req, state)).await;
     match resp {
         Ok(v) => match v {
             Ok(v) => CResponseResult::Backend(v),
@@ -227,16 +214,16 @@ async fn wrapper_inner_handle(
     }
 }
 
-async fn inner_handle(
+async fn inner_core_handle(
     origin_req: Request<StatisticsIncoming>,
     state: ClientState,
 ) -> anyhow::Result<hyper::Response<CResponse>> {
     let site = &state.website;
 
     let pool = site.pool();
-    let conn = pool.get().await?;
+    let conn = pool.get().await.context(anyhow!("Unavailable connection"))?;
     let io = TokioIo::new(conn);
-    let (mut c_req, connection) = client::conn::http1::handshake(io).await?;
+    let (mut c_req, connection) = client::conn::http1::handshake(io).await.context(anyhow!("Failed to handshake upstream"))?;
     tokio::task::spawn(async move {
         if let Err(err) = connection.await {
             eprintln!("Connection error: {}", err);
@@ -254,17 +241,17 @@ async fn inner_handle(
     }
     req = req.uri({
         let current_uri = pool.get_path().map_or_else(
-        || origin_req.uri().path().to_string(),
-        |v| {
-            let a = v.join(&origin_req.uri().path()[1..]).unwrap();
-            a.path().to_string()
-        },
-    );
-    if let Some(query) = origin_req.uri().query() {
-        format!("{}?{}", current_uri, query)
-    } else {
-        current_uri
-    }
+            || origin_req.uri().path().to_string(),
+            |v| {
+                let a = v.join(&origin_req.uri().path()[1..]).unwrap();
+                a.path().to_string()
+            },
+        );
+        if let Some(query) = origin_req.uri().query() {
+            format!("{}?{}", current_uri, query)
+        } else {
+            current_uri
+        }
     });
 
     // insert custom headers
@@ -279,8 +266,8 @@ async fn inner_handle(
     headers.insert("X-Forwarded-Host", state.host.parse()?);
     let final_req = req.body(origin_req.into_body()).unwrap();
 
-    let mut resp = c_req.send_request(final_req).await?;
-    resp.headers_mut().insert("Server", "WebGateway".parse()?);
+    let resp = c_req.send_request(final_req).await?;
+    // resp.headers_mut().insert("Server", "WebGateway".parse()?);
     let (mut parts, b) = resp.into_parts();
     parts.version = origin_version;
     let final_resp = Response::from_parts(
