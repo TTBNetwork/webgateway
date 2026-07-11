@@ -270,7 +270,7 @@ async fn inner_core_handle(
     headers.insert("X-Forwarded-Host", state.host.parse()?);
     let final_req = req.body(origin_req.into_body()).unwrap();
 
-    let resp = c_req.send_request(final_req).await?;
+    let resp = c_req.send_request(final_req).await.with_context(|| anyhow!("Failed to send request"))?;
     // resp.headers_mut().insert("Server", "WebGateway".parse()?);
     let (mut parts, b) = resp.into_parts();
     parts.version = origin_version;
