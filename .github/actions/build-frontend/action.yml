@@ -50,8 +50,8 @@ runs:
         context: ./dashboard/frontend
         push: true
         tags: |
-          ghcr.io/${{ github.repository }}/dashboard-frontend:latest
-          ghcr.io/${{ github.repository }}/dashboard-frontend:${{ github.sha }}
-          ghcr.io/${{ github.repository }}/dashboard-frontend:${{ env.RELEASE_VERSION }}
+          ghcr.io/${{ env.LOWER_REPO }}/dashboard-frontend:latest
+          ghcr.io/${{ env.LOWER_REPO }}/dashboard-frontend:${{ github.sha }}
+          ghcr.io/${{ env.LOWER_REPO }}/dashboard-frontend:${{ env.RELEASE_VERSION }}
         cache-from: type=gha
         cache-to: type=gha,mode=max
