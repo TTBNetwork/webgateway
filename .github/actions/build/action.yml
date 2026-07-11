@@ -9,8 +9,8 @@ inputs:
 runs:
   using: "composite"
   steps:
-    - name: Checkout repository
-      uses: actions/checkout@v2
+    # - name: Checkout repository
+    #   uses: actions/checkout@v2
 
     # build it
     - name: Build and copy build artifacts
@@ -23,9 +23,8 @@ runs:
           export cargo_mode=""
           export cargo_build_dir="debug"
         fi
-        cargo build $cargo_mode -p dashboard
-        cargo build $cargo_mode -p gateway
-        cargo build $cargo_mode -p webgateway-mnt
+        
+        cargo build $cargo_mode --bin dashboard --bin gateway --bin webgateway-mnt
 
         mkdir builds
 

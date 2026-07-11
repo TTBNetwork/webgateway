@@ -27,7 +27,7 @@ runs:
       with:
         cache-all-crates: true # 已设置，缓存 registry 源码
         cache-on-failure: true # 即使构建失败也保存缓存（调试时有用）
-        sharedKey: my-workspace-cache # 可选：跨分支共享基础依赖（谨慎使用）
+        # sharedKey: my-workspace-cache # 可选：跨分支共享基础依赖（谨慎使用）
         workspaces: |
           . -> target
 
@@ -61,9 +61,9 @@ runs:
         context: ./gateway
         push: true
         tags: |
-          ghcr.io/${{ github.repository }}/gateway:latest
-          ghcr.io/${{ github.repository }}/gateway:${{ github.sha }}
-          ghcr.io/${{ github.repository }}/gateway:${{ env.RELEASE_VERSION }}
+          ghcr.io/${{ env.LOWER_REPO }}/gateway:latest
+          ghcr.io/${{ env.LOWER_REPO }}/gateway:${{ github.sha }}
+          ghcr.io/${{ env.LOWER_REPO }}/gateway:${{ env.RELEASE_VERSION }}
         cache-from: type=gha
         cache-to: type=gha,mode=max
 
@@ -73,8 +73,8 @@ runs:
         context: ./dashboard/backend
         push: true
         tags: |
-          ghcr.io/${{ github.repository }}/dashboard-backend:latest
-          ghcr.io/${{ github.repository }}/dashboard-backend:${{ github.sha }}
-          ghcr.io/${{ github.repository }}/dashboard-backend:${{ env.RELEASE_VERSION }}
+          ghcr.io/${{ env.LOWER_REPO }}/dashboard-backend:latest
+          ghcr.io/${{ env.LOWER_REPO }}/dashboard-backend:${{ github.sha }}
+          ghcr.io/${{ env.LOWER_REPO }}/dashboard-backend:${{ env.RELEASE_VERSION }}
         cache-from: type=gha
         cache-to: type=gha,mode=max
