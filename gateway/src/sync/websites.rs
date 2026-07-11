@@ -83,7 +83,7 @@ pub async fn get_website(domain: impl Into<String>) -> Option<Arc<WebSiteRunner>
         .iter()
         .map(|entry| (entry.key().clone(), entry.value().clone()))
         .collect();
-    candidates.sort_by(|(a, _), (b, _)| b.len().cmp(&a.len()));
+    candidates.sort_by_key(|(b, _)| std::cmp::Reverse(b.len()));
 
     for (pattern, site) in candidates {
         if regex_match(&domain, &pattern) {

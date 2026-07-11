@@ -43,6 +43,7 @@ impl<'r> FromRow<'r, PgRow> for DatabaseWebsite {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct DatabaseWebsiteBackend {
+    pub match_path: Option<String>, // default /
     pub url: Url,
     pub balance: usize,
     pub main: bool,

@@ -185,7 +185,8 @@ pub async fn handle(
             .unwrap(),
         CResponseResult::GatewayError(e) => Response::builder()
             .status(StatusCode::INTERNAL_SERVER_ERROR)
-            .body(CResponse::new_from_string(e.to_string()))
+            .header("Detail-Error", e.to_string())
+            .body(CResponse::new_from_string(format!("Gateway error")))
             .unwrap(),
         CResponseResult::Timeout => Response::builder()
             .status(StatusCode::REQUEST_TIMEOUT)
