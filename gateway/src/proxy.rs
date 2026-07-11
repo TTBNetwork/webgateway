@@ -161,16 +161,19 @@ pub async fn handle(
     };
 
     let mut responsed_at = None;
-    let final_resp = match resp {
+    let mut final_resp = match resp {
         CResponseResult::NotFoundGateway => Response::builder()
             .status(StatusCode::NOT_FOUND)
             .body(CResponse::new_from_string("Not Found"))
             .unwrap(),
-        CResponseResult::GatewayError(e) => Response::builder()
+        CResponseResult::GatewayError(e) => {
+            event!(Level::ERROR, "Gateway error: {e:?}");
+            Response::builder()
             .status(StatusCode::INTERNAL_SERVER_ERROR)
             .header("Detail-Error", e.to_string())
             .body(CResponse::new_from_string(format!("Gateway error")))
-            .unwrap(),
+            .unwrap()
+        },
         CResponseResult::Timeout => Response::builder()
             .status(StatusCode::REQUEST_TIMEOUT)
             .body(CResponse::new_from_string("Request Timeout"))
@@ -184,6 +187,7 @@ pub async fn handle(
             resp
         }
     };
+    final_resp.headers_mut().insert("Server", "WebGateway".parse()?);
     access::add_response_log(
         &ResponseLog::new(
             req_id,
@@ -221,9 +225,9 @@ async fn inner_core_handle(
     let site = &state.website;
 
     let pool = site.pool();
-    let conn = pool.get().await.context(anyhow!("Unavailable connection"))?;
+    let conn = pool.get().await.with_context(|| anyhow!("Unavailable connection"))?;
     let io = TokioIo::new(conn);
-    let (mut c_req, connection) = client::conn::http1::handshake(io).await.context(anyhow!("Failed to handshake upstream"))?;
+    let (mut c_req, connection) = client::conn::http1::handshake(io).await.with_context(|| anyhow!("Failed to handshake upstream"))?;
     tokio::task::spawn(async move {
         if let Err(err) = connection.await {
             eprintln!("Connection error: {}", err);
