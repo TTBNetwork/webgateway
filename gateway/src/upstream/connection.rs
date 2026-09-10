@@ -5,7 +5,10 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::task::{Context, Poll};
 
-use rustls::{ClientConfig, pki_types::{DnsName, ServerName}};
+use rustls::{
+    ClientConfig,
+    pki_types::{DnsName, ServerName},
+};
 use shared::streams::WrapperBufferStream;
 use tokio::io::{AsyncRead, AsyncWrite, AsyncWriteExt, ReadBuf};
 use tokio::net::TcpStream;
@@ -20,7 +23,9 @@ pub struct UpstreamConnection {
 
 impl UpstreamConnection {
     pub async fn new_tcp(addr: SocketAddr) -> anyhow::Result<Self> {
-        Ok(Self { inner: WrapperBufferStream::Raw(TcpStream::connect(addr).await?) })
+        Ok(Self {
+            inner: WrapperBufferStream::Raw(TcpStream::connect(addr).await?),
+        })
     }
 
     pub async fn new_tls(
@@ -44,13 +49,17 @@ impl UpstreamConnection {
                 if let Ok(ip) = host.parse::<std::net::IpAddr>() {
                     ServerName::IpAddress(ip.into())
                 } else {
-                    DnsName::try_from(host).map_err(|_| anyhow::anyhow!("invalid DNS name"))?.into()
+                    DnsName::try_from(host)
+                        .map_err(|_| anyhow::anyhow!("invalid DNS name"))?
+                        .into()
                 }
             }
             None => ServerName::IpAddress(stream.peer_addr()?.ip().into()),
         };
         Ok(Self {
-            inner: WrapperBufferStream::TlsClient(Box::new(connector.connect(server_name, stream).await?)),
+            inner: WrapperBufferStream::TlsClient(Box::new(
+                connector.connect(server_name, stream).await?,
+            )),
         })
     }
 
@@ -60,7 +69,8 @@ impl UpstreamConnection {
 
     pub async fn is_healthy(&mut self) -> bool {
         matches!(
-            tokio::time::timeout(std::time::Duration::from_millis(100), self.inner.write(&[])).await,
+            tokio::time::timeout(std::time::Duration::from_millis(100), self.inner.write(&[]))
+                .await,
             Ok(Ok(_))
         )
     }
@@ -99,17 +109,11 @@ impl AsyncWrite for UpstreamConnection {
         self.inner.is_write_vectored()
     }
 
-    fn poll_flush(
-        mut self: Pin<&mut Self>,
-        cx: &mut Context<'_>,
-    ) -> Poll<std::io::Result<()>> {
+    fn poll_flush(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
         Pin::new(&mut self.inner).poll_flush(cx)
     }
 
-    fn poll_shutdown(
-        mut self: Pin<&mut Self>,
-        cx: &mut Context<'_>,
-    ) -> Poll<std::io::Result<()>> {
+    fn poll_shutdown(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
         Pin::new(&mut self.inner).poll_shutdown(cx)
     }
 }
@@ -320,22 +324,14 @@ impl AsyncWrite for PooledUpstreamConnection {
         self.conn.as_ref().unwrap().is_write_vectored()
     }
 
-    fn poll_flush(
-        mut self: Pin<&mut Self>,
-        cx: &mut Context<'_>,
-    ) -> Poll<std::io::Result<()>> {
+    fn poll_flush(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
         Pin::new(self.conn.as_mut().unwrap()).poll_flush(cx)
     }
 
-    fn poll_shutdown(
-        mut self: Pin<&mut Self>,
-        cx: &mut Context<'_>,
-    ) -> Poll<std::io::Result<()>> {
+    fn poll_shutdown(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
         Pin::new(self.conn.as_mut().unwrap()).poll_shutdown(cx)
     }
 }
-
-
 
 // == MixedUpstreamConnection
 #[derive(Debug)]
@@ -387,20 +383,14 @@ impl AsyncWrite for MixedUpstreamConnection {
         }
     }
 
-    fn poll_flush(
-        self: Pin<&mut Self>,
-        cx: &mut Context<'_>,
-    ) -> Poll<std::io::Result<()>> {
+    fn poll_flush(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
         match self.get_mut() {
             MixedUpstreamConnection::Pool(p) => Pin::new(p).poll_flush(cx),
             MixedUpstreamConnection::Raw(r) => Pin::new(r).poll_flush(cx),
         }
     }
 
-    fn poll_shutdown(
-        self: Pin<&mut Self>,
-        cx: &mut Context<'_>,
-    ) -> Poll<std::io::Result<()>> {
+    fn poll_shutdown(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
         match self.get_mut() {
             MixedUpstreamConnection::Pool(p) => Pin::new(p).poll_shutdown(cx),
             MixedUpstreamConnection::Raw(r) => Pin::new(r).poll_shutdown(cx),

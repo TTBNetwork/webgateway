@@ -1,13 +1,21 @@
-use std::{error::Error, net::SocketAddr, sync::{Arc, LazyLock}, time::Duration};
+use std::{
+    error::Error,
+    net::SocketAddr,
+    sync::{Arc, LazyLock},
+    time::Duration,
+};
 
+use ::protocols::tls::ProtocolTLS;
 use anyhow::Context;
 use dashmap::DashMap;
 use http_body::Body;
 use hyper::{
-    Request, Response, StatusCode, Version, body::Incoming, client, service::service_fn, upgrade::self,
+    Request, Response, StatusCode, Version, body::Incoming, client, service::service_fn, upgrade,
 };
-use hyper_util::{rt::{TokioExecutor, TokioIo}, server::conn::auto::Builder};
-use ::protocols::tls::ProtocolTLS;
+use hyper_util::{
+    rt::{TokioExecutor, TokioIo, TokioTimer},
+    server::conn::auto::Builder,
+};
 use shared::{
     database::get_database,
     listener::CustomDualStackTcpListener,
@@ -15,10 +23,10 @@ use shared::{
     streams::{BufferStream, WrapperBufferStream},
 };
 use tokio::{
+    io::copy_bidirectional,
     net::TcpStream,
     task::JoinHandle,
-    time::timeout,
-    io::{copy_bidirectional},
+    time::{sleep, timeout},
 };
 use tokio_rustls::TlsAcceptor;
 use tracing::{Level, event};
@@ -31,12 +39,19 @@ use crate::{
     upstream::{connection::UpstreamConnectionPool, structs::ConnectionRequest},
 };
 
+pub mod connection;
 mod protocols;
 mod structs;
-pub mod connection;
 
 static HTTP_BUILDER: LazyLock<Builder<TokioExecutor>> = LazyLock::new(|| {
-    hyper_util::server::conn::auto::Builder::<TokioExecutor>::new(TokioExecutor::new())
+    let mut builder =
+        hyper_util::server::conn::auto::Builder::<TokioExecutor>::new(TokioExecutor::new());
+    builder
+        .http1()
+        .timer(TokioTimer::new())
+        .header_read_timeout(Duration::from_secs(30))
+        .keep_alive(true);
+    builder
 });
 
 static LISTENERS: LazyLock<DashMap<u16, JoinHandle<()>>> = LazyLock::new(DashMap::default);
@@ -44,24 +59,49 @@ static LISTENERS: LazyLock<DashMap<u16, JoinHandle<()>>> = LazyLock::new(DashMap
 static TLS_ACCEPTOR: LazyLock<Arc<TlsAcceptor>> =
     LazyLock::new(|| Arc::new(TlsAcceptor::from(SERVER_CONFIG.clone())));
 
+const EMFILE: i32 = 24;
+const ENFILE: i32 = 23;
+const ECONNABORTED: i32 = 103;
+
 async fn accept(listener: CustomDualStackTcpListener) {
     loop {
         let (stream, addr) = match listener.accept().await {
             Ok(v) => v,
-            Err(_) => continue,
+            Err(e) => {
+                match e.raw_os_error() {
+                    Some(EMFILE) | Some(ENFILE) => {
+                        event!(Level::ERROR, "fd exhausted, backing off 100ms: {e}");
+                        sleep(Duration::from_millis(100)).await;
+                    }
+                    Some(ECONNABORTED) => {
+                        // 客户端在建连过程中断开，立即重试
+                    }
+                    _ => {
+                        event!(Level::WARN, "accept error: {e}");
+                        sleep(Duration::from_millis(10)).await;
+                    }
+                }
+                continue;
+            }
         };
         tokio::spawn(async move {
             let connection = match ConnectionCycle::new(stream, addr) {
                 Ok(connection) => connection,
                 Err(e) => {
-                    event!(Level::ERROR, "Failed to create connection cycle, error: {e}");
+                    event!(
+                        Level::ERROR,
+                        "Failed to create connection cycle, error: {e}"
+                    );
                     return;
                 }
             };
             match connection.handle_connection().await {
                 Ok(()) => {}
                 Err(e) => {
-                    event!(Level::ERROR, "Failed to handle connection cycle, error: {e}");
+                    event!(
+                        Level::ERROR,
+                        "Failed to handle connection cycle, error: {e}"
+                    );
                 }
             }
         });
@@ -127,37 +167,44 @@ impl ConnectionCycle {
             local_addr: self.local_addr.ip(),
         });
         let io = TokioIo::new(self.stream);
-        let _ = HTTP_BUILDER
-            .serve_connection_with_upgrades(
-                io,
-                service_fn(move |req: Request<Incoming>| {
-                    let state = state.clone();
-                    let req_id = ObjectId::new();
-                    let uri = req.uri();
-                    let host = uri.authority().map(|v| v.as_str().to_owned()).unwrap_or_else(|| req
-                        .headers()
-                        .get("host")
-                        .and_then(|v| v.to_str().ok().map(|v| v.to_string())).unwrap_or_default());
-                    let path = req.uri();
-                    let conn_req = Arc::new(ConnectionRequest {
-                        host: Arc::new(host),
-                        path: Arc::new(path.path().to_string()),
-                        // query: Arc::new(path.query().unwrap_or_default().to_string()),
-                        req_id,
+        let conn = HTTP_BUILDER.serve_connection_with_upgrades(
+            io,
+            service_fn(move |req: Request<Incoming>| {
+                let state = state.clone();
+                let req_id = ObjectId::new();
+                let uri = req.uri();
+                let host = uri
+                    .authority()
+                    .map(|v| v.as_str().to_owned())
+                    .unwrap_or_else(|| {
+                        req.headers()
+                            .get("host")
+                            .and_then(|v| v.to_str().ok().map(|v| v.to_string()))
+                            .unwrap_or_default()
                     });
-                    let (parts, body) = req.into_parts();
-                    let req = Request::from_parts(
-                        parts,
-                        StatisticsIncoming::new(
-                            req_id,
-                            body,
-                            crate::transport::StatisticsIncomingType::Request,
-                        ),
-                    );
-                    Self::handle_request(req, state, conn_req)
-                }),
-            )
-            .await;
+                let path = req.uri();
+                let conn_req = Arc::new(ConnectionRequest {
+                    host: Arc::new(host),
+                    path: Arc::new(path.path().to_string()),
+                    // query: Arc::new(path.query().unwrap_or_default().to_string()),
+                    req_id,
+                });
+                let (parts, body) = req.into_parts();
+                let req = Request::from_parts(
+                    parts,
+                    StatisticsIncoming::new(
+                        req_id,
+                        body,
+                        crate::transport::StatisticsIncomingType::Request,
+                    ),
+                );
+                Self::handle_request(req, state, conn_req)
+            }),
+        );
+
+        if let Err(_) = timeout(Duration::from_secs(300), conn).await {
+            event!(Level::DEBUG, "connection lifetime exceeded, closing");
+        }
     }
 
     // ---------- 请求处理函数 ----------
@@ -166,7 +213,11 @@ impl ConnectionCycle {
         base_state: Arc<BaseClientState>,
         connection_req: Arc<ConnectionRequest>,
     ) -> anyhow::Result<hyper::Response<CResponse>> {
-        let site = get_website(connection_req.host.as_str(), Some(connection_req.path.as_str())).await;
+        let site = get_website(
+            connection_req.host.as_str(),
+            Some(connection_req.path.as_str()),
+        )
+        .await;
         let website_id = site.as_ref().map(|v| v.inner().id);
         let req_log = RequestLog::new(RequestContext {
             req_id: connection_req.req_id,
@@ -226,7 +277,9 @@ impl ConnectionCycle {
                 resp
             }
         };
-        final_resp.headers_mut().insert("Server", "WebGateway".parse()?);
+        final_resp
+            .headers_mut()
+            .insert("Server", "WebGateway".parse()?);
         access::add_response_log(
             &ResponseLog::new(
                 connection_req.req_id,
@@ -278,10 +331,11 @@ impl ConnectionCycle {
 
         // ---- 普通 HTTP 转发（原有逻辑） ----
         // 获取连接（从池中取出）
-        let pooled = pool.get()
+        let pooled = pool
+            .get()
             .await
             .with_context(|| "Unavailable connection from pool")?;
-        let conn = pooled;//.conn.ok_or_else(|| anyhow::anyhow!("No connection"))?;
+        let conn = pooled; //.conn.ok_or_else(|| anyhow::anyhow!("No connection"))?;
 
         let io = TokioIo::new(conn);
         let (mut c_req, connection) = client::conn::http1::Builder::new()
@@ -290,8 +344,10 @@ impl ConnectionCycle {
             .with_context(|| "Failed to handshake upstream")?;
 
         tokio::task::spawn(async move {
-            if let Err(err) = connection.with_upgrades().await {
-                event!(Level::ERROR, "Connection error: {}", err);
+            match timeout(Duration::from_secs(120), connection.with_upgrades()).await {
+                Ok(Ok(())) => {}
+                Ok(Err(e)) => event!(Level::ERROR, "Upstream connection error: {e}"),
+                Err(_) => event!(Level::WARN, "Upstream connection timeout, force closing"),
             }
             // println!("done");
         });
@@ -354,72 +410,95 @@ impl ConnectionCycle {
     }
 
     // -------- WebSocket 升级处理 --------
-async fn handle_upgrade(
-    req: Request<StatisticsIncoming>,
-    state: ClientState,
-    pool: Arc<UpstreamConnectionPool>, // 不再使用池
-) -> anyhow::Result<hyper::Response<CResponse>> {
-    // 1. 从客户端请求中取出 OnUpgrade
-    let (mut parts, body) = req.into_parts();
-    let client_on_upgrade = parts
-        .extensions
-        .remove::<upgrade::OnUpgrade>()
-        .context("Missing OnUpgrade extension")?;
-    // 保留原始头部和版本
-    let original_headers = parts.headers.clone();
-    let original_version = parts.version;
-    let original_method = parts.method.clone();
-    let original_uri = parts.uri.clone();
+    async fn handle_upgrade(
+        req: Request<StatisticsIncoming>,
+        state: ClientState,
+        pool: Arc<UpstreamConnectionPool>, // 不再使用池
+    ) -> anyhow::Result<hyper::Response<CResponse>> {
+        // 1. 从客户端请求中取出 OnUpgrade
+        let (mut parts, body) = req.into_parts();
+        let client_on_upgrade = parts
+            .extensions
+            .remove::<upgrade::OnUpgrade>()
+            .context("Missing OnUpgrade extension")?;
+        // 保留原始头部和版本
+        let original_headers = parts.headers.clone();
+        let original_version = parts.version;
+        let original_method = parts.method.clone();
+        let original_uri = parts.uri.clone();
 
-    // 2. 获取后端地址，新建连接（不从池中取）
-    // 假设 state.website 有 get_addr() 返回 SocketAddr
-    let stream = pool.create_connection().await?;
-    let io = TokioIo::new(stream);
+        // 2. 获取后端地址，新建连接（不从池中取）
+        // 假设 state.website 有 get_addr() 返回 SocketAddr
+        let stream = pool.create_connection().await?;
+        let io = TokioIo::new(stream);
 
-    // 3. 与后端握手
-    let (mut c_req, connection) = client::conn::http1::Builder::new()
-        .handshake(io)
-        .await
-        .context("Failed to handshake upstream")?;
+        // 3. 与后端握手
+        let (mut c_req, connection) = client::conn::http1::Builder::new()
+            .handshake(io)
+            .await
+            .context("Failed to handshake upstream")?;
 
-    tokio::task::spawn(async move {
-        if let Err(e) = connection.with_upgrades().await {
-            event!(Level::ERROR, "Upstream connection error: {}", e);
-        }
-    });
+        tokio::task::spawn(async move {
+            match timeout(Duration::from_secs(120), connection.with_upgrades()).await {
+                Ok(Ok(())) => {}
+                Ok(Err(e)) => event!(Level::ERROR, "Upstream connection error: {e}"),
+                Err(_) => event!(Level::WARN, "Upstream connection timeout, force closing"),
+            }
+        });
 
-    // 4. 构造转发请求
-    let path = pool.get_path().map_or_else(
-        || original_uri.path().to_string(),
-        |v| v.join(&original_uri.path()[1..]).unwrap().path().to_string(),
-    );
-    let query = original_uri.query().unwrap_or_default();
-    let new_uri = if query.is_empty() { path } else { format!("{}?{}", path, query) };
+        // 4. 构造转发请求
+        let path = pool.get_path().map_or_else(
+            || original_uri.path().to_string(),
+            |v| {
+                v.join(&original_uri.path()[1..])
+                    .unwrap()
+                    .path()
+                    .to_string()
+            },
+        );
+        let query = original_uri.query().unwrap_or_default();
+        let new_uri = if query.is_empty() {
+            path
+        } else {
+            format!("{}?{}", path, query)
+        };
 
-    // 注意：body 是 StatisticsIncoming，需要转换为 Incoming
-    let incoming_body = body; // 假设有 into_inner
-    let mut forward_req = Request::builder()
-        .method(original_method)
-        .version(original_version)  // 保留原始版本
-        .uri(new_uri)
-        .body(incoming_body)
-        .unwrap();
+        // 注意：body 是 StatisticsIncoming，需要转换为 Incoming
+        let incoming_body = body; // 假设有 into_inner
+        let mut forward_req = Request::builder()
+            .method(original_method)
+            .version(original_version) // 保留原始版本
+            .uri(new_uri)
+            .body(incoming_body)
+            .unwrap();
 
-    // 复制原始头部
-    *forward_req.headers_mut() = original_headers;
-    // 添加/覆盖代理头
-    forward_req.headers_mut().insert("Host", state.host.parse()?);
-    forward_req.headers_mut().insert("X-Real-Ip", state.remote_addr().to_string().parse()?);
-    forward_req.headers_mut().insert("X-Forwarded-For", state.remote_addr().to_string().parse()?);
-    forward_req.headers_mut().insert("X-Forwarded-Proto", state.scheme().to_string().parse()?);
-    forward_req.headers_mut().insert("X-Forwarded-Host", state.host.parse()?);
+        // 复制原始头部
+        *forward_req.headers_mut() = original_headers;
+        // 添加/覆盖代理头
+        forward_req
+            .headers_mut()
+            .insert("Host", state.host.parse()?);
+        forward_req
+            .headers_mut()
+            .insert("X-Real-Ip", state.remote_addr().to_string().parse()?);
+        forward_req
+            .headers_mut()
+            .insert("X-Forwarded-For", state.remote_addr().to_string().parse()?);
+        forward_req
+            .headers_mut()
+            .insert("X-Forwarded-Proto", state.scheme().to_string().parse()?);
+        forward_req
+            .headers_mut()
+            .insert("X-Forwarded-Host", state.host.parse()?);
 
-    // 5. 发送请求
-    let backend_resp = c_req.send_request(forward_req).await
-        .context("Failed to send request to backend")?;
+        // 5. 发送请求
+        let backend_resp = c_req
+            .send_request(forward_req)
+            .await
+            .context("Failed to send request to backend")?;
 
-    let (final_backend_resp_parts, final_backend_resp_body) = backend_resp.into_parts();
-    let final_backend_resp = Response::from_parts(
+        let (final_backend_resp_parts, final_backend_resp_body) = backend_resp.into_parts();
+        let final_backend_resp = Response::from_parts(
             final_backend_resp_parts,
             CResponse::Incoming(StatisticsIncoming::new(
                 state.id,
@@ -428,46 +507,48 @@ async fn handle_upgrade(
             )),
         );
 
-    // 6. 判断状态
-    if final_backend_resp.status() == StatusCode::SWITCHING_PROTOCOLS {
-        let (mut backend_parts, backend_body) = final_backend_resp.into_parts();
-        let backend_on_upgrade = backend_parts
-            .extensions
-            .remove::<upgrade::OnUpgrade>()
-            .context("Backend did not provide OnUpgrade")?;
+        // 6. 判断状态
+        if final_backend_resp.status() == StatusCode::SWITCHING_PROTOCOLS {
+            let (mut backend_parts, backend_body) = final_backend_resp.into_parts();
+            let backend_on_upgrade = backend_parts
+                .extensions
+                .remove::<upgrade::OnUpgrade>()
+                .context("Backend did not provide OnUpgrade")?;
 
-        // 构建客户端 101 响应
-        let mut client_resp = Response::builder()
-            .status(StatusCode::SWITCHING_PROTOCOLS)
-            .version(original_version)
-            .body(backend_body)?;
-        // 复制升级相关头
-        for (k, v) in backend_parts.headers.iter() {
-            if k.as_str().eq_ignore_ascii_case("upgrade")
-                || k.as_str().eq_ignore_ascii_case("connection")
-                || k.as_str().starts_with("sec-websocket-")
-            {
-                client_resp.headers_mut().insert(k.clone(), v.clone());
-            }
-        }
-        client_resp.extensions_mut().insert(client_on_upgrade.clone());
-
-        // 桥接
-        tokio::spawn(async move {
-            match tokio::try_join!(client_on_upgrade, backend_on_upgrade) {
-                Ok((client_upgraded, backend_upgraded)) => {
-                    let mut client_io = TokioIo::new(client_upgraded);
-                    let mut backend_io = TokioIo::new(backend_upgraded);
-                    let _ = copy_bidirectional(&mut client_io, &mut backend_io).await;
+            // 构建客户端 101 响应
+            let mut client_resp = Response::builder()
+                .status(StatusCode::SWITCHING_PROTOCOLS)
+                .version(original_version)
+                .body(backend_body)?;
+            // 复制升级相关头
+            for (k, v) in backend_parts.headers.iter() {
+                if k.as_str().eq_ignore_ascii_case("upgrade")
+                    || k.as_str().eq_ignore_ascii_case("connection")
+                    || k.as_str().starts_with("sec-websocket-")
+                {
+                    client_resp.headers_mut().insert(k.clone(), v.clone());
                 }
-                Err(e) => tracing::warn!("WebSocket upgrade failed: {}", e),
             }
-        });
+            client_resp
+                .extensions_mut()
+                .insert(client_on_upgrade.clone());
 
-        Ok(client_resp)
-    } else {
-        Ok(final_backend_resp)
-        // anyhow::bail!("Backend responded with {}", final_backend_resp.status());
+            // 桥接
+            tokio::spawn(async move {
+                match tokio::try_join!(client_on_upgrade, backend_on_upgrade) {
+                    Ok((client_upgraded, backend_upgraded)) => {
+                        let mut client_io = TokioIo::new(client_upgraded);
+                        let mut backend_io = TokioIo::new(backend_upgraded);
+                        let _ = copy_bidirectional(&mut client_io, &mut backend_io).await;
+                    }
+                    Err(e) => tracing::warn!("WebSocket upgrade failed: {}", e),
+                }
+            });
+
+            Ok(client_resp)
+        } else {
+            Ok(final_backend_resp)
+            // anyhow::bail!("Backend responded with {}", final_backend_resp.status());
+        }
     }
-}
 }

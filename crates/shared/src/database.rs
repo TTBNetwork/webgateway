@@ -109,7 +109,12 @@ impl Database {
             let mut stream = match listener_result {
                 Ok(s) => s,
                 Err(e) => {
-                    event!(Level::ERROR, "Failed to listen notification channel {}, error: {:?}, retry in 5s", channel, e);
+                    event!(
+                        Level::ERROR,
+                        "Failed to listen notification channel {}, error: {:?}, retry in 5s",
+                        channel,
+                        e
+                    );
                     tokio::time::sleep(tokio::time::Duration::from_secs(5)).await;
                     continue;
                 }
@@ -125,13 +130,21 @@ impl Database {
                         handler(notification).await;
                     }
                     Err(e) => {
-                        event!(Level::ERROR, "Failed to receive notification: {:?}, wait for next notification", e);
+                        event!(
+                            Level::ERROR,
+                            "Failed to receive notification: {:?}, wait for next notification",
+                            e
+                        );
                         // 这里不退出循环，继续接收后续通知（如果流仍然有效）
                     }
                 }
             }
             // 流结束（通常因为连接断开），稍后重连
-            event!(Level::ERROR, "Currently notification channel has been closed: {}", channel);
+            event!(
+                Level::ERROR,
+                "Currently notification channel has been closed: {}",
+                channel
+            );
             tokio::time::sleep(tokio::time::Duration::from_secs(1)).await;
         }
     }

@@ -5,11 +5,11 @@ use shared::database::get_database;
 use tracing::{Level, event};
 
 use crate::{
-    upstream::listen,
     sync::{
         cert::{AutoCertificate, sync_certificates},
         websites::sync_websites,
     },
+    upstream::listen,
 };
 
 pub mod cert;

@@ -14,7 +14,7 @@ use crate::upstream::connection::{UpstreamConnectionPool, UpstreamConnectionPool
 #[derive(Debug)]
 pub struct WebSiteRunner {
     inner: DatabaseWebsite,
-    pool: Arc<UpstreamConnectionPool>,  // 类型替换
+    pool: Arc<UpstreamConnectionPool>, // 类型替换
 }
 
 impl WebSiteRunner {

@@ -6,5 +6,5 @@ use shared::objectid::ObjectId;
 pub struct ConnectionRequest {
     pub host: Arc<String>,
     pub path: Arc<String>,
-    pub req_id: ObjectId
+    pub req_id: ObjectId,
 }

@@ -8,7 +8,9 @@ use chrono::{DateTime, Utc};
 use dashmap::DashMap;
 use regex::Regex;
 use shared::{
-    database::{get_database, websites::DatabaseWebsiteRepository}, models::websites::DatabaseWebsiteBackend, objectid::ObjectId,
+    database::{get_database, websites::DatabaseWebsiteRepository},
+    models::websites::DatabaseWebsiteBackend,
+    objectid::ObjectId,
 };
 use tokio::sync::RwLock;
 use tracing::{Level, event};
@@ -87,16 +89,16 @@ pub async fn sync_websites() -> anyhow::Result<Vec<u16>> {
 }
 
 /// 根据域名和路径查找匹配的网站（支持精确匹配、通配符、缓存）
-pub async fn get_website(domain: impl Into<String>, path: Option<&str>) -> Option<Arc<WebSiteRunner>> {
+pub async fn get_website(
+    domain: impl Into<String>,
+    path: Option<&str>,
+) -> Option<Arc<WebSiteRunner>> {
     let domain = domain.into().to_lowercase();
     let path = path.unwrap_or("/");
 
     // 检查某个网站是否包含匹配当前路径的 backend
     let has_matching_backend = |site: &Arc<WebSiteRunner>| -> bool {
-        site.inner()
-            .backends
-            .iter()
-            .any(|b| path_matches(path, b))
+        site.inner().backends.iter().any(|b| path_matches(path, b))
     };
 
     // 1. 精确匹配
@@ -119,7 +121,13 @@ pub async fn get_website(domain: impl Into<String>, path: Option<&str>) -> Optio
     // 3. 通配符匹配（使用预编译正则）
     let mut candidates: Vec<_> = LAZY_WEBSITES
         .iter()
-        .map(|entry| (entry.key().clone(), entry.value().0.clone(), entry.value().1.clone()))
+        .map(|entry| {
+            (
+                entry.key().clone(),
+                entry.value().0.clone(),
+                entry.value().1.clone(),
+            )
+        })
         .collect();
     // 按模式长度降序（更具体的优先）
     candidates.sort_by_key(|(pattern, _, _)| std::cmp::Reverse(pattern.len()));
