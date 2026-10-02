@@ -1,5 +1,9 @@
 use std::{
     pin::Pin,
+    sync::{
+        Arc,
+        atomic::{AtomicBool, Ordering},
+    },
     task::{Context, Poll},
 };
 
@@ -38,6 +42,12 @@ pub struct StatisticsIncoming {
     method: StatisticsIncomingType,
     total_size: usize,
     size: usize,
+    /// 响应体是否已被完整读到 EOF。
+    ///
+    /// 由连接池的归还逻辑读取：只有观察到 EOF 才允许把上游连接放回池中复用。
+    /// 客户端中途断开、响应体被丢弃时该标志保持 `false`，连接会被关闭，
+    /// 避免残留的响应字节被下一个请求读到（ISSUES.md P0-5）。
+    body_drained: Option<Arc<AtomicBool>>,
 }
 
 impl StatisticsIncoming {
@@ -48,6 +58,19 @@ impl StatisticsIncoming {
             method,
             size: 0,
             total_size: 0,
+            body_drained: None,
+        }
+    }
+
+    /// 附加一个"响应体已读到 EOF"的信号量，供连接池判断连接能否安全复用。
+    pub fn with_body_drained_flag(mut self, flag: Arc<AtomicBool>) -> Self {
+        self.body_drained = Some(flag);
+        self
+    }
+
+    fn mark_drained(&self) {
+        if let Some(flag) = &self.body_drained {
+            flag.store(true, Ordering::Release);
         }
     }
 
@@ -94,6 +117,10 @@ impl http_body::Body for StatisticsIncoming {
         cx: &mut Context<'_>,
     ) -> Poll<Option<Result<Frame<Self::Data>, <CResponse as Body>::Error>>> {
         let res = Pin::new(&mut self.inner).poll_frame(cx).map(|opt| {
+            if opt.is_none() {
+                // 读到流结束：响应体已完整消费，连接可以安全复用。
+                self.mark_drained();
+            }
             opt.map(|result| {
                 result.map_err(|e| anyhow::anyhow!(e).into()).map(|v| {
                     v.map_data(|data| {
@@ -108,6 +135,7 @@ impl http_body::Body for StatisticsIncoming {
 
         // is end stream
         if self.inner.is_end_stream() {
+            self.mark_drained();
             self.update_size();
         }
 

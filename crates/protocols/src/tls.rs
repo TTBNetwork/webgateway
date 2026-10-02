@@ -3,6 +3,11 @@ use std::io::{BufRead, BufReader, Read};
 #[derive(Debug, Clone)]
 pub enum ProtocolTLSError {
     WantMoreData(Option<usize>),
+    /// 客户端声明的手shake长度超过 [`MAX_TLS_HANDSHAKE_LENGTH`]，直接拒绝而不是继续分配内存。
+    HandshakeTooLarge {
+        length: usize,
+        limit: usize,
+    },
 }
 
 #[derive(Debug, Clone)]
@@ -15,6 +20,13 @@ pub type ProtocolTLSResult<T> = Result<T, ProtocolTLSError>;
 
 pub const TLS_HANDSHAKE_PREFIX_LENGTH: usize = 1;
 pub const TLS_HANDSHAKE_START_LENGTH: usize = 3;
+/// ClientHello 手shake 消息长度的硬上限。
+///
+/// 握手长度字段是 3 字节大端，理论最大 0xFFFFFF（约 16MB）。攻击者只要在
+/// ClientHello 头部声明这个长度，预读路径就会为其分配并等待读取 16MB，
+/// 并发发起即可耗尽内存与 fd（ISSUES.md P0-10）。
+/// 正常浏览器的 ClientHello 远小于 16KB，这里取 64KB 作为宽松但安全的上限。
+pub const MAX_TLS_HANDSHAKE_LENGTH: usize = 64 * 1024;
 const TLS_HANDSHAKE: &[u8; TLS_HANDSHAKE_PREFIX_LENGTH] = b"\x16";
 
 pub fn is_tls_handshake(data: &[u8]) -> bool {
@@ -50,6 +62,13 @@ pub fn parse_tls_client_hello(data: &[u8]) -> ProtocolTLSResult<Option<ProtocolT
 
     // 握手消息长度（3 字节，大端）
     let handshake_len = u32::from_be_bytes([0, data[6], data[7], data[8]]) as usize;
+    // 长度上限校验必须放在计算 `WantMoreData` 之前：否则单连接就能申请 16MB。
+    if handshake_len > MAX_TLS_HANDSHAKE_LENGTH {
+        return Err(ProtocolTLSError::HandshakeTooLarge {
+            length: handshake_len,
+            limit: MAX_TLS_HANDSHAKE_LENGTH,
+        });
+    }
     if data.len() < 9 + handshake_len {
         return Err(ProtocolTLSError::WantMoreData(Some(
             9 + handshake_len - data.len(),

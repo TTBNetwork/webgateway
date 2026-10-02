@@ -4,4 +4,7 @@ version = "0.1.0"
 edition = "2024"
 
 [dependencies]
-
+acmex = { version = "0.8.0", features = ["dns-tencent", "zerossl-ca"] }
+hex = "0.4.3"
+rustls-acme = "0.15.4"
+sha2 = "0.11.0"

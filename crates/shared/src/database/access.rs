@@ -1,3 +1,4 @@
+use async_trait::async_trait;
 use std::collections::HashMap;
 
 use crate::{
@@ -8,25 +9,75 @@ use crate::{
         ResponseQPS, TodayMetricsInfoOfWebsite,
     },
 };
-use async_trait::async_trait;
+use futures::future::BoxFuture;
 use simple_shared::objectid::ObjectId;
-use sqlx::{QueryBuilder, types::Json};
+use sqlx::{Postgres, QueryBuilder, Transaction, types::Json};
 use sqlx_pg_ext_uint::{c_u16::U16, c_usize::USize};
 
 const INIT_SQL: &str = include_str!("../../../../assets/sqls/access_init.sql");
 
-#[async_trait]
-pub trait DatabaseAccessLogsInitializer {
-    async fn initialize_access_logs(&self) -> anyhow::Result<()>;
+/// 单条语句的最大绑定参数个数上限（PostgreSQL 扩展查询协议用 Int16 表示参数个数）。
+const PG_MAX_BIND_PARAMS: usize = 65_535;
+/// 批量写入的目标分块行数：在语句数与参数数之间取平衡。
+const BATCH_ROWS: usize = 1_000;
+
+/// 按每条记录消耗的绑定参数个数计算安全的分块行数。
+///
+/// 单条 INSERT/UPDATE 的参数总数一旦超过 65535，PostgreSQL 会整体报错；
+/// 原先未分块的实现会在流量高峰（也就是最需要日志时）必然失败并丢数据。
+const fn chunk_rows(binds_per_row: usize) -> usize {
+    let rows = PG_MAX_BIND_PARAMS / binds_per_row;
+    if rows < BATCH_ROWS { rows } else { BATCH_ROWS }
 }
 
-#[async_trait]
-impl DatabaseAccessLogsInitializer for Database {
-    async fn initialize_access_logs(&self) -> anyhow::Result<()> {
-        sqlx::raw_sql(INIT_SQL).execute(&self.pool).await?;
+/// 在调用方提供的（可由 advisory lock 保护的）事务中创建访问日志相关对象。
+pub trait DatabaseAccessLogsInitializer {
+    fn initialize_access_logs<'a>(
+        &'a self,
+        tx: &'a mut Transaction<'_, Postgres>,
+    ) -> BoxFuture<'a, anyhow::Result<()>>;
+}
 
-        Ok(())
+impl DatabaseAccessLogsInitializer for Database {
+    fn initialize_access_logs<'a>(
+        &'a self,
+        tx: &'a mut Transaction<'_, Postgres>,
+    ) -> BoxFuture<'a, anyhow::Result<()>> {
+        Box::pin(async move {
+            // 注意：这里必须逐条执行，不能用 `sqlx::raw_sql`。
+            // `RawSql` 会在 `Executor` 上引入 `'q` 借用参数，与 `Transaction`
+            // 的 reborrow 组合后会触发 "implementation of `Executor` is not
+            // general enough" 的编译错误。
+            for statement in split_sql_statements(INIT_SQL) {
+                sqlx::query(&statement).execute(&mut **tx).await?;
+            }
+            Ok(())
+        })
     }
+}
+
+/// 把 DDL 脚本拆成单条语句。
+///
+/// `access_init.sql` 中没有字符串字面量里的分号，也没有 `$$ ... $$` 函数体，
+/// 因此按行累积、遇到以 `;` 结尾的行即切分即可；注释行与空行会被跳过。
+fn split_sql_statements(sql: &str) -> Vec<String> {
+    let mut statements = Vec::new();
+    let mut current = String::new();
+    for line in sql.lines() {
+        let trimmed = line.trim();
+        if trimmed.is_empty() || trimmed.starts_with("--") {
+            continue;
+        }
+        current.push_str(line);
+        current.push('\n');
+        if trimmed.ends_with(';') {
+            statements.push(std::mem::take(&mut current));
+        }
+    }
+    if !current.trim().is_empty() {
+        statements.push(current);
+    }
+    statements
 }
 
 // 以下为占位的空实现，可根据后续需求填充方法
@@ -45,8 +96,14 @@ pub trait DatabaseAccessLogsRepository {
 impl DatabaseAccessLogsRepository for Database {
     async fn get_qps_per_second(&self, count: usize) -> anyhow::Result<ResponseQPS> {
         let max_limit = count;
+        // 直接在 requested_at 上过滤（sargable），使 idx_requested_at 可用。
+        // 旧写法 `WHERE time >= ...` 中的 time 是 date_trunc(...) 的别名，
+        // 无法走索引，每次都退化为全表聚合 + 排序（见 ISSUES.md P0-3）。
         let rows = sqlx::query_as::<_, DatabaseQPS>(
-            "SELECT time, total_requests, qps FROM qps_per_second WHERE time >= NOW() - INTERVAL '1 second' * $1 ORDER BY time DESC LIMIT $1",
+            "SELECT date_trunc('second', requested_at) AS time, COUNT(id) AS total_requests \
+             FROM access_request_logs \
+             WHERE requested_at >= NOW() - INTERVAL '1 second' * $1 \
+             GROUP BY 1 ORDER BY 1 DESC LIMIT $1",
         )
         .bind(max_limit as i64)
         .fetch_all(&self.pool)
@@ -59,11 +116,17 @@ impl DatabaseAccessLogsRepository for Database {
     }
     async fn get_qps_per_5s(&self, count: usize) -> anyhow::Result<ResponseQPS> {
         let max_limit = count * 5;
-        let rows = sqlx::query_as::<_, DatabaseQPS>
-            ("SELECT time, total_requests FROM qps_per_5s WHERE time >= NOW() - INTERVAL '1 second' * $1 ORDER BY time DESC LIMIT $1")
-            .bind(max_limit as i64)
-            .fetch_all(&self.pool)
-            .await?;
+        // 同上：谓词落在 requested_at 原始列上。
+        let rows = sqlx::query_as::<_, DatabaseQPS>(
+            "SELECT to_timestamp(floor(extract(epoch FROM requested_at) / 5) * 5) AS time, \
+                    COUNT(id) AS total_requests \
+             FROM access_request_logs \
+             WHERE requested_at >= NOW() - INTERVAL '1 second' * $1 \
+             GROUP BY 1 ORDER BY 1 DESC LIMIT $1",
+        )
+        .bind(max_limit as i64)
+        .fetch_all(&self.pool)
+        .await?;
         Ok(ResponseQPS {
             interval: 5,
             data: rows,
@@ -213,22 +276,25 @@ impl DatabaseAccessLogsModifyRepository for Database {
         if requests.is_empty() {
             return Ok(());
         }
-        let mut builder = QueryBuilder::new(
-            "INSERT INTO access_request_logs (id, host, method, path, headers, http_version, remote_addr, body_length, requested_at, website_id)",
-        );
-        builder.push_values(requests.iter(), |mut b, req| {
-            b.push_bind(req.id)
-                .push_bind(&req.host)
-                .push_bind(&req.method)
-                .push_bind(&req.path)
-                .push_bind(Json(&req.headers))
-                .push_bind(req.http_version.to_string())
-                .push_bind(&req.remote_addr)
-                .push_bind(USize::from(req.body_length))
-                .push_bind(req.requested_at)
-                .push_bind(req.website_id);
-        });
-        builder.build().execute(&self.pool).await?;
+        // 10 个绑定/行。
+        for chunk in requests.chunks(chunk_rows(10)) {
+            let mut builder = QueryBuilder::new(
+                "INSERT INTO access_request_logs (id, host, method, path, headers, http_version, remote_addr, body_length, requested_at, website_id)",
+            );
+            builder.push_values(chunk.iter(), |mut b, req| {
+                b.push_bind(req.id)
+                    .push_bind(&req.host)
+                    .push_bind(&req.method)
+                    .push_bind(&req.path)
+                    .push_bind(Json(&req.headers))
+                    .push_bind(req.http_version.to_string())
+                    .push_bind(&req.remote_addr)
+                    .push_bind(USize::from(req.body_length))
+                    .push_bind(req.requested_at)
+                    .push_bind(req.website_id);
+            });
+            builder.build().execute(&self.pool).await?;
+        }
         Ok(())
     }
     async fn insert_batch_access_responses(
@@ -238,20 +304,23 @@ impl DatabaseAccessLogsModifyRepository for Database {
         if responses.is_empty() {
             return Ok(());
         }
-        let mut builder = QueryBuilder::new(
-            "INSERT INTO access_response_logs (id, status, headers, body_length, http_version, backend_responsed_at, responsed_at, website_id)",
-        );
-        builder.push_values(responses.iter(), |mut b, resp| {
-            b.push_bind(resp.id)
-                .push_bind(U16::from(resp.status))
-                .push_bind(Json(&resp.headers))
-                .push_bind(USize::from(resp.body_length))
-                .push_bind(resp.http_version.to_string())
-                .push_bind(resp.backend_responsed_at)
-                .push_bind(resp.responsed_at)
-                .push_bind(resp.website_id);
-        });
-        builder.build().execute(&self.pool).await?;
+        // 8 个绑定/行。
+        for chunk in responses.chunks(chunk_rows(8)) {
+            let mut builder = QueryBuilder::new(
+                "INSERT INTO access_response_logs (id, status, headers, body_length, http_version, backend_responsed_at, responsed_at, website_id)",
+            );
+            builder.push_values(chunk.iter(), |mut b, resp| {
+                b.push_bind(resp.id)
+                    .push_bind(U16::from(resp.status))
+                    .push_bind(Json(&resp.headers))
+                    .push_bind(USize::from(resp.body_length))
+                    .push_bind(resp.http_version.to_string())
+                    .push_bind(resp.backend_responsed_at)
+                    .push_bind(resp.responsed_at)
+                    .push_bind(resp.website_id);
+            });
+            builder.build().execute(&self.pool).await?;
+        }
         Ok(())
     }
 
@@ -262,31 +331,27 @@ impl DatabaseAccessLogsModifyRepository for Database {
         if requests.is_empty() {
             return Ok(());
         }
-
-        // 构建 UPDATE 语句，使用 CASE 表达式一次更新多行
-        let mut builder =
-            sqlx::QueryBuilder::new("UPDATE access_request_logs SET body_length = CASE");
-
-        for req in &requests {
-            // 追加 WHEN id = ? THEN ? 子句
-            builder.push(" WHEN id = ");
-            builder.push_bind(req.id); // id 是 String (ObjectId 转文本)
-            builder.push(" THEN ");
-            builder.push_bind(USize::from(req.body_length)); // body_length: usize -> uint8
+        // 3 个绑定/行：`SET (id, body_length) = (VALUES ...)` 比原来的
+        // `CASE WHEN id = ? THEN ? ...` 少一半绑定参数，且避免重复绑定 id。
+        for chunk in requests.chunks(chunk_rows(3)) {
+            let mut builder = QueryBuilder::new(
+                "UPDATE access_request_logs AS ar SET body_length = v.body_length \
+                 FROM (VALUES ",
+            );
+            {
+                // 缩小 `separated` 的作用域：它借用 `builder`，出块后自动释放。
+                let mut separated = builder.separated(", ");
+                for req in chunk {
+                    separated.push("(");
+                    separated.push_bind_unseparated(req.id);
+                    separated.push_unseparated(", ");
+                    separated.push_bind_unseparated(USize::from(req.body_length));
+                    separated.push_unseparated(")");
+                }
+                separated.push_unseparated(") AS v(id, body_length) WHERE ar.id = v.id");
+            }
+            builder.build().execute(&self.pool).await?;
         }
-        builder.push(" ELSE body_length END "); // 其余行保持原值
-
-        // 添加 WHERE 子句限定要更新的行，避免全表扫描
-        builder.push(" WHERE id IN (");
-        let mut separated = builder.separated(", ");
-        for req in &requests {
-            separated.push_bind(req.id); // 再次绑定 id 用于 IN 列表
-        }
-        builder.push(")");
-
-        // 执行批量更新
-        builder.build().execute(&self.pool).await?;
-
         Ok(())
     }
     async fn update_batch_access_response_size_logs(
@@ -296,31 +361,24 @@ impl DatabaseAccessLogsModifyRepository for Database {
         if responses.is_empty() {
             return Ok(());
         }
-
-        // 构建 UPDATE 语句，使用 CASE 表达式一次更新多行
-        let mut builder =
-            sqlx::QueryBuilder::new("UPDATE access_response_logs SET body_length = CASE");
-
-        for req in &responses {
-            // 追加 WHEN id = ? THEN ? 子句
-            builder.push(" WHEN id = ");
-            builder.push_bind(req.id); // id 是 String (ObjectId 转文本)
-            builder.push(" THEN ");
-            builder.push_bind(USize::from(req.body_length)); // body_length: usize -> uint8
+        for chunk in responses.chunks(chunk_rows(3)) {
+            let mut builder = QueryBuilder::new(
+                "UPDATE access_response_logs AS ar SET body_length = v.body_length \
+                 FROM (VALUES ",
+            );
+            {
+                let mut separated = builder.separated(", ");
+                for resp in chunk {
+                    separated.push("(");
+                    separated.push_bind_unseparated(resp.id);
+                    separated.push_unseparated(", ");
+                    separated.push_bind_unseparated(USize::from(resp.body_length));
+                    separated.push_unseparated(")");
+                }
+                separated.push_unseparated(") AS v(id, body_length) WHERE ar.id = v.id");
+            }
+            builder.build().execute(&self.pool).await?;
         }
-        builder.push(" ELSE body_length END "); // 其余行保持原值
-
-        // 添加 WHERE 子句限定要更新的行，避免全表扫描
-        builder.push(" WHERE id IN (");
-        let mut separated = builder.separated(", ");
-        for req in &responses {
-            separated.push_bind(req.id); // 再次绑定 id 用于 IN 列表
-        }
-        builder.push(")");
-
-        // 执行批量更新
-        builder.build().execute(&self.pool).await?;
-
         Ok(())
     }
 
@@ -331,16 +389,19 @@ impl DatabaseAccessLogsModifyRepository for Database {
         if responses.is_empty() {
             return Ok(());
         }
-        let mut builder = QueryBuilder::new(
-            "INSERT INTO access_response_size_logs (id, response_id, body_length, created_at)",
-        );
-        builder.push_values(responses.iter(), |mut b, resp| {
-            b.push_bind(ObjectId::new())
-                .push_bind(resp.id)
-                .push_bind(USize::from(resp.body_length))
-                .push_bind(resp.created_at);
-        });
-        builder.build().execute(&self.pool).await?;
+        // 4 个绑定/行。
+        for chunk in responses.chunks(chunk_rows(4)) {
+            let mut builder = QueryBuilder::new(
+                "INSERT INTO access_response_size_logs (id, response_id, body_length, created_at)",
+            );
+            builder.push_values(chunk.iter(), |mut b, resp| {
+                b.push_bind(ObjectId::new())
+                    .push_bind(resp.id)
+                    .push_bind(USize::from(resp.body_length))
+                    .push_bind(resp.created_at);
+            });
+            builder.build().execute(&self.pool).await?;
+        }
         Ok(())
     }
 
@@ -351,16 +412,18 @@ impl DatabaseAccessLogsModifyRepository for Database {
         if requests.is_empty() {
             return Ok(());
         }
-        let mut builder = QueryBuilder::new(
-            "INSERT INTO access_request_size_logs (id, request_id, body_length, created_at)",
-        );
-        builder.push_values(requests.iter(), |mut b, req| {
-            b.push_bind(ObjectId::new())
-                .push_bind(req.id)
-                .push_bind(USize::from(req.body_length))
-                .push_bind(req.created_at);
-        });
-        builder.build().execute(&self.pool).await?;
+        for chunk in requests.chunks(chunk_rows(4)) {
+            let mut builder = QueryBuilder::new(
+                "INSERT INTO access_request_size_logs (id, request_id, body_length, created_at)",
+            );
+            builder.push_values(chunk.iter(), |mut b, req| {
+                b.push_bind(ObjectId::new())
+                    .push_bind(req.id)
+                    .push_bind(USize::from(req.body_length))
+                    .push_bind(req.created_at);
+            });
+            builder.build().execute(&self.pool).await?;
+        }
         Ok(())
     }
 }

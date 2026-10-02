@@ -35,3 +35,8 @@ ttl_cache = "0.5.1"
 [[bin]]
 name = "dashboard"
 path = "src/main.rs"
+
+[dev-dependencies]
+# 仅用于集成测试：直接对 Router 发请求，不必真的监听端口。
+tower = { version = "0.5", features = ["util"] }
+http-body-util = "0.1"

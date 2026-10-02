@@ -20,8 +20,9 @@ use crate::{
     models::{
         auth::{
             AuthBindQRCodeResponse, AuthInfo, AuthJWTInfoExtract, AuthPostBody, AuthQueryInfo,
-            AuthResponse, AuthToBindQRCodePostBody, AuthToRefreshBindQRCodePostBody,
-            AuthToVerifyBindQRCodePostBody, AuthVerifyTOTP,
+            AuthResponse, AuthSetRoleBody, AuthToBindQRCodePostBody,
+            AuthToRefreshBindQRCodePostBody, AuthToVerifyBindQRCodePostBody, AuthVerifyTOTP,
+            Authorizer,
         },
         log::LogAddr,
     },
@@ -81,10 +82,25 @@ pub async fn info(AuthJWTInfoExtract(info): AuthJWTInfoExtract) -> APIResponse<A
     APIResponse::ok(AuthInfo::from(info.user))
 }
 
+/// 查询用户信息。
+///
+/// 修复（ISSUES.md P1-15，IDOR）：原先只要持有合法令牌，就能通过任意
+/// `?user_id=` 读取他人信息；中间件校验完身份后直接把它丢弃了。
+/// 现在的规则是：
+///   * 请求自己的信息 → 允许；
+///   * 请求他人信息 → 仅 admin 允许（面板的日志页需要按 user_id 反查用户名）。
+///
+/// 注意 `AuthInfo` 本身不含 `jwt_secret` / `totp_secret`，泄露面是用户 ID 与用户名，
+/// 但这仍属越权读取，必须修。
 pub async fn get_userinfo(
-    AuthJWTInfoExtract(_): AuthJWTInfoExtract,
+    auth: Authorizer,
     Query(info): Query<AuthQueryInfo>,
 ) -> APIResponse<AuthInfo> {
+    if auth.user_id() != info.user_id
+        && let Err(e) = auth.require_admin()
+    {
+        return APIResponse::from(e);
+    }
     let user = get_database().get_user_from_id(&info.user_id).await;
     match user {
         Ok(user) => APIResponse::ok(AuthInfo::from(user)),
@@ -246,8 +262,38 @@ pub async fn verify_bind_qrcode(
     }
 }
 
-async fn all_users(AuthJWTInfoExtract(_): AuthJWTInfoExtract) -> APIResponse<Vec<AuthInfo>> {
+/// 列出全部账号。
+///
+/// 修复（ISSUES.md P1-16）：原先任何已登录账号都能枚举全部账号（含 `bound_totp`
+/// 状态，可用于筛选未绑定 TOTP 的目标）。现在仅 admin 可用。
+pub async fn all_users(auth: Authorizer) -> APIResponse<Vec<AuthInfo>> {
+    if let Err(e) = auth.require_admin() {
+        return APIResponse::from(e);
+    }
     APIResponse::result(get_database().get_info_of_users().await)
+}
+
+/// 修改指定账号的角色。仅 admin 可用。
+///
+/// 安全护栏：不允许把自己降级（避免管理员误操作后无人能再管理面板）；
+/// 也不允许通过该接口修改自己的角色，改角色请由另一名 admin 操作。
+pub async fn set_user_role(
+    auth: Authorizer,
+    Json(body): Json<AuthSetRoleBody>,
+) -> APIResponse<AuthInfo> {
+    if let Err(e) = auth.require_admin() {
+        return APIResponse::from(e);
+    }
+    if auth.user_id() == body.user_id {
+        return APIResponse::error(None, 400, "Refusing to change your own role");
+    }
+    match get_database().set_user_role(&body.user_id, body.role).await {
+        Ok(()) => match get_database().get_user_from_id(&body.user_id).await {
+            Ok(user) => APIResponse::ok(AuthInfo::from(user)),
+            Err(_) => APIResponse::error(None, 404, "User not found"),
+        },
+        Err(e) => APIResponse::error(None, 404, e.to_string()),
+    }
 }
 
 pub fn get_router() -> Router {
@@ -259,5 +305,6 @@ pub fn get_router() -> Router {
         .route("/totp/qrcode/refresh", post(refresh_bind_qrcode))
         .route("/refresh", get(refresh_token))
         .route("/users", get(all_users))
+        .route("/users/role", post(set_user_role))
         .route("/", get(info))
 }

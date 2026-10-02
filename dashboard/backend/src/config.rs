@@ -77,7 +77,15 @@ fn config_database_url() -> String {
 
 pub static CONFIG: OnceLock<MainConfig> = OnceLock::new();
 
+/// 初始化配置。**幂等**：重复调用直接返回 `Ok(())`。
+///
+/// 原先用 `CONFIG.set(config).unwrap()`，第二次调用会 panic
+/// （`OnceLock::set` 在已初始化时返回 `Err`）。测试、以及未来可能的
+/// "重新加载配置"都会踩到这一点。
 pub fn init_config() -> anyhow::Result<()> {
+    if CONFIG.get().is_some() {
+        return Ok(());
+    }
     // laod from toml
     let config = match std::fs::read_to_string("config.toml") {
         Ok(content) => match toml::from_str::<MainConfig>(&content) {
@@ -92,7 +100,8 @@ pub fn init_config() -> anyhow::Result<()> {
             MainConfig::default()
         }
     };
-    CONFIG.set(config).unwrap();
+    // 与上面的 `get()` 之间存在竞争时忽略 `set` 失败（另一方已经写入）。
+    let _ = CONFIG.set(config);
 
     Ok(())
 }

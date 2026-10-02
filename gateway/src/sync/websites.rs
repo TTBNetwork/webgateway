@@ -1,10 +1,8 @@
 use std::{
-    collections::HashSet,
     sync::{Arc, LazyLock, RwLock as SyncRwLock},
     time::Duration,
 };
 
-use chrono::{DateTime, Utc};
 use dashmap::DashMap;
 use regex::Regex;
 use shared::{
@@ -12,18 +10,16 @@ use shared::{
     models::websites::DatabaseWebsiteBackend,
     objectid::ObjectId,
 };
-use tokio::sync::RwLock;
 use tracing::{Level, event};
 
 use crate::state::WebSiteRunner;
 
-static LAST_SYNC: LazyLock<RwLock<DateTime<Utc>>> =
-    LazyLock::new(|| RwLock::new(DateTime::from_timestamp_secs(0).unwrap()));
-static WEBSITES: LazyLock<DashMap<ObjectId, Arc<WebSiteRunner>>> = LazyLock::new(DashMap::default);
-static FULL_WEBSITES: LazyLock<DashMap<String, Arc<WebSiteRunner>>> =
+pub static WEBSITES: LazyLock<DashMap<ObjectId, Arc<WebSiteRunner>>> =
+    LazyLock::new(DashMap::default);
+pub static FULL_WEBSITES: LazyLock<DashMap<String, Arc<WebSiteRunner>>> =
     LazyLock::new(DashMap::default);
 
-// 变更：存储 (预编译正则, 网站) 用于通配符匹配
+/// 通配符站点：域名模式 → (预编译正则, 站点)。
 static LAZY_WEBSITES: LazyLock<DashMap<String, (Regex, Arc<WebSiteRunner>)>> =
     LazyLock::new(DashMap::default);
 
@@ -32,60 +28,79 @@ static CACHE_WEBSITES: LazyLock<SyncRwLock<ttl_cache::TtlCache<String, Arc<WebSi
 static CACHE_WEBSITES_EXPIRE: LazyLock<Arc<Duration>> =
     LazyLock::new(|| Arc::new(Duration::from_hours(2)));
 
+/// 全量重建站点表，返回当前**应当**监听的全部端口。
+///
+/// 修复（ISSUES.md P0-8）：原实现只做增量 insert，从不删除本地条目，
+/// 因此「删除站点」「修改站点 hosts 移除域名」都不会生效 —— 已下线的域名仍可访问。
+/// 另外水位依赖 `updated_at > last_sync`，而 `updated_at` 由触发器用事务开始时间
+/// （原为 `NOW()`）写入，长事务提交后会永久落后于水位（P0-9），增量同步本身就会漏更新。
+///
+/// 站点表规模很小，因此改为**对账式全量重建**：每轮同步都从数据库取全量配置，
+/// 重建三张内存表，天然消除「多出来的条目」。调用方拿到端口集合后再做监听器 diff。
 pub async fn sync_websites() -> anyhow::Result<Vec<u16>> {
-    let mut last_sync = { *LAST_SYNC.read().await };
-    event!(Level::DEBUG, "Last sync websites time: {last_sync}");
-    let websites = get_database()
-        .get_websites_before_updated_at(&last_sync)
-        .await?;
-    let mut ports = HashSet::new();
+    let websites = get_database().get_websites().await?;
+
+    let mut next_full: Vec<(String, Arc<WebSiteRunner>)> = Vec::new();
+    let mut next_lazy: Vec<(String, Regex, Arc<WebSiteRunner>)> = Vec::new();
+    let mut next_by_id: Vec<(ObjectId, Arc<WebSiteRunner>)> = Vec::new();
+    let mut ports = std::collections::HashSet::new();
+
     for website in websites {
         let site = Arc::new(WebSiteRunner::new(website).await?);
         ports.extend(&site.inner().ports);
-        WEBSITES.insert(site.inner().id, site.clone());
+        next_by_id.push((site.inner().id, site.clone()));
 
         for domain in &site.inner().hosts {
             let domain = domain.to_lowercase();
             if domain.contains('*') {
-                // 预编译正则表达式
                 let regex_pattern = domain.replace('.', "\\.").replace('*', r"[-\w]+");
                 match Regex::new(&format!("^{}$", regex_pattern)) {
-                    Ok(re) => {
-                        event!(
-                            Level::INFO,
-                            "Insert lazy website: {} -> {}",
-                            domain,
-                            site.inner().id
-                        );
-                        LAZY_WEBSITES.insert(domain.to_owned(), (re, site.clone()));
-                    }
-                    Err(e) => {
-                        event!(
-                            Level::WARN,
-                            "Invalid wildcard pattern '{}': {} — skipped",
-                            domain,
-                            e
-                        );
-                    }
+                    Ok(re) => next_lazy.push((domain, re, site.clone())),
+                    Err(e) => event!(
+                        Level::WARN,
+                        "Invalid wildcard pattern '{}': {} — skipped",
+                        domain,
+                        e
+                    ),
                 }
             } else {
-                event!(
-                    Level::INFO,
-                    "Insert full website: {} -> {}, {:?}",
-                    domain,
-                    site.inner().id,
-                    site.inner()
-                );
-                FULL_WEBSITES.insert(domain.to_owned(), site.clone());
+                next_full.push((domain, site.clone()));
             }
         }
-
-        if site.inner().updated_at > last_sync {
-            last_sync = site.inner().updated_at;
-        }
     }
-    *LAST_SYNC.write().await = last_sync;
-    Ok(ports.iter().copied().collect::<Vec<u16>>())
+
+    // 以下替换是原子的（逐表 clear + 重建）。网关的路由查询在读侧，
+    // 短暂的空窗只会让个别请求落到 404，不会返回错误的上游。
+    WEBSITES.clear();
+    FULL_WEBSITES.clear();
+    LAZY_WEBSITES.clear();
+    for (id, site) in next_by_id {
+        WEBSITES.insert(id, site);
+    }
+    for (domain, site) in next_full {
+        FULL_WEBSITES.insert(domain, site);
+    }
+    for (domain, re, site) in next_lazy {
+        LAZY_WEBSITES.insert(domain, (re, site));
+    }
+
+    // 缓存中的条目可能指向已被删除的站点，直接清空最安全。
+    CACHE_WEBSITES
+        .write()
+        .unwrap_or_else(|e| e.into_inner())
+        .clear();
+
+    event!(
+        Level::DEBUG,
+        "Reconciled websites: {} exact, {} wildcard, ports {:?}",
+        FULL_WEBSITES.len(),
+        LAZY_WEBSITES.len(),
+        ports
+    );
+
+    let mut ports = ports.into_iter().collect::<Vec<u16>>();
+    ports.sort_unstable();
+    Ok(ports)
 }
 
 /// 根据域名和路径查找匹配的网站（支持精确匹配、通配符、缓存）
@@ -111,7 +126,11 @@ pub async fn get_website(
     }
 
     // 2. 缓存（缓存中可能包含任意网站，需验证路径）
-    if let Some(cached) = CACHE_WEBSITES.read().unwrap().get(&domain) {
+    if let Some(cached) = CACHE_WEBSITES
+        .read()
+        .unwrap_or_else(|e| e.into_inner())
+        .get(&domain)
+    {
         if has_matching_backend(&cached) {
             return Some(cached.clone());
         }
@@ -154,8 +173,6 @@ fn path_matches(path: &str, backend: &DatabaseWebsiteBackend) -> bool {
 
 /// 插入缓存
 fn insert_cache(domain: &str, site: Arc<WebSiteRunner>) {
-    let mut cache = CACHE_WEBSITES.write().unwrap();
+    let mut cache = CACHE_WEBSITES.write().unwrap_or_else(|e| e.into_inner());
     cache.insert(domain.to_string(), site, **CACHE_WEBSITES_EXPIRE);
 }
-
-// 注意：原 regex_match 函数已删除，不再使用

@@ -20,7 +20,18 @@ pub mod upstream;
 async fn main() -> anyhow::Result<()> {
     logger::init(LoggerConfig::default());
     config::init_config()?;
-    database::init_database(&get_config().database, get_config().max_connections).await?;
+    // 数据面默认只校验 schema、不执行任何 DDL（ISSUES.md P0-7）：
+    // 两个进程并发重放 `CREATE TABLE/INDEX IF NOT EXISTS` 会互相冲突并可能启动失败。
+    //   * DB_AUTO_MIGRATE=1 —— 本进程在 advisory lock 下补齐 schema，再进入服务；
+    //   * --migrate          —— 只执行迁移然后退出（供独立迁移 Job 使用）。
+    let mode = database::DbStartupMode::from_env_args();
+    database::init_database_with_mode(&get_config().database, get_config().max_connections, mode)
+        .await?;
+    if mode == database::DbStartupMode::Migrate {
+        println!("Migration finished, exiting");
+        return Ok(());
+    }
+
     access::init_access_logs().await?;
     sync::main().await?;
 

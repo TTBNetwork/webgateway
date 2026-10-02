@@ -15,10 +15,13 @@ static EXPIRES: LazyLock<i64> = LazyLock::new(|| get_config().token_exp as i64);
 pub async fn sign_jwt(username: &str) -> Result<AuthResponse> {
     let user = get_database().get_user(username).await?;
     let now = chrono::Utc::now().timestamp();
+    // 修复（ISSUES.md P1-4）：`exp` 原本用秒、`exp_at` 却用分钟，
+    // 于是令牌实际 7 天有效，却告诉客户端 420 天。这里统一为**秒**。
+    let expires_at = chrono::Utc::now() + chrono::Duration::seconds(*EXPIRES);
     let payload = AuthJWT {
         id: user.id,
         iat: now,
-        exp: now + *EXPIRES, // 7 days
+        exp: expires_at.timestamp(),
     };
     let token = jsonwebtoken::encode(
         &jsonwebtoken::Header::default(),
@@ -27,7 +30,7 @@ pub async fn sign_jwt(username: &str) -> Result<AuthResponse> {
     )?;
     Ok(AuthResponse {
         token,
-        exp_at: chrono::Utc::now() + chrono::Duration::minutes(*EXPIRES),
+        exp_at: expires_at,
     })
 }
 

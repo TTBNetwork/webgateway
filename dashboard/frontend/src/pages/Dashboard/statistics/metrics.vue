@@ -136,33 +136,66 @@ import PanelViewData from '../../../components/PanelViewData.vue';
 import { get_access_info } from '../../../apis/access';
 import type { AccessInfo } from '../../../types/access';
 import { formatBytes, formatNumber } from '../../../units';
+import { isAbortError } from '../../../utils';
 import DataView from '../../../components/DataView.vue';
+import { useVisiblePolling } from '../../../composables/useVisiblePolling';
+
+const POLL_INTERVAL_MS = 60000;
+const SWITCH_DEBOUNCE_MS = 250;
 
 const data = ref<AccessInfo>();
-const task = ref();
 const props = defineProps({
     in_days: {
         type: Number,
         default: 1,
     },
 });
-async function refreshInfo() {
-    data.value = await get_access_info(props.in_days);
-    clearTimeout(task.value);
-    task.value = setTimeout(refreshInfo, 60000);
+
+// 取消 + 请求序号双重保护：切换区间时取消在途请求，且过期响应永远不会覆盖新数据
+let controller: AbortController | undefined;
+let requestSeq = 0;
+let switchTimer: ReturnType<typeof setTimeout> | undefined;
+
+async function refreshInfo(): Promise<void> {
+    const seq = ++requestSeq;
+    controller?.abort();
+    const current = new AbortController();
+    controller = current;
+    const inDays = props.in_days;
+    try {
+        const resp = await get_access_info(inDays, current.signal);
+        if (seq !== requestSeq) return; // 过期响应，直接丢弃
+        data.value = resp;
+    } catch (error) {
+        // 被新请求取代的旧请求不是失败，不应触发退避
+        if (isAbortError(error)) return;
+        throw error; // 交给轮询器记录失败并指数退避
+    }
 }
+
+const poller = useVisiblePolling({
+    interval: POLL_INTERVAL_MS,
+    refresh: refreshInfo,
+});
+
+// 切换区间做短暂防抖，避免快速点击叠加多个 30 天全量聚合
 watch(
     () => props.in_days,
     () => {
-        refreshInfo();
+        if (switchTimer !== undefined) clearTimeout(switchTimer);
+        switchTimer = setTimeout(() => {
+            switchTimer = undefined;
+            void poller.refreshNow();
+        }, SWITCH_DEBOUNCE_MS);
     },
 );
 
-onMounted(async () => {
-    refreshInfo();
+onMounted(() => {
+    poller.start();
 });
 onUnmounted(() => {
-    clearTimeout(task.value);
+    if (switchTimer !== undefined) clearTimeout(switchTimer);
+    controller?.abort();
 });
 </script>
 

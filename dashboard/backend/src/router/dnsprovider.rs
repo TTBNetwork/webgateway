@@ -13,7 +13,7 @@ use shared::{
     secret::RemovedSensitiveInfo,
 };
 
-use crate::{auth::middle_refresh_token, response::APIResponse};
+use crate::{auth::middle_refresh_token, models::auth::Authorizer, response::APIResponse};
 
 pub async fn info() -> APIResponse<usize> {
     APIResponse::result(get_database().get_total_of_dns_providers().await)
@@ -37,8 +37,12 @@ pub async fn paged(
 }
 
 pub async fn create(
+    auth: Authorizer,
     Json(dns_provider): Json<CreateDatabaseDNSProvider>,
 ) -> APIResponse<DatabaseDNSProvider> {
+    if let Err(e) = auth.require_write() {
+        return APIResponse::from(e);
+    }
     if dns_provider.domains.is_empty() {
         return APIResponse::error(None, 422, "DNS provider must have at least one domain");
     }

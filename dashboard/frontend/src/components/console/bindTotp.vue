@@ -34,7 +34,7 @@
 </template>
 
 <script setup lang="ts">
-import { onUnmounted, ref, watch } from 'vue';
+import { ref, watch } from 'vue';
 import Dialog from '../../plugins/dialog/Dialog.vue';
 import DialogClose from '../../plugins/dialog/DialogClose.vue';
 import type { BindTotpResponse, BindTotpState } from '../../types/auth';
@@ -44,6 +44,7 @@ import DraftContent from '../../plugins/dialog/templates/DraftContent.vue';
 import { bindTotp, refreshBindTotpQrcode, verifyBindTotp } from '../../auth';
 import addPresentation from '../../plugins/presentation';
 import { QRCodeClient } from 'vue3-next-qrcode';
+import { useVisiblePolling } from '../../composables/useVisiblePolling';
 
 const emit = defineEmits(['close']);
 const state = ref<BindTotpState>('input');
@@ -51,7 +52,29 @@ const consoleInput = ref('');
 const qrcodeInput = ref('');
 const modified = ref(false);
 const bindTotpResponse = ref<BindTotpResponse>();
-const refreshBindTotpQrcodeTask = ref();
+
+async function refreshBindTotpQrcodeNow(): Promise<void> {
+    const resp = await refreshBindTotpQrcode(
+        bindTotpResponse.value?.secret_id || '',
+    );
+    if (resp.status != 200) {
+        throw new Error(resp.message || '刷新动态密码二维码失败');
+    }
+    bindTotpResponse.value = resp.data;
+}
+
+// 可见性门控 + 失败退避的轮询器；绑定成功后必须 stop()，否则会一直申请新密钥
+const totpQrcodePoller = useVisiblePolling({
+    interval: 1000 * 300,
+    refresh: refreshBindTotpQrcodeNow,
+    onError: (error) => {
+        addPresentation(
+            error instanceof Error ? error.message : String(error),
+            'alert',
+        );
+    },
+});
+
 watch(
     () => [state.value, consoleInput.value, qrcodeInput.value],
     () => {
@@ -77,16 +100,7 @@ async function submit() {
             return;
         }
         bindTotpResponse.value = resp.data;
-        refreshBindTotpQrcodeTask.value = setInterval(async () => {
-            const resp = await refreshBindTotpQrcode(
-                bindTotpResponse.value?.secret_id || '',
-            );
-            if (resp.status != 200) {
-                addPresentation(resp.message || '', 'alert');
-                return;
-            }
-            bindTotpResponse.value = resp.data;
-        }, 1000 * 300);
+        totpQrcodePoller.start();
         state.value = 'qrcode';
     } else if (state.value == 'qrcode') {
         if (qrcodeInput.value == '') {
@@ -100,15 +114,14 @@ async function submit() {
             addPresentation(resp.message || '', 'alert');
             return;
         }
+        // 绑定已成功，停止每 5 分钟申请新 TOTP 密钥的轮询
+        totpQrcodePoller.stop();
         state.value = 'verified';
         //state.value = 'verified';
     } else {
         emit('close');
     }
 }
-onUnmounted(() => {
-    clearInterval(refreshBindTotpQrcodeTask.value);
-});
 </script>
 
 <style lang="css" scoped>

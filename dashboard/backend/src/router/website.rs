@@ -10,13 +10,19 @@ use shared::{
     models::websites::{CreateDatabaseWebsite, DatabaseWebsite},
 };
 
-use crate::{auth::middle_refresh_token, response::APIResponse};
+use crate::{auth::middle_refresh_token, models::auth::Authorizer, response::APIResponse};
 
 pub async fn get_all() -> APIResponse<Vec<DatabaseWebsite>> {
     APIResponse::result(get_database().get_websites().await)
 }
 
-pub async fn create(Json(data): Json<CreateDatabaseWebsite>) -> APIResponse<DatabaseWebsite> {
+pub async fn create(
+    auth: Authorizer,
+    Json(data): Json<CreateDatabaseWebsite>,
+) -> APIResponse<DatabaseWebsite> {
+    if let Err(e) = auth.require_write() {
+        return APIResponse::from(e);
+    }
     APIResponse::result(get_database().create_website(&data).await)
 }
 

@@ -1,7 +1,7 @@
 use std::{
     error::Error,
     net::SocketAddr,
-    sync::{Arc, LazyLock},
+    sync::{Arc, LazyLock, atomic::Ordering},
     time::Duration,
 };
 
@@ -108,22 +108,82 @@ async fn accept(listener: CustomDualStackTcpListener) {
     }
 }
 
+/// 把实际监听的端口集合对齐到 `desired`：新增的开始监听，多余的中止。
+///
+/// 修复（ISSUES.md P0-8）：原先 `LISTENERS` 只增不减，站点移除端口后
+/// **该端口会一直被监听**。现在每轮配置同步都做一次 diff。
+pub async fn sync_listeners(desired: Vec<u16>) {
+    let desired: std::collections::HashSet<u16> = desired.into_iter().collect();
+
+    // 关闭不再需要的监听端口。
+    let stale: Vec<u16> = LISTENERS
+        .iter()
+        .map(|entry| *entry.key())
+        .filter(|port| !desired.contains(port))
+        .collect();
+    for port in stale {
+        if let Some((_, handle)) = LISTENERS.remove(&port) {
+            handle.abort();
+            event!(Level::INFO, "Stopped listening on port {port}");
+        }
+    }
+
+    // 启动新增端口。
+    for port in desired {
+        if let Err(e) = listen(port).await {
+            event!(Level::ERROR, "Failed to listen port {port}: {e}");
+        }
+    }
+}
+
+/// 开始监听某个端口。
+///
+/// 修复（P1-8）：原先 `contains_key` → `spawn` → `insert` 不是原子操作，
+/// 并发调用（启动同步与 NOTIFY 处理同时触发）会重复 bind；又因为
+/// `listener.rs` 开启了 `SO_REUSEPORT`，两次 bind 都会"成功"，
+/// 连接被内核分摊到两个 accept 循环。同时 bind 失败只会在任务内 panic，
+/// 而 `LISTENERS` 已经标记该端口"已监听"，站点静默不服务且日志无线索。
+/// 这里改为：先 bind 成功，再插入监听表。
 pub async fn listen(port: u16) -> anyhow::Result<()> {
     if LISTENERS.contains_key(&port) {
         return Ok(());
     }
+    let listener = CustomDualStackTcpListener::new_by_port(port)
+        .await
+        .map_err(|e| anyhow::anyhow!("Failed to bind port {port}: {e}"))?;
+    match listener.local_addrs() {
+        Ok(addrs) => event!(Level::INFO, "Listening on {addrs:?}"),
+        Err(e) => event!(
+            Level::WARN,
+            "Listening on port {port} but cannot read local addrs: {e}"
+        ),
+    }
     let thread = tokio::spawn(async move {
-        let listener = CustomDualStackTcpListener::new_by_port(port).await.unwrap();
-        event!(
-            Level::INFO,
-            "Listening on {:?}",
-            listener.local_addrs().unwrap()
-        );
         accept(listener).await;
     });
 
     LISTENERS.insert(port, thread);
     Ok(())
+}
+
+/// 去掉 Host 头里的端口，只保留主机名。
+///
+/// 支持三种形式：`example.com`、`example.com:8080`、`[::1]:8080`。
+/// 这样做是为了让站点匹配不受监听端口影响：站点配置里通常只写主机名，
+/// 而浏览器访问非默认端口时 `Host` 会带端口。
+fn strip_port(host: &str) -> &str {
+    // IPv6 字面量：`[::1]:8080` → `[::1]`；`[::1]` → `[::1]`
+    if let Some(rest) = host.strip_prefix('[') {
+        return match rest.find(']') {
+            Some(idx) => &host[..idx + 2],
+            None => host,
+        };
+    }
+    // 主机名 / IPv4：只按最后一个冒号切分，避免误伤 IPv6（上面已处理）。
+    match host.rsplit_once(':') {
+        Some((name, _port)) if !name.is_empty() => name,
+        _ => host,
+    }
 }
 
 // ==================== ConnectionCycle ====================
@@ -213,8 +273,11 @@ impl ConnectionCycle {
         base_state: Arc<BaseClientState>,
         connection_req: Arc<ConnectionRequest>,
     ) -> anyhow::Result<hyper::Response<CResponse>> {
+        // Host 头可能带端口（`example.com:8080`、`[::1]:8080`），而站点配置里
+        // 通常只写主机名。不做归一化的话，监听非 80/443 端口时所有请求都会
+        // 匹配不到站点而返回 404 —— 多端口监听等于完全失效。
         let site = get_website(
-            connection_req.host.as_str(),
+            strip_port(connection_req.host.as_str()),
             Some(connection_req.path.as_str()),
         )
         .await;
@@ -335,21 +398,54 @@ impl ConnectionCycle {
             .get()
             .await
             .with_context(|| "Unavailable connection from pool")?;
-        let conn = pooled; //.conn.ok_or_else(|| anyhow::anyhow!("No connection"))?;
+        // 响应体读到 EOF 时会置位这个共享标志；只有它被置位，连接才允许回到池中。
+        // 客户端中途断开导致响应体没读完时，连接会被关闭（P0-5）。
+        let body_drained = pooled.drained_flag();
+        // 连接任务与响应体各持一份引用。
+        let body_drained_for_task = body_drained.clone();
 
-        let io = TokioIo::new(conn);
-        let (mut c_req, connection) = client::conn::http1::Builder::new()
+        // 把整个 `PooledUpstreamConnection`（含连接许可）交进 hyper 的 IO：
+        // 它会被持有到连接任务结束，`Drop` 时按 `reusable` 决定归还还是关闭。
+        // 许可若在这里提前释放，池的并发上限就会被绕过（P0-6）。
+        let io = TokioIo::new(pooled);
+        let (mut c_req, mut connection) = client::conn::http1::Builder::new()
             .handshake(io)
             .await
             .with_context(|| "Failed to handshake upstream")?;
 
         tokio::task::spawn(async move {
-            match timeout(Duration::from_secs(120), connection.with_upgrades()).await {
-                Ok(Ok(())) => {}
-                Ok(Err(e)) => event!(Level::ERROR, "Upstream connection error: {e}"),
-                Err(_) => event!(Level::WARN, "Upstream connection timeout, force closing"),
+            // 用 `poll_without_shutdown` 而不是 `with_upgrades()`：这样连接结束时可以
+            // `into_parts()` 取回 IO 对象（内含 `PooledUpstreamConnection`），
+            // 由我们带外决定归还还是关闭。若直接 `with_upgrades()` 消费掉
+            // `Connection`，IO 会随之 drop，只能依赖 IO 自身的 `Drop`，
+            // 连接许可与复用判定都会失控。
+            let deadline = tokio::time::Instant::now() + Duration::from_secs(120);
+            let finished = std::future::poll_fn(|cx| {
+                if tokio::time::Instant::now() >= deadline {
+                    return std::task::Poll::Ready(Err(()));
+                }
+                match connection.poll_without_shutdown(cx) {
+                    std::task::Poll::Ready(Ok(())) => std::task::Poll::Ready(Ok(())),
+                    std::task::Poll::Ready(Err(e)) => {
+                        event!(Level::ERROR, "Upstream connection error: {e}");
+                        std::task::Poll::Ready(Ok(()))
+                    }
+                    std::task::Poll::Pending => std::task::Poll::Pending,
+                }
+            })
+            .await;
+
+            if finished.is_err() {
+                event!(Level::WARN, "Upstream connection timeout, force closing");
             }
-            // println!("done");
+            // 取回 IO 并释放：IO 的 `Drop` 会依据共享标志决定归还或关闭连接。
+            let parts = connection.into_parts();
+            drop(parts.read_buf);
+            if finished.is_err() {
+                // 超时必须强制不可复用：清掉标志，保证 Drop 关闭连接。
+                body_drained_for_task.store(false, Ordering::Release);
+            }
+            drop(parts.io);
         });
 
         let origin_version = origin_req.version();
@@ -363,17 +459,34 @@ impl ConnectionCycle {
             v.extend(origin_req.extensions().clone());
         }
         req = req.uri({
-            let current_uri = pool.get_path().map_or_else(
-                || origin_req.uri().path().to_string(),
-                |v| {
-                    let a = v.join(&origin_req.uri().path()[1..]).unwrap();
-                    a.path().to_string()
-                },
-            );
+            // 修复（P1-5）：
+            // 1) 原代码对 `uri.path()` 无条件做 `[1..]` 切片，authority-form 请求
+            //    （如 `CONNECT host:port`）的 path 是空串，`&""[1..]` 会越界 panic，
+            //    而这个分支**总是**会被走到（`get_path()` 必然返回 Some）。
+            // 2) 原代码用 `Url::join` 拼接，遵循 RFC 3986 —— 对没有尾斜杠的 base
+            //    会替换掉最后一段：后端配置 `http://h/api` 时 `join("foo/bar")`
+            //    得到 `http://h/foo/bar`，`/api` 前缀被静默丢弃。
+            // 这里改为显式保留 base path 前缀，并对空 path / join 失败做兜底。
+            let origin_path = origin_req.uri().path();
+            let base = pool
+                .get_path()
+                .map(|v| v.path().trim_end_matches('/'))
+                .filter(|v| !v.is_empty() && *v != "/");
+            let path = match base {
+                Some(base) => {
+                    // 显式拼接，保留 `/api` 这类 base path 前缀（不再用 `Url::join`）。
+                    if origin_path.is_empty() {
+                        format!("{base}/")
+                    } else {
+                        format!("{base}{origin_path}")
+                    }
+                }
+                None => origin_path.to_owned(),
+            };
             if let Some(query) = origin_req.uri().query() {
-                format!("{}?{}", current_uri, query)
+                format!("{}?{}", path, query)
             } else {
-                current_uri
+                path
             }
         });
 
@@ -400,11 +513,14 @@ impl ConnectionCycle {
         parts.version = origin_version;
         let final_resp = Response::from_parts(
             parts,
-            CResponse::Incoming(StatisticsIncoming::new(
-                state.id,
-                b,
-                crate::transport::StatisticsIncomingType::Response,
-            )),
+            CResponse::Incoming(
+                StatisticsIncoming::new(
+                    state.id,
+                    b,
+                    crate::transport::StatisticsIncomingType::Response,
+                )
+                .with_body_drained_flag(body_drained),
+            ),
         );
         Ok(final_resp)
     }
@@ -446,16 +562,22 @@ impl ConnectionCycle {
             }
         });
 
-        // 4. 构造转发请求
-        let path = pool.get_path().map_or_else(
-            || original_uri.path().to_string(),
-            |v| {
-                v.join(&original_uri.path()[1..])
-                    .unwrap()
-                    .path()
-                    .to_string()
-            },
-        );
+        // 4. 构造转发请求（路径拼接与普通转发保持一致，见 P1-5）
+        let origin_path = original_uri.path();
+        let base = pool
+            .get_path()
+            .map(|v| v.path().trim_end_matches('/'))
+            .filter(|v| !v.is_empty() && *v != "/");
+        let path = match base {
+            Some(base) => {
+                if origin_path.is_empty() {
+                    format!("{base}/")
+                } else {
+                    format!("{base}{origin_path}")
+                }
+            }
+            None => origin_path.to_owned(),
+        };
         let query = original_uri.query().unwrap_or_default();
         let new_uri = if query.is_empty() {
             path
@@ -550,5 +672,23 @@ impl ConnectionCycle {
             Ok(final_backend_resp)
             // anyhow::bail!("Backend responded with {}", final_backend_resp.status());
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::strip_port;
+
+    #[test]
+    fn strips_port_from_host_header() {
+        assert_eq!(strip_port("example.com"), "example.com");
+        assert_eq!(strip_port("example.com:8080"), "example.com");
+        assert_eq!(strip_port("example.com:80"), "example.com");
+        assert_eq!(strip_port("[::1]:8080"), "[::1]");
+        assert_eq!(strip_port("[::1]"), "[::1]");
+        assert_eq!(strip_port("127.0.0.1:18081"), "127.0.0.1");
+        // 没有端口、结尾是冒号等异常输入不应 panic。
+        assert_eq!(strip_port(""), "");
+        assert_eq!(strip_port(":8080"), ":8080");
     }
 }

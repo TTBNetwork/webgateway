@@ -1,4 +1,7 @@
-use std::sync::{Arc, LazyLock};
+use std::{
+    sync::{Arc, LazyLock},
+    time::Duration,
+};
 
 use rustls::ServerConfig;
 use shared::database::get_database;
@@ -9,11 +12,19 @@ use crate::{
         cert::{AutoCertificate, sync_certificates},
         websites::sync_websites,
     },
-    upstream::listen,
+    upstream::sync_listeners,
 };
 
 pub mod cert;
 pub mod websites;
+
+/// 周期性兜底全量同步的间隔。
+///
+/// 恢复该机制的原因（ISSUES.md P0-7 问题 B）：NOTIFY 依赖数据库触发器，
+/// 而触发器在重建窗口内、或通知在连接重连期间丢失时，网关会**永久**使用旧配置，
+/// 直到进程重启。原先的兜底轮询被注释掉了，于是「真空期修改站点配置 → 网关永久不同步」。
+/// 对账式全量同步本身很便宜（表规模小），每 10 秒跑一次即可作为最终一致性保障。
+const FALLBACK_SYNC_INTERVAL: Duration = Duration::from_secs(10);
 
 pub static SERVER_CONFIG: LazyLock<Arc<ServerConfig>> = LazyLock::new(|| {
     Arc::new({
@@ -31,11 +42,16 @@ pub async fn main() -> anyhow::Result<()> {
         event!(Level::ERROR, "Failed to sync first config: {e}");
         return Err(e);
     }
-    // tokio::spawn(tokio_schedule::every(10).seconds().perform(|| async {
-    //     if let Err(e) = sync_config().await {
-    //         event!(Level::ERROR, "Failed to sync config: {e}");
-    //     }
-    // }));
+
+    // 周期兜底同步：即使 NOTIFY 丢失（触发器真空期、连接抖动）也能自愈。
+    tokio::spawn(async move {
+        loop {
+            tokio::time::sleep(FALLBACK_SYNC_INTERVAL).await;
+            if let Err(e) = sync_config().await {
+                event!(Level::ERROR, "Failed to run fallback config sync: {e}");
+            }
+        }
+    });
 
     tokio::spawn(async move {
         match get_database()
@@ -43,14 +59,7 @@ pub async fn main() -> anyhow::Result<()> {
                 event!(Level::INFO, "Recvied notification, syncing websites");
                 match sync_websites().await {
                     Ok(ports) => {
-                        for port in ports {
-                            match listen(port).await {
-                                Err(e) => event!(Level::ERROR, "Failed to listen port {port}: {e}"),
-                                Ok(()) => {
-                                    event!(Level::INFO, "Listen port {port}");
-                                }
-                            }
-                        }
+                        sync_listeners(ports).await;
                     }
                     Err(e) => {
                         event!(Level::ERROR, "Failed to sync websites: {e}");
@@ -90,9 +99,7 @@ pub async fn sync_config() -> anyhow::Result<()> {
     sync_certificates().await?;
     event!(Level::DEBUG, "Syncing websites");
     let ports = sync_websites().await?;
-    for port in ports {
-        listen(port).await?;
-    }
-    // maybe need clean LINKED_WEBSITES, maybe make a lat performance
+    // 对账式监听：新端口开始监听，已移除的端口关闭监听（P0-8）。
+    sync_listeners(ports).await;
     Ok(())
 }

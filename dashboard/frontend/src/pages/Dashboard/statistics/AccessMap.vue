@@ -10,11 +10,18 @@
     </Panel>
 </template>
 <script setup lang="ts">
-import { computed, defineAsyncComponent, onMounted, ref, watch } from 'vue';
+import {
+    computed,
+    defineAsyncComponent,
+    onMounted,
+    onUnmounted,
+    ref,
+    watch,
+} from 'vue';
 import Panel from '../../../components/Panel.vue';
 import type { MapType } from '../../../types/access';
 import { get_access_map } from '../../../apis/access';
-import { debounce } from 'vue-debounce';
+import { isAbortError } from '../../../utils';
 const vchart = defineAsyncComponent(() => import('vue-echarts'));
 const type = ref<MapType>('global');
 const props = defineProps({
@@ -23,7 +30,11 @@ const props = defineProps({
         default: 1,
     },
 });
-const data = ref([]);
+interface MapSeriesItem {
+    name: string;
+    value: number;
+}
+const data = ref<MapSeriesItem[]>([]);
 const options = computed(() => ({
     tooltip: {
         trigger: 'item',
@@ -55,13 +66,53 @@ const options = computed(() => ({
         data: data.value,
     },
 }));
-async function refresh() {
-    const resp = await get_access_map(props.in_days, type.value);
-    console.log(resp);
+const SWITCH_DEBOUNCE_MS = 300;
+let controller: AbortController | undefined;
+let requestSeq = 0;
+let switchTimer: ReturnType<typeof setTimeout> | undefined;
+
+async function refresh(): Promise<void> {
+    const seq = ++requestSeq;
+    controller?.abort();
+    const current = new AbortController();
+    controller = current;
+    try {
+        // 后端返回 HashMap<国家/地区, 次数>，转换为 ECharts map 需要的 { name, value } 序列
+        const resp = await get_access_map(
+            props.in_days,
+            type.value,
+            current.signal,
+        );
+        if (seq !== requestSeq) return; // 过期响应，直接丢弃
+        data.value = Object.entries(resp).map(([name, value]) => ({
+            name,
+            value,
+        }));
+    } catch (error) {
+        // 被新请求取代不算失败；真正的失败保留旧数据
+        if (isAbortError(error)) return;
+        console.error('获取访问地图失败', error);
+    }
 }
-watch(() => type.value, debounce(refresh, 500));
+
+// 切换时间范围（以及未来的地图类型切换）时防抖刷新，避免叠加全量聚合
+watch(
+    () => [props.in_days, type.value],
+    () => {
+        if (switchTimer !== undefined) clearTimeout(switchTimer);
+        switchTimer = setTimeout(() => {
+            switchTimer = undefined;
+            void refresh();
+        }, SWITCH_DEBOUNCE_MS);
+    },
+);
+
 onMounted(async () => {
     await refresh();
+});
+onUnmounted(() => {
+    if (switchTimer !== undefined) clearTimeout(switchTimer);
+    controller?.abort();
 });
 </script>
 

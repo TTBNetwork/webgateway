@@ -11,6 +11,17 @@ export function increaseInputID() {
 export const got = ky.create({
     prefixUrl: new URL('/api', window.location.origin).toString(),
     throwHttpErrors: false,
+    // ky retries idempotent requests (GET/HEAD/PUT/DELETE/...) twice by default
+    // for 408/413/429/500/502/503/504. When the database is under stress this
+    // turns a single dashboard poll into three full-table aggregations, creating
+    // a positive feedback loop (ISSUES.md P0-11). The dashboard has no flow that
+    // depends on automatic retries, so disable them globally. Errors are
+    // surfaced to the caller (and to the polling backoff) instead.
+    retry: 0,
+    // Explicit request timeout: bound hung requests and keep the polling
+    // backoff responsive. (ky's default is 10s; 15s gives the heavier 30-day
+    // aggregations a little more headroom while still failing fast.)
+    timeout: 15000,
     hooks: {
         afterResponse: [
             async (_, __, response) => {

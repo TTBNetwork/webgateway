@@ -17,3 +17,11 @@ export function formatDate(t: Date | string | number): string {
     const seconds = String(date.getSeconds()).padStart(2, '0');
     return `${year}-${month}-${day} ${hours}:${minutes}:${seconds}`;
 }
+
+/** 判断错误是否来自 AbortController 取消（被新请求取代，并非真正的失败）。 */
+export function isAbortError(error: unknown): boolean {
+    return (
+        (error instanceof DOMException && error.name === 'AbortError') ||
+        (error instanceof Error && error.name === 'AbortError')
+    );
+}

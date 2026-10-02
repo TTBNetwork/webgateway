@@ -1,4 +1,5 @@
 use sqlx::types::Json;
+use sqlx::{Postgres, Transaction};
 use sqlx_pg_ext_uint::c_u16::U16;
 
 use crate::{
@@ -9,12 +10,12 @@ use crate::{
 
 #[async_trait::async_trait]
 pub trait DatabaseWebsiteInitializer {
-    async fn initialize_websites(&self) -> anyhow::Result<()>;
+    async fn initialize_websites(&self, tx: &mut Transaction<'_, Postgres>) -> anyhow::Result<()>;
 }
 
 #[async_trait::async_trait]
 impl DatabaseWebsiteInitializer for Database {
-    async fn initialize_websites(&self) -> anyhow::Result<()> {
+    async fn initialize_websites(&self, tx: &mut Transaction<'_, Postgres>) -> anyhow::Result<()> {
         for sql in [
             r#"CREATE TABLE IF NOT EXISTS websites (
                 id TEXT PRIMARY KEY,
@@ -31,9 +32,9 @@ impl DatabaseWebsiteInitializer for Database {
             "CREATE INDEX IF NOT EXISTS idx_websites_name ON websites USING GIN (name);",
             "CREATE INDEX IF NOT EXISTS idx_websites_created_at ON websites (created_at);",
         ] {
-            sqlx::query(sql).execute(&self.pool).await?;
+            sqlx::query(sql).execute(&mut **tx).await?;
         }
-        self.create_trigger_notify("websites").await?;
+        self.create_trigger_notify_tx(tx, "websites").await?;
         Ok(())
     }
 }

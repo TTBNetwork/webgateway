@@ -1,5 +1,6 @@
 use async_trait::async_trait;
 use sqlx::types::Json;
+use sqlx::{Postgres, Transaction};
 
 use crate::{
     database::Database,
@@ -10,12 +11,12 @@ use anyhow::Result;
 
 #[async_trait]
 pub trait DatabaseDNSProviderInitializer {
-    async fn initialize_dns_provider(&self) -> Result<()>;
+    async fn initialize_dns_provider(&self, tx: &mut Transaction<'_, Postgres>) -> Result<()>;
 }
 
 #[async_trait]
 impl DatabaseDNSProviderInitializer for Database {
-    async fn initialize_dns_provider(&self) -> Result<()> {
+    async fn initialize_dns_provider(&self, tx: &mut Transaction<'_, Postgres>) -> Result<()> {
         sqlx::query(
             r#"
             CREATE TABLE IF NOT EXISTS dns_providers (
@@ -28,9 +29,9 @@ impl DatabaseDNSProviderInitializer for Database {
             )
         "#,
         )
-        .execute(&self.pool)
+        .execute(&mut **tx)
         .await?;
-        self.create_trigger_notify("dns_providers").await?;
+        self.create_trigger_notify_tx(tx, "dns_providers").await?;
         Ok(())
     }
 }

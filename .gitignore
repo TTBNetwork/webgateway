@@ -13,3 +13,5 @@ node_modules
 ipdb/data
 ipdb/test
 dev/environment
+
+tests/*

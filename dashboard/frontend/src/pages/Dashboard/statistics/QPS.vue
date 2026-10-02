@@ -29,6 +29,7 @@ import { type ResponseQPS, type QPS } from '../../../types/access';
 import { isDark } from '../../../theme';
 import { darkMainColor, lightMainColor } from '../../../constant';
 import { debounce } from 'vue-debounce';
+import { useVisiblePolling } from '../../../composables/useVisiblePolling';
 
 // 异步加载 ECharts 组件
 const vchart = defineAsyncComponent(() => import('vue-echarts'));
@@ -103,8 +104,7 @@ const option = computed(() => ({
     ],
 }));
 
-// 定时器句柄
-const task = ref<ReturnType<typeof setTimeout>>();
+// 定时器句柄由 useVisiblePolling 内部管理
 
 // 组件属性：显示的数据点数量（默认 60 个，对应 5 分钟）
 const qps_chart = ref<HTMLDivElement>();
@@ -150,34 +150,41 @@ function setData() {
 }
 
 async function refreshQPS() {
-    try {
-        const resp = (await get_qps(undefined)).data;
-        respData.value = resp;
-        setData();
-    } catch (error) {
-        // console.error('获取 QPS 数据失败', error);
-        // 失败时不更新 data，保留旧数据
+    const resp = await get_qps(undefined);
+    // ky 关闭了自动重试且 throwHttpErrors: false，失败时响应仍会 resolve，
+    // 因此这里必须显式抛出，交给轮询器做指数退避。
+    if (resp.status !== 200 || !resp.data) {
+        throw new Error(resp.message || `获取 QPS 数据失败 (${resp.status})`);
     }
+    respData.value = resp.data;
+    setData();
+}
 
-    // 5. 安排下一次刷新，对齐到下一个“中间时刻”（与组件初始化逻辑一致）
-    clearTimeout(task.value);
+// 对齐到下一个“中间时刻”（与组件初始化逻辑一致）
+function nextBoundaryDelay(): number {
     const now = Date.now();
     const nextBoundary =
         Math.ceil((now - OFFSET_MS) / INTERVAL_MS) * INTERVAL_MS + OFFSET_MS;
-    let delay = nextBoundary - now;
-    if (delay < 0) delay = 0; // 防御性代码
-    task.value = setTimeout(refreshQPS, delay);
+    return Math.max(0, nextBoundary - now);
 }
+
+// 可见性门控 + 失败退避的轮询器；成功时仍按 5s 墙钟边界对齐。
+const poller = useVisiblePolling({
+    interval: INTERVAL_MS,
+    refresh: refreshQPS,
+    nextDelay: nextBoundaryDelay,
+    maxBackoffMs: 60000,
+});
 
 // 组件挂载后立即开始刷新
 onMounted(() => {
-    refreshQPS();
+    poller.start();
     observer.observe(qps_chart.value!);
 });
 
-// 组件卸载时清除定时器
+// 组件卸载时停止轮询并断开 ResizeObserver
+// （useVisiblePolling 会在卸载时自行清理定时器与 visibilitychange 监听）
 onUnmounted(() => {
-    clearTimeout(task.value);
     observer.disconnect();
 });
 </script>

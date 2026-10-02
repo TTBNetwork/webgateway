@@ -50,15 +50,19 @@ CREATE INDEX IF NOT EXISTS idx_access_request_size_logs_id ON access_request_siz
 CREATE INDEX IF NOT EXISTS idx_access_response_size_logs_id ON access_response_size_logs (id);
 CREATE INDEX IF NOT EXISTS idx_access_request_size_logs_req_id ON access_request_size_logs (request_id);
 CREATE INDEX IF NOT EXISTS idx_access_response_size_logs_resp_id ON access_response_size_logs (response_id);
+-- 访问地图按 remote_addr 聚合（ISSUES.md P1-1）：与 requested_at 组成复合索引，兼顾窗口过滤。
+CREATE INDEX IF NOT EXISTS idx_access_request_logs_remote_addr_time ON access_request_logs (remote_addr, requested_at);
 
+-- 注意：视图内的 ORDER BY 是冗余的（外层查询总会再排序），
+-- 且会让优化器难以对视图做谓词下推。QPS 查询已改为直接过滤 requested_at（见
+-- crates/shared/src/database/access.rs），这两个视图仅为兼容保留（ISSUES.md P0-3 / P2-1）。
 CREATE OR REPLACE VIEW qps_per_second AS
     SELECT
         date_trunc('second', requested_at) AS time,
         COUNT(req.id) AS total_requests,
         COUNT(req.id) AS qps  
     FROM access_request_logs req
-    GROUP BY time
-    ORDER BY time DESC;
+    GROUP BY time;
 
 CREATE OR REPLACE VIEW qps_per_5s AS
     SELECT
@@ -66,8 +70,7 @@ CREATE OR REPLACE VIEW qps_per_5s AS
         COUNT(req.id) AS total_requests,                
         COUNT(req.id) / 5.0 AS avg_qps                   
     FROM access_request_logs req
-    GROUP BY time
-    ORDER BY time DESC;
+    GROUP BY time;
 
 CREATE OR REPLACE VIEW daily_traffic_by_website AS
     SELECT

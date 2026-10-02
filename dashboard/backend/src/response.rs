@@ -120,6 +120,40 @@ impl IntoResponse for AppError {
     }
 }
 
+/// 把 [`AppError`] 转成任意 `APIResponse<T>`。
+///
+/// 授权检查（`require_write` / `require_admin`）会返回 `AppError`，
+/// 而 handler 的返回类型是 `APIResponse<Something>`，因此需要一个泛型的转换入口，
+/// 让 `return auth.require_write().map_err(Into::into)?;` 这类写法可用。
+impl<T: Serialize> From<AppError> for APIResponse<T> {
+    fn from(err: AppError) -> Self {
+        let status = err.status_code();
+        APIResponse::error(None, status.as_u16(), err.message())
+    }
+}
+
+impl AppError {
+    pub fn status_code(&self) -> StatusCode {
+        match self {
+            AppError::BadRequest(_) => StatusCode::BAD_REQUEST,
+            AppError::Unauthorized => StatusCode::UNAUTHORIZED,
+            AppError::Forbidden => StatusCode::FORBIDDEN,
+            AppError::NotFound(_) => StatusCode::NOT_FOUND,
+            AppError::Internal(_) => StatusCode::INTERNAL_SERVER_ERROR,
+        }
+    }
+
+    pub fn message(&self) -> String {
+        match self {
+            AppError::BadRequest(msg) => msg.clone(),
+            AppError::Unauthorized => "Unauthorized".to_string(),
+            AppError::Forbidden => "Forbidden".to_string(),
+            AppError::NotFound(msg) => msg.clone(),
+            AppError::Internal(e) => format!("Internal server error: {e}"),
+        }
+    }
+}
+
 // 将 anyhow::Error 转换为 AppError::Internal
 impl<E> From<E> for AppError
 where
@@ -131,22 +165,6 @@ where
 }
 
 // AppError into APIResponse
-impl From<AppError> for APIResponse {
-    fn from(err: AppError) -> Self {
-        let (status, message) = match err {
-            AppError::BadRequest(msg) => (StatusCode::BAD_REQUEST, msg),
-            AppError::Unauthorized => (StatusCode::UNAUTHORIZED, "Unauthorized".to_string()),
-            AppError::Forbidden => (StatusCode::FORBIDDEN, "Forbidden".to_string()),
-            AppError::NotFound(msg) => (StatusCode::NOT_FOUND, msg),
-            AppError::Internal(e) => (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                format!("Internal server error: {}", e),
-            ),
-        };
-        Self::error(None, status.as_u16(), message)
-    }
-}
-
 // ---------- 请求日志中间件 ----------
 #[derive(Debug, Clone)]
 #[allow(unused)]

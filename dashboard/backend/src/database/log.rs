@@ -1,12 +1,29 @@
 use anyhow::Result;
 use shared::{database::Database, objectid::ObjectId};
-use sqlx::types::Json;
+use sqlx::{Postgres, Transaction, types::Json};
 
 use crate::models::log::{Log, LogAddr, LogContent};
 
-#[async_trait::async_trait]
-pub trait WebLogInitializer {
-    async fn initialize_web_log(&self) -> Result<()>;
+/// 在给定事务中创建 `web_log` 表。
+///
+/// 独立函数形式是为了让迁移入口（已持有 advisory lock 的事务）直接复用，
+/// 而不必通过 `Database` 实例。
+pub async fn initialize_web_log_tx(tx: &mut Transaction<'_, Postgres>) -> Result<()> {
+    sqlx::query(
+        r#"
+        CREATE TABLE IF NOT EXISTS web_log (
+            id TEXT PRIMARY KEY,
+            user_id TEXT NOT NULL,
+            content JSONB NOT NULL default '{}',
+            created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+            address TEXT NOT NULL,
+            FOREIGN KEY (user_id) REFERENCES users(id)
+        )
+    "#,
+    )
+    .execute(&mut **tx)
+    .await?;
+    Ok(())
 }
 
 /*
@@ -41,27 +58,6 @@ pub struct LogContentData {
     pub content: String,
     pub params: Vec<LogContentParams>,
 } */
-
-#[async_trait::async_trait]
-impl WebLogInitializer for Database {
-    async fn initialize_web_log(&self) -> Result<()> {
-        sqlx::query(
-            r#"
-            CREATE TABLE IF NOT EXISTS web_log (
-                id TEXT PRIMARY KEY,
-                user_id TEXT NOT NULL,
-                content JSONB NOT NULL default '{}',
-                created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
-                address TEXT NOT NULL,
-                FOREIGN KEY (user_id) REFERENCES users(id)
-            )
-        "#,
-        )
-        .execute(&self.pool)
-        .await?;
-        Ok(())
-    }
-}
 
 #[async_trait::async_trait]
 pub trait WebLogManager {

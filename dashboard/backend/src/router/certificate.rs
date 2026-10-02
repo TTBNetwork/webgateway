@@ -15,7 +15,7 @@ use shared::{
     secret::RemovedSensitiveInfo,
 };
 
-use crate::{auth::middle_refresh_token, response::APIResponse};
+use crate::{auth::middle_refresh_token, models::auth::Authorizer, response::APIResponse};
 
 pub async fn info() -> APIResponse<usize> {
     APIResponse::result(get_database().get_total_of_certificates().await)
@@ -39,8 +39,12 @@ pub async fn paged(
 }
 
 pub async fn create(
+    auth: Authorizer,
     Json(certificate): Json<CreateCertificate>,
 ) -> APIResponse<DatabaseCertificate> {
+    if let Err(e) = auth.require_write() {
+        return APIResponse::from(e);
+    }
     match &certificate.content {
         CreateCertificateMethod::AUTO(context) => {
             if context.hostnames.is_empty() {

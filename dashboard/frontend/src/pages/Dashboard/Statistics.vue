@@ -40,7 +40,7 @@ const query = computed(() => useRoute().query);
         <QPS />
     </div>
     <div class="statistics-overview">
-        <AccessMap></AccessMap>
+        <AccessMap :in_days="+(query?.in_days || 1)"></AccessMap>
         <AccessStatistics></AccessStatistics>
     </div>
 </template>
