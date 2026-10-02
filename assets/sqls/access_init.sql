@@ -24,6 +24,18 @@ CREATE TABLE IF NOT EXISTS access_response_logs (
     website_id              TEXT
 );
 
+-- 请求/响应体大小明细：**每个(请求, 秒)一行**，用于统计"每秒传了多少字节"。
+--
+-- 为什么需要 UNIQUE (xxx_id, at_second)：
+--   1. 粒度：保留每秒颗粒度 —— 这是这两张表的用途（按秒统计流量大小）。
+--   2. 去重：`StatisticsIncoming::poll_frame` 每读到一个 body chunk 就上报一次
+--      （一个响应体常被切成 7+ 块），若每块插一行，生产库实测该表膨胀到
+--      **1600 万行 / 3.6 GB（请求主表的 7.03 倍）**，且近 24 小时仍以 6.4 倍重复率增长
+--      （单条 response_id 最多挂 262791 行）。
+--      有了唯一约束后，同一秒内的多块用 `ON CONFLICT ... DO UPDATE SET body_length =
+--      body_length + EXCLUDED.body_length` **累加**成一行：粒度不丢，行数按秒收敛。
+--
+-- `id` 列保留（主键），便于与既有数据/工具兼容，但唯一性由 (xxx_id, at_second) 表达。
 CREATE TABLE IF NOT EXISTS access_request_size_logs (
     id                      TEXT PRIMARY KEY NOT NULL,
     request_id              TEXT NOT NULL REFERENCES access_request_logs(id),
@@ -37,7 +49,6 @@ CREATE TABLE IF NOT EXISTS access_response_size_logs (
     body_length             uint8 NOT NULL,
     created_at              TIMESTAMPTZ NOT NULL DEFAULT NOW()
 );
-
 
 CREATE INDEX IF NOT EXISTS idx_requested_at ON access_request_logs (requested_at);
 CREATE INDEX IF NOT EXISTS idx_responsed_at ON access_response_logs (responsed_at);

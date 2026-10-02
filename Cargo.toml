@@ -10,3 +10,10 @@ members = [
     "mnt"
 ]
 resolver = "3"
+
+# acmex 0.8.0 把 `aws-lc-rs` 的 `fips` feature 硬编码在依赖声明里（见
+# vendor/acmex/Cargo.toml 的补丁说明）。FIPS 后端 `aws-lc-fips-sys` 在较新的
+# binutils 上无法构建（".data section found in module"），会让整个 workspace
+# 产不出 release 产物，因此这里用本地 vendored 副本替换 crates.io 版本。
+[patch.crates-io]
+acmex = { path = "vendor/acmex" }

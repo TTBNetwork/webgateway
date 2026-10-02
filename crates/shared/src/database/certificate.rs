@@ -2,6 +2,7 @@ use anyhow::Result;
 use async_trait::async_trait;
 use chrono::{DateTime, Utc};
 use sqlx::{Postgres, Transaction};
+use tracing::{Level, event};
 
 use crate::{
     database::Database,
@@ -11,6 +12,14 @@ use crate::{
     },
     objectid::ObjectId,
 };
+
+/// 超过这个时长仍未释放的签发认领视为**过期**，可被重新认领。
+///
+/// 存在的意义：签发进程被强杀（SIGKILL / OOM / `docker kill`）时
+/// `SigningGuard::drop` 不会执行，`signing_started_at` 会永远留在旧值上，
+/// 该证书再也不会被选中续签。10 分钟远大于正常签发耗时（DNS-01 挑战通常
+/// 数十秒），因此不会误抢正在进行的签发。
+const STALE_SIGNING_CLAIM: &str = "10 minutes";
 
 #[async_trait]
 pub trait DatabaseCertificateInitializer {
@@ -220,12 +229,19 @@ impl DatabaseCertificateModifiyRepository for Database {
         // 让并发实例直接跳过已被锁住的行，而不是排队等待后再重复签发（P0-14）。
         // 用 `clock_timestamp()` 而不是 `NOW()`：后者是事务开始时间，
         // 长事务会让标记时间失真（与 P0-9 同一类问题）。
+        //
+        // 关于 `signing_started_at < clock_timestamp() - STALE_SIGNING_CLAIM`：
+        // 释放认领原本只由 `SigningGuard::drop` 负责，而进程被 SIGKILL / OOM /
+        // `docker kill` 打断时 `Drop` 根本不会执行 → 该行永远停留在"已认领"状态，
+        // 再也不被任何实例选中，证书静默到期、HTTPS 中断（P0-13 同类后果）。
+        // 这里把"过期的认领"视同未认领，使崩溃后能自动恢复，无需人工改库。
         let mut tx = self.pool.begin().await?;
         let cert = sqlx::query_as::<_, NeedSignCertificate>(
             r#"
-            SELECT id, name, hostnames, dns_provider_id
+            SELECT id, name, hostnames, dns_provider_id, email
               FROM certificates
-             WHERE signing_started_at IS NULL
+             WHERE (signing_started_at IS NULL
+                    OR signing_started_at < clock_timestamp() - $1::INTERVAL)
                AND (expires_at IS NULL OR expires_at < NOW() + '7 days'::INTERVAL)
                AND dns_provider_id IS NOT NULL
                AND email IS NOT NULL
@@ -234,6 +250,7 @@ impl DatabaseCertificateModifiyRepository for Database {
              FOR UPDATE SKIP LOCKED
             "#,
         )
+        .bind(STALE_SIGNING_CLAIM)
         .fetch_optional(&mut *tx)
         .await?;
 
@@ -246,6 +263,17 @@ impl DatabaseCertificateModifiyRepository for Database {
             .await?;
         }
         tx.commit().await?;
+
+        if let Some(cert) = &cert {
+            // 被回收的过期认领要留下痕迹：如果频繁出现，说明签发进程在反复崩溃。
+            event!(
+                Level::WARN,
+                "Claimed certificate {} for signing (a stale claim older than {} was recycled, \
+                 which usually means a previous signing process died without releasing it)",
+                cert.id,
+                STALE_SIGNING_CLAIM
+            );
+        }
         Ok(cert)
     }
 

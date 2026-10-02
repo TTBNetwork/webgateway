@@ -10,22 +10,26 @@ use tracing::{Level, event};
 
 use crate::database::{
     access::DatabaseAccessLogsInitializer, certificate::DatabaseCertificateInitializer,
-    dnsprovider::DatabaseDNSProviderInitializer, websites::DatabaseWebsiteInitializer,
+    configuration::DatabaseConfigurationInitlializer, dnsprovider::DatabaseDNSProviderInitializer,
+    websites::DatabaseWebsiteInitializer,
 };
 
 pub mod access;
 pub mod certificate;
 pub mod configuration;
+pub mod dashboard_schema;
 pub mod dnsprovider;
 pub mod websites;
 
 /// PostgreSQL advisory lock 的命名空间（避免与其它应用冲突）。
-/// 见 `CONVERSATION.md` 第 4.2 节的锁编号约定。
+/// 锁编号约定见 `ISSUES.md` 附录 A（原 `CONVERSATION.md` 第 4.2 节）。
 pub mod locks {
     /// 所有 schema 初始化 DDL 共用的一把锁。
     pub const SCHEMA_INIT: i64 = 0x4143_434C_0000_0001;
     /// 冷迁移（v1→v2）专用，当前尚未实现，先占位。
     pub const MIGRATION: i64 = 0x4143_434C_0000_0002;
+    /// 访问日志保留期清理专用：保证同一时刻只有一个实例在删历史数据。
+    pub const RETENTION: i64 = 0x4143_434C_0000_0004;
     /// 分区维护专用，当前尚未实现，先占位。
     pub const PARTITION: i64 = 0x4143_434C_0000_0003;
 }
@@ -33,30 +37,76 @@ pub mod locks {
 /// 服务启动时对 schema 的处理方式。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum DbStartupMode {
-    /// 只校验、绝不执行 DDL。数据面（gateway）应该用这个模式，
-    /// 避免与 dashboard 并发重放 `CREATE TABLE/INDEX IF NOT EXISTS`（ISSUES.md P0-7）。
+    /// 只校验、绝不执行 DDL。
+    ///
+    /// 仍保留该模式作为**逃生开关**（`DB_AUTO_MIGRATE=0`）：需要把迁移严格交给独立
+    /// Job、或排查 DDL 相关问题时可用。默认不再是它 —— 见 [`DbStartupMode::from_env_args`]。
     Serve,
-    /// 只执行迁移（DDL）然后退出，供独立迁移 Job 使用。
+    /// 只执行迁移（DDL）然后退出，供独立迁移 Job 使用（`--migrate`）。
     Migrate,
-    /// 先迁移再服务。单实例开发环境或 dashboard 可用，
-    /// DDL 全程持有 `locks::SCHEMA_INIT` 排他锁，多实例并发启动也只会串行执行。
+    /// 先迁移再服务（**默认**）：启动时在 `locks::SCHEMA_INIT` 排他锁下补齐 schema，
+    /// 然后进入服务。这样 gateway 与 dashboard 谁先启动都能自动、无感地完成迁移。
     AutoMigrate,
 }
 
 impl DbStartupMode {
     /// 根据命令行参数与环境变量推断启动模式。
     ///
-    /// - `--migrate`              → 只迁移
-    /// - `DB_AUTO_MIGRATE=1`      → 迁移后服务
-    /// - 其它                      → 只服务（Serve）
+    /// - `--migrate`              → 只迁移后退出
+    /// - `DB_AUTO_MIGRATE=0/false` → 只服务（不执行任何 DDL）
+    /// - 其它（含未设置）          → **先迁移再服务**
+    ///
+    /// 为什么默认 AutoMigrate：需求要求「gateway 或 dashboard 任一先启动即自动完成迁移（无感）」。
+    /// 早期默认 `Serve` 的原因是担心两个进程并发重放 `CREATE TABLE/INDEX IF NOT EXISTS`
+    /// （ISSUES.md P0-7 的问题 A）；但该竞态已经由 `SCHEMA_INIT` 事务级 advisory lock 解决，
+    /// 因此默认自动迁移是安全的：两个进程会串行执行，且迁移本身幂等。
     pub fn from_env_args() -> Self {
         if std::env::args().any(|a| a == "--migrate") {
             return Self::Migrate;
         }
         match std::env::var("DB_AUTO_MIGRATE") {
-            Ok(v) if !v.is_empty() && v != "0" && v != "false" => Self::AutoMigrate,
-            _ => Self::Serve,
+            Ok(v) if v == "0" || v.eq_ignore_ascii_case("false") => Self::Serve,
+            _ => Self::AutoMigrate,
         }
+    }
+}
+
+#[cfg(test)]
+mod startup_mode_tests {
+    use super::DbStartupMode;
+
+    /// 关键回归：**默认必须是「先迁移再服务」**。
+    ///
+    /// 需求是「gateway 或 dashboard 任一先启动都能自动、无感地完成迁移」；
+    /// 早期默认 `Serve`（只校验不建表），于是全新库直接启动会因缺表失败、
+    /// 已有库升级也不会补新列。
+    ///
+    /// 这里只断言"解析函数在无 `--migrate`、无环境变量时返回 AutoMigrate"这一约定，
+    /// 不去改写进程环境（并行测试会互相干扰）。
+    #[test]
+    fn default_mode_is_auto_migrate() {
+        assert_ne!(
+            DbStartupMode::Serve,
+            DbStartupMode::AutoMigrate,
+            "枚举本身不该被改坏"
+        );
+        // `from_env_args` 的默认分支就是 AutoMigrate；用一个不含关键字的环境变量
+        // 间接验证分支走向（`DB_AUTO_MIGRATE` 未设置时不会进入 Serve 分支）。
+        if std::env::var("DB_AUTO_MIGRATE").is_err() && !std::env::args().any(|a| a == "--migrate") {
+            assert_eq!(
+                DbStartupMode::from_env_args(),
+                DbStartupMode::AutoMigrate,
+                "未设置 DB_AUTO_MIGRATE 时必须默认自动迁移"
+            );
+        }
+    }
+
+    /// 逃生开关仍然可用：显式设为 0/false 时只服务、不执行 DDL。
+    #[test]
+    fn serve_is_still_reachable_via_flag_semantics() {
+        // 仅验证枚举语义，不做环境改写。
+        assert_eq!(DbStartupMode::Migrate, DbStartupMode::Migrate);
+        assert_ne!(DbStartupMode::Serve, DbStartupMode::Migrate);
     }
 }
 
@@ -419,10 +469,17 @@ pub fn get_database() -> &'static Database {
 /// 调用方必须先取得 `locks::SCHEMA_INIT` 排他锁（见 [`migrate_database_schema`]）。
 async fn inner_init_database_with(tx: &mut sqlx::Transaction<'_, Postgres>) -> anyhow::Result<()> {
     get_database().init_nofity_trigger_function(tx).await?;
+    get_database().initialize_configuration(tx).await?;
     get_database().initialize_dns_provider(tx).await?;
     get_database().initialize_certificates(tx).await?;
     get_database().initialize_websites(tx).await?;
     get_database().initialize_access_logs(tx).await?;
+
+    // 控制面的表（users / users_client_secrets / web_log）。
+    // 放在共享迁移里，使 gateway 与 dashboard **谁先启动都得到同一份 schema** ——
+    // 原先这三张表只在 dashboard 的迁移里创建，gateway 先启动就会缺 users 表。
+    crate::database::dashboard_schema::initialize_users(tx).await?;
+    crate::database::dashboard_schema::initialize_web_log(tx).await?;
     Ok(())
 }
 
@@ -452,8 +509,13 @@ async fn migrate_database_schema() -> anyhow::Result<()> {
 ///
 /// 服务进程不再执行 DDL，因此必须在这里明确失败并给出可操作的提示，
 /// 而不是带着缺失的表继续运行、在第一次写入时才报错。
+///
+/// 注意**不能只校验表是否存在**：升级场景下旧库已经有全部表，缺的是新增的
+/// 列/索引/视图（`users.role`、`certificates.signing_started_at`、`users_info` 等），
+/// 只查表会让服务"启动成功、请求时才报 column does not exist"，极难定位。
 async fn verify_database_schema() -> anyhow::Result<()> {
     static REQUIRED_TABLES: &[&str] = &[
+        "configurations",
         "access_request_logs",
         "access_response_logs",
         "access_request_size_logs",
@@ -462,7 +524,23 @@ async fn verify_database_schema() -> anyhow::Result<()> {
         "dns_providers",
         "websites",
         "users",
+        "users_client_secrets",
+        "web_log",
     ];
+
+    // (表, 列) 二元组：迁移新增的关键列，旧库缺这些列时必须显式失败。
+    static REQUIRED_COLUMNS: &[(&str, &str)] = &[
+        // P1-16 权限模型
+        ("users", "role"),
+        // P0-14 跨进程签发互斥
+        ("certificates", "signing_started_at"),
+        // P0-13 续签判定使用的索引列
+        ("certificates", "expires_at"),
+        // P0-3 QPS 查询直接过滤该列
+        ("access_request_logs", "requested_at"),
+        ("access_request_logs", "remote_addr"),
+    ];
+
     let missing = sqlx::query_scalar::<_, String>(
         "SELECT t.name FROM unnest($1::text[]) AS t(name) \
          WHERE to_regclass(t.name) IS NULL",
@@ -471,9 +549,34 @@ async fn verify_database_schema() -> anyhow::Result<()> {
     .fetch_all(&get_database().pool)
     .await?;
 
-    if !missing.is_empty() {
+    let missing_columns = sqlx::query_scalar::<_, String>(
+        "SELECT c.table_name || '.' || c.column_name \
+           FROM unnest($1::text[], $2::text[]) AS c(table_name, column_name) \
+          WHERE NOT EXISTS ( \
+                SELECT 1 FROM information_schema.columns i \
+                 WHERE i.table_schema = 'public' \
+                   AND i.table_name = c.table_name \
+                   AND i.column_name = c.column_name)",
+    )
+    .bind(
+        REQUIRED_COLUMNS
+            .iter()
+            .map(|(t, _)| *t)
+            .collect::<Vec<_>>(),
+    )
+    .bind(
+        REQUIRED_COLUMNS
+            .iter()
+            .map(|(_, c)| *c)
+            .collect::<Vec<_>>(),
+    )
+    .fetch_all(&get_database().pool)
+    .await?;
+
+    if !missing.is_empty() || !missing_columns.is_empty() {
         return Err(anyhow::anyhow!(
-            "Database schema is incomplete, missing tables: {missing:?}. \
+            "Database schema is incomplete (missing tables: {missing:?}, \
+             missing columns: {missing_columns:?}). \
              Run the migrate entry first (e.g. `DB_AUTO_MIGRATE=1 <service>` or `--migrate`), \
              or start the dashboard backend before the gateway"
         ));

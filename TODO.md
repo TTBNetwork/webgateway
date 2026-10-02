@@ -63,7 +63,14 @@ P0 事故级：
 - [x] P0-1 访问日志刷盘改为"先写库成功、再删内存"，失败批次留在内存重试（`gateway/src/access.rs` 已重写）
 - [x] P0-2 批量 INSERT 按 ≤1000 行分块；批量 UPDATE 改 `FROM (VALUES ...)`（`crates/shared/src/database/access.rs`）
 - [x] P0-3 QPS 查询改为直接过滤 `requested_at`（sargable，`EXPLAIN` 确认走索引）；视图去掉冗余 `ORDER BY`
-- [ ] P0-3（残留）日志表**分区 / TTL 清理策略**未做 —— 表仍会无限增长，属 CONVERSATION.md 迁移方案范围
+- [x] P0-3（残留，第六轮部分完成）**保留期自动清理**已实现：控制面板「设置 → 数据保留」可配 90~3650 天（默认 180），gateway 每小时按批清理。**仍未做**：分区（按周 RANGE）方案，见 [ISSUES.md](ISSUES.md) 附录 A
+- [x] 新增（第六轮）修复 `access_response_size_logs` 的 7 倍存储膨胀：同一响应的多个 body chunk 改为内存累加、每响应只落一行
+- [ ] 新增（第六轮待办）控制面板配置 HTTP/HTTPS 代理以续签证书。**经核实无需改代码**：acmex 用 `reqwest::Client::builder()` 且未调 `.no_proxy()`，给 dashboard-backend 设 `HTTPS_PROXY` / `HTTP_PROXY` / `NO_PROXY` 环境变量即可。若要做成面板字段，需在 `certificate.rs` 构造 acmex 客户端时读取配置（acmex 未暴露代理入口，需改 vendor 副本）
+- [x] P0-1（残留，第四轮修复）批量 INSERT 改为幂等（`ON CONFLICT DO NOTHING`），部分成功后整批重试不再永久毒化刷盘队列
+- [x] P0-3（残留，第七轮）size 明细表改为**按 (请求, 秒) 聚合**：保留秒级颗粒度、消除按 chunk 的 7 倍膨胀
+- [x] 第七轮：默认启动即自动迁移（`AutoMigrate`），控制面表纳入共享迁移，gateway/dashboard 谁先启动都一样
+- [x] P0-14（残留，第四轮修复）证书认领增加 10 分钟过期回收；并修复认领查询漏选 `email` 列导致自动续签 100% 失败
+- [x] P0-5（回归，第四轮修复）连接任务结束后不再把连接放回空闲池（否则后续请求永久挂起）
 - [x] P0-4 刷盘循环改为**最小 1 秒间隔**，超过 3s 记录 WARN，消除自激
 - [x] P0-5 只有响应体被完整读到 EOF 才允许归还连接池；`write(&[])` 假健康检查已删除（真实网关 + 8MB 响应中途断开验证 32/32 无串包）
 - [x] P0-6 设置有限连接池上限（默认 256）+ 取许可 5s 超时

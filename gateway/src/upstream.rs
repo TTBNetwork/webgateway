@@ -1,5 +1,4 @@
 use std::{
-    error::Error,
     net::SocketAddr,
     sync::{Arc, LazyLock, atomic::Ordering},
     time::Duration,
@@ -392,71 +391,23 @@ impl ConnectionCycle {
             return Self::handle_upgrade(origin_req, state, pool.clone()).await;
         }
 
-        // ---- 普通 HTTP 转发（原有逻辑） ----
-        // 获取连接（从池中取出）
-        let pooled = pool
-            .get()
-            .await
-            .with_context(|| "Unavailable connection from pool")?;
-        // 响应体读到 EOF 时会置位这个共享标志；只有它被置位，连接才允许回到池中。
-        // 客户端中途断开导致响应体没读完时，连接会被关闭（P0-5）。
-        let body_drained = pooled.drained_flag();
-        // 连接任务与响应体各持一份引用。
-        let body_drained_for_task = body_drained.clone();
-
-        // 把整个 `PooledUpstreamConnection`（含连接许可）交进 hyper 的 IO：
-        // 它会被持有到连接任务结束，`Drop` 时按 `reusable` 决定归还还是关闭。
-        // 许可若在这里提前释放，池的并发上限就会被绕过（P0-6）。
-        let io = TokioIo::new(pooled);
-        let (mut c_req, mut connection) = client::conn::http1::Builder::new()
-            .handshake(io)
-            .await
-            .with_context(|| "Failed to handshake upstream")?;
-
-        tokio::task::spawn(async move {
-            // 用 `poll_without_shutdown` 而不是 `with_upgrades()`：这样连接结束时可以
-            // `into_parts()` 取回 IO 对象（内含 `PooledUpstreamConnection`），
-            // 由我们带外决定归还还是关闭。若直接 `with_upgrades()` 消费掉
-            // `Connection`，IO 会随之 drop，只能依赖 IO 自身的 `Drop`，
-            // 连接许可与复用判定都会失控。
-            let deadline = tokio::time::Instant::now() + Duration::from_secs(120);
-            let finished = std::future::poll_fn(|cx| {
-                if tokio::time::Instant::now() >= deadline {
-                    return std::task::Poll::Ready(Err(()));
-                }
-                match connection.poll_without_shutdown(cx) {
-                    std::task::Poll::Ready(Ok(())) => std::task::Poll::Ready(Ok(())),
-                    std::task::Poll::Ready(Err(e)) => {
-                        event!(Level::ERROR, "Upstream connection error: {e}");
-                        std::task::Poll::Ready(Ok(()))
-                    }
-                    std::task::Poll::Pending => std::task::Poll::Pending,
-                }
-            })
-            .await;
-
-            if finished.is_err() {
-                event!(Level::WARN, "Upstream connection timeout, force closing");
-            }
-            // 取回 IO 并释放：IO 的 `Drop` 会依据共享标志决定归还或关闭连接。
-            let parts = connection.into_parts();
-            drop(parts.read_buf);
-            if finished.is_err() {
-                // 超时必须强制不可复用：清掉标志，保证 Drop 关闭连接。
-                body_drained_for_task.store(false, Ordering::Release);
-            }
-            drop(parts.io);
-        });
-
         let origin_version = origin_req.version();
+        let (parts, body) = origin_req.into_parts();
+        let origin_method = parts.method;
+        let origin_uri = parts.uri;
+        let origin_headers = parts.headers;
+        let origin_extensions = parts.extensions;
+
+        // 请求在**循环外**构造一次；重试时复用同一份 metadata，
+        // body 由 `try_send_request` 在未发出任何字节的情况下原样交还。
         let mut req = Request::builder()
-            .method(origin_req.method())
+            .method(&origin_method)
             .version(Version::HTTP_11);
         if let Some(v) = req.headers_mut() {
-            v.extend(origin_req.headers().clone());
+            v.extend(origin_headers.clone());
         }
         if let Some(v) = req.extensions_mut() {
-            v.extend(origin_req.extensions().clone());
+            v.extend(origin_extensions.clone());
         }
         req = req.uri({
             // 修复（P1-5）：
@@ -467,7 +418,7 @@ impl ConnectionCycle {
             //    会替换掉最后一段：后端配置 `http://h/api` 时 `join("foo/bar")`
             //    得到 `http://h/foo/bar`，`/api` 前缀被静默丢弃。
             // 这里改为显式保留 base path 前缀，并对空 path / join 失败做兜底。
-            let origin_path = origin_req.uri().path();
+            let origin_path = origin_uri.path();
             let base = pool
                 .get_path()
                 .map(|v| v.path().trim_end_matches('/'))
@@ -483,7 +434,7 @@ impl ConnectionCycle {
                 }
                 None => origin_path.to_owned(),
             };
-            if let Some(query) = origin_req.uri().query() {
+            if let Some(query) = origin_uri.query() {
                 format!("{}?{}", path, query)
             } else {
                 path
@@ -499,13 +450,109 @@ impl ConnectionCycle {
         );
         headers.insert("X-Forwarded-Proto", state.scheme().to_string().parse()?);
         headers.insert("X-Forwarded-Host", state.host.parse()?);
-        let final_req = req.body(origin_req.into_body()).unwrap();
+        let mut request = req.body(body).unwrap();
 
-        let resp = match c_req.send_request(final_req).await {
-            Ok(resp) => resp,
-            Err(e) => {
-                tracing::error!("Send request error: {:?}, source: {:?}", e, e.source());
-                return Err(anyhow::anyhow!("Failed to send request: {}", e));
+        // 复用的 keep-alive 连接可能已被上游单方面关闭（上游空闲超时最常见），
+        // 而 `is_healthy()` 的探活与真正发送之间存在时间窗口，hyper 会在发送阶段
+        // 返回 `Kind::Canceled`（其 Display 即用户看到的 “operation was canceled”）。
+        //
+        // 判据与 hyper-util `legacy::Client` 一致：**只有**「连接取自空闲队列（复用）
+        // + 请求被原样交还（说明连一个字节都没发出去）」时重试才安全 —— 这正是
+        // `try_send_request` 相对 `send_request` 的价值：它会把请求体还回来。
+        // 不重试的话，每个被上游回收的空闲连接都会把一次正常请求变成 502。
+        let (resp, body_drained) = loop {
+            let pooled = pool
+                .get()
+                .await
+                .with_context(|| "Unavailable connection from pool")?;
+            // 响应体读到 EOF 时会置位这个共享标志；只有它被置位，连接才允许回到池中。
+            // 客户端中途断开导致响应体没读完时，连接会被关闭（P0-5）。
+            let body_drained = pooled.drained_flag();
+            // 连接任务与响应体各持一份引用。
+            let body_drained_for_task = body_drained.clone();
+            // 任务退出前置位：此后这条连接不再有任何 future 在驱动，绝不能再复用。
+            let task_exited_for_task = pooled.task_exited_flag();
+            let reused = pooled.is_reused();
+
+            // 把整个 `PooledUpstreamConnection`（含连接许可）交进 hyper 的 IO：
+            // 它会被持有到连接任务结束，`Drop` 时按 `reusable` 决定归还还是关闭。
+            // 许可若在这里提前释放，池的并发上限就会被绕过（P0-6）。
+            let io = TokioIo::new(pooled);
+            let (mut c_req, mut connection) = client::conn::http1::Builder::new()
+                .handshake(io)
+                .await
+                .with_context(|| "Failed to handshake upstream")?;
+
+            tokio::task::spawn(async move {
+                // 用 `poll_without_shutdown` 而不是 `with_upgrades()`：这样连接结束时可以
+                // `into_parts()` 取回 IO 对象（内含 `PooledUpstreamConnection`），
+                // 由我们带外决定归还还是关闭。若直接 `with_upgrades()` 消费掉
+                // `Connection`，IO 会随之 drop，只能依赖 IO 自身的 `Drop`，
+                // 连接许可与复用判定都会失控。
+                let deadline = tokio::time::Instant::now() + Duration::from_secs(120);
+                let finished = std::future::poll_fn(|cx| {
+                    if tokio::time::Instant::now() >= deadline {
+                        return std::task::Poll::Ready(Err(()));
+                    }
+                    // 注意：这里**不能**把 `Ready(Err(e))` 映射成 `Ready(Ok(()))`。
+                    // 一旦映射，上层只看得到"正常结束"，于是"响应体已读完"的标志
+                    // 会原样保留，这条**已经死掉的**连接会被 `Drop` 放回空闲池；
+                    // 下一个请求复用它时，驱动该连接的 future 早已不存在，
+                    // `try_send_request` 会把请求投进没有接收者的队列并**永久挂起**
+                    // （实测表现：每隔一个请求超时，且请求根本到不了上游）。
+                    match connection.poll_without_shutdown(cx) {
+                        std::task::Poll::Ready(Ok(())) => std::task::Poll::Ready(Ok(())),
+                        std::task::Poll::Ready(Err(e)) => {
+                            event!(Level::DEBUG, "Upstream connection ended with error: {e}");
+                            std::task::Poll::Ready(Err(()))
+                        }
+                        std::task::Poll::Pending => std::task::Poll::Pending,
+                    }
+                })
+                .await;
+
+                // 任务即将退出：**无论退出原因**，此后都没有 future 在驱动这条连接，
+                // 复用它会命中"投递到没有接收者的队列 → 永久挂起"。
+                // 因此这里统一置位 `task_exited`，让 `Drop` 走关闭分支。
+                task_exited_for_task.store(true, Ordering::Release);
+                if finished.is_err() {
+                    event!(
+                        Level::DEBUG,
+                        "Upstream connection ended with error or lifetime timeout; closing it \
+                         instead of returning it to the idle pool"
+                    );
+                }
+                let _ = &body_drained_for_task;
+                let parts = connection.into_parts();
+                drop(parts.read_buf);
+                drop(parts.io);
+            });
+
+            let mut send_err = match c_req.try_send_request(request).await {
+                Ok(resp) => break (resp, body_drained),
+                Err(e) => e,
+            };
+
+            // `TrySendError` 只实现 `Debug`（它可能携带请求体，不便实现 `Display`）。
+            let send_err_text = format!("{send_err:?}");
+            match send_err.take_message() {
+                // 请求体被交还 = 一个字节都没发出去，重发是安全的。
+                Some(req) if reused => {
+                    event!(
+                        Level::DEBUG,
+                        "Reused upstream connection was already closed by the peer; \
+                         retrying once on a fresh connection: {send_err_text}"
+                    );
+                    request = req;
+                }
+                Some(_) => {
+                    tracing::error!("Send request error: {send_err_text}");
+                    return Err(anyhow::anyhow!("Failed to send request: {send_err_text}"));
+                }
+                None => {
+                    tracing::error!("Send request error: {send_err_text}");
+                    return Err(anyhow::anyhow!("Failed to send request: {send_err_text}"));
+                }
             }
         };
 

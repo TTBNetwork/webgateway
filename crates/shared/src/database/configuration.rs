@@ -1,18 +1,31 @@
 use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
 use sqlx::types::Json;
+use sqlx::{Postgres, Transaction};
 
 use crate::{database::Database, models::configuration::Configuration};
 
 #[async_trait]
 pub trait DatabaseConfigurationInitlializer {
-    async fn initialize_configuration(&self) -> anyhow::Result<()>;
+    /// 在调用方提供的（由 advisory lock 保护的）事务中创建 `configurations` 表。
+    ///
+    /// 原先接受 `&self` 并在连接池上直接执行 DDL，既绕过迁移事务、也不受
+    /// `SCHEMA_INIT` 锁保护，而且**从未被任何地方调用** —— 结果这张表在真实库里
+    /// 根本不存在，配置的读写一上线就会失败。现改为与其他 initializer 一致的
+    /// 事务签名，并接入迁移入口。
+    async fn initialize_configuration(
+        &self,
+        tx: &mut Transaction<'_, Postgres>,
+    ) -> anyhow::Result<()>;
 }
 
 #[async_trait]
 impl DatabaseConfigurationInitlializer for Database {
-    async fn initialize_configuration(&self) -> anyhow::Result<()> {
-        sqlx::query(r#"CREATE TABLE IF NOT EXISTS configurations (key TEXT PRIMARY KEY NOT NULL, value jsonb NOT NULL DEFAULT '{}')"#).execute(&self.pool).await?;
+    async fn initialize_configuration(
+        &self,
+        tx: &mut Transaction<'_, Postgres>,
+    ) -> anyhow::Result<()> {
+        sqlx::query(r#"CREATE TABLE IF NOT EXISTS configurations (key TEXT PRIMARY KEY NOT NULL, value jsonb NOT NULL DEFAULT '{}')"#).execute(&mut **tx).await?;
         Ok(())
     }
 }

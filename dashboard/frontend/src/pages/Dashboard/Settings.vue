@@ -6,6 +6,7 @@ import { pushQuery } from '../../constant';
 import { computed } from 'vue';
 import Log from './settings/Log.vue';
 import Console from './settings/Console.vue';
+import DataRetention from './settings/DataRetention.vue';
 const options = [
     {
         text: '控制台管理',
@@ -14,6 +15,10 @@ const options = [
     {
         text: '系统日志',
         key: 'log',
+    },
+    {
+        text: '数据保留',
+        key: 'retention',
     },
 ];
 const query = computed(() => useRoute().query);
@@ -32,5 +37,8 @@ const query = computed(() => useRoute().query);
     </div>
     <div v-if="query?.tab == 'console'">
         <Console />
+    </div>
+    <div v-if="query?.tab == 'retention'">
+        <DataRetention />
     </div>
 </template>

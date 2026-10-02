@@ -303,6 +303,10 @@ impl From<(ObjectId, usize)> for AccessUpdateResponseSize {
 pub struct AccessInsertResponseSize {
     pub id: ObjectId,
     pub body_length: usize,
+    /// 该行统计的**秒**（截断到整秒）。与 `response_id` 一起构成唯一键：
+    /// 同一秒内的多个 body chunk 累加成一行，从而既保留"每秒颗粒度"、又不按 chunk 膨胀。
+    pub at_second: DateTime<Utc>,
+    /// 行创建时间（保留原语义，便于排查/清理）。
     pub created_at: DateTime<Utc>,
 }
 
@@ -310,26 +314,40 @@ pub struct AccessInsertResponseSize {
 pub struct AccessInsertRequestSize {
     pub id: ObjectId,
     pub body_length: usize,
+    /// 见 [`AccessInsertResponseSize::at_second`]。
+    pub at_second: DateTime<Utc>,
     pub created_at: DateTime<Utc>,
 }
 
 // from
+/// 把时间截断到整秒（`at_second` 唯一键用）。
+///
+/// 不用 `chrono::Rounding::trunc_subsecs`：它需要 `Rounding` trait 在作用域内，
+/// 这里直接用时间戳算术，语义更直白也少一个 use。
+fn truncate_to_second(t: DateTime<Utc>) -> DateTime<Utc> {
+    DateTime::from_timestamp(t.timestamp(), 0).expect("valid timestamp")
+}
+
 impl AccessInsertRequestSize {
-    pub fn new(id: ObjectId, body_length: usize, created_at: DateTime<Utc>) -> Self {
+    /// `at` 会被截断到整秒作为 `at_second`（唯一键的一部分）。
+    pub fn new(id: ObjectId, body_length: usize, at: DateTime<Utc>) -> Self {
         Self {
             id,
             body_length,
-            created_at,
+            at_second: truncate_to_second(at),
+            created_at: at,
         }
     }
 }
 
 impl AccessInsertResponseSize {
-    pub fn new(id: ObjectId, body_length: usize, created_at: DateTime<Utc>) -> Self {
+    /// `at` 会被截断到整秒作为 `at_second`（唯一键的一部分）。
+    pub fn new(id: ObjectId, body_length: usize, at: DateTime<Utc>) -> Self {
         Self {
             id,
             body_length,
-            created_at,
+            at_second: truncate_to_second(at),
+            created_at: at,
         }
     }
 }

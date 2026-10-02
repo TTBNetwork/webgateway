@@ -13,9 +13,10 @@ WebGateway 是一个自建的**反向代理 / 网关系统**，由「数据面�
 | 前端 | Vue 3 + TypeScript + Vite（`vue-router` / `echarts` / `ky` / `vue-i18n`） |
 | 数据库 | PostgreSQL（`sqlx` 0.8，依赖 `uint128`、`btree_gin` 扩展，使用 LISTEN/NOTIFY 触发器做配置同步） |
 | 运行时 | Tokio 异步运行时；Unix Socket 用于本地运维通道（mnt） |
-| 部署 | Docker Compose（4 容器）+ GitHub Actions 构建镜像到 GHCR |
+| 部署 | Docker Compose（一次性 migrate + 4 容器）+ GitHub Actions 构建镜像到 GHCR |
 | 当前版本 | `0.1.0`（见 [project.toml](project.toml)） |
 | 当前阶段 | 开发中（未发布）。核心链路可用，存在停用模块与半成品 crate，详见 [TODO.md](TODO.md) |
+| 生产可用性 | 2026-10-02 第四轮修复后，阻塞上线的代码缺陷已处理；**但 release 构建受阻于 `acmex → aws-lc-rs/fips`**（详见 CHANGELOG 与 ISSUES.md） |
 
 ## 目录结构
 
@@ -103,8 +104,26 @@ webgateway/
 cargo build --release --bin dashboard --bin gateway --bin webgateway-mnt
 
 # 前端
-cd dashboard/frontend && yarn install && yarn build
+cd dashboard/frontend && pnpm install --frozen-lockfile && pnpm build   # 包管理器为 pnpm（2026-10-02 起，原为 yarn）
 ```
+
+### 前端包管理器
+
+前端使用 **pnpm**（2026-10-02 从 yarn 迁移）。`pnpm-lock.yaml` 是唯一锁文件，`yarn.lock` /
+`.yarnrc.yml` / `.yarn/` 已删除。
+
+```bash
+cd dashboard/frontend
+pnpm install --frozen-lockfile   # CI 用这个；lockfile 与 package.json 不一致会直接失败
+pnpm build                       # vue-tsc -b && vite build
+pnpm typecheck                   # 仅类型检查
+pnpm lint                        # eslint（注意：存量错误较多，见 ISSUES.md）
+```
+
+- pnpm 版本固定在 `package.json` 的 `packageManager` 字段（`pnpm@12.8.1`），CI 里由
+  `pnpm/action-setup@v4` 使用同一版本。
+- pnpm 12 起 `overrides` 等设置写在 `pnpm-workspace.yaml`，**不再**读 `package.json` 的 `pnpm` 字段。
+- `storeDir` 指向 `../../target/pnpm-store`（本开发环境家目录只读）。
 
 ### 测试
 
@@ -127,11 +146,45 @@ source dev/environment && cargo test -p dashboard --bin dashboard -- --nocapture
 
 ```bash
 cp .env.default .env      # 至少设置 SUBNET_PREFIX、POSTGRES_PASSWORD
-docker compose up -d      # postgres + gateway + dashboard-backend + dashboard-frontend
+docker compose up -d      # 一次性 migrate → postgres + gateway + dashboard-backend + dashboard-frontend
 ```
 
+- **无需单独跑迁移**：两个服务默认都是 `AutoMigrate` —— 启动时在
+  `locks::SCHEMA_INIT` 事务级 advisory lock 下补齐**完整** schema，然后进入服务。
+  因此 gateway 与 dashboard **谁先启动都一样**，全新库直接 `docker compose up -d` 即可。
+  迁移幂等，重复 `up` 安全。
+- 只想服务、不执行 DDL：设 `DB_AUTO_MIGRATE=0`（逃生开关；此时必须自行保证 schema 已就绪）。
+- 独立迁移 Job（例如 K8s）：`<镜像> --migrate`，只迁移后退出。
+- 首次在**老库**上启动会稍慢：size 明细表要补 `at_second` 列、合并历史重复行并建唯一索引
+  （生产库实测约 417 万行需要合并），见下方「size 明细表」一节。
 - 端口：网关 `80/443`，前端 `7173→4173`（nginx），后端容器内 `3000`。
 - 镜像推送由 [.github/workflows/build.yml](.github/workflows/build.yml) 在 push `master` 或 `v*` tag 时触发，推到 GHCR。
+
+### 生产部署现状（2026-10-02 只读排查，`10.240.0.1`）
+
+> 这一节由 [STEP.md](STEP.md) 的「授予权限」整理而来，**不含任何凭据**。
+
+| 项 | 现状 |
+|----|------|
+| 主机 | `sj-pub`，Debian 13 (trixie)，内核 6.12，**2 vCPU / 1.9 GiB 内存**（无 swap），根分区 39G 已用 50% |
+| 部署目录 | `/opt/webgateway/`（`docker-compose.yml` + `.env` + `data/`） |
+| 运行容器 | `webgateway-pg` / `-gateway` / `-dashboard-backend` / `-dashboard-frontend`，均为 `Up 4 days` |
+| 镜像来源 | **`ghcr.milu.moe`**（GHCR 镜像站），不是 `ghcr.io`：`IMAGE_PREFIX=ghcr.milu.moe/ttbnetwork`、`POSTGRES_IMAGE_PREFIX=ghcr.milu.moe/tianxiu2b2t` |
+| 端口 | 80 / 443（网关）、7173（前端）、5432（Postgres 直接暴露到公网） |
+| **当前版本** | 镜像 3 周前构建，**早于审计修复**：日志里没有新代码的 `Database startup mode: Serve` 特征 |
+| 迁移入口 | **未部署**：`/opt/webgateway/.env` 没有 `DB_AUTO_MIGRATE`，compose 里也没有 migrate 服务 |
+| 库名注意 | 生产库名是 **`postgres`**，不是 `webgateway`（连接串写 `.../webgateway` 会报 database does not exist） |
+
+**上线时要做的事**（新镜像默认自迁移，不再需要单独跑迁移服务）：
+
+1. 部署新镜像即可 —— 两个服务默认 `AutoMigrate`，会在 advisory lock 下把生产库缺失的对象
+   （`users.role`、`certificates.signing_started_at`、`configurations` 表、
+   size 表的 `at_second` + 唯一索引）全部补齐。
+2. **首次启动会明显变慢**：size 明细表要合并历史重复行并建唯一索引，生产库实测
+   `access_response_size_logs` 有 298541 组重复、约 **417 万行**需要合并（16M 行表上的一次性代价，
+   会消耗较多 WAL 与磁盘 IO）。建议选低峰期、并确认磁盘余量（当时约剩 19 GB）。
+   迁移是单事务：中途失败会整体回滚，重跑安全。
+3. `/opt/webgateway/.env` 里**不要**设置 `DB_AUTO_MIGRATE=0`（那是"只服务不迁移"的逃生开关）。
 
 ### 环境变量
 
@@ -143,35 +196,130 @@ docker compose up -d      # postgres + gateway + dashboard-backend + dashboard-f
 | `TOKEN_EXPIRES` | JWT 有效期秒数（默认 7 天） |
 | `BACKEND_URL` | 前端 nginx / Vite 代理的后端地址 |
 | `SUBNET_PREFIX`、`POSTGRES_*`、`IMAGE_PREFIX` | 仅 `docker-compose.yml` 使用 |
+| `HTTP_PROXY` / `HTTPS_PROXY` / `NO_PROXY` | **可选**：ACME 证书签发与 DNS API 调用走代理（reqwest 默认读取，见下） |
+| `DB_AUTO_MIGRATE` | 默认（不设置）即「先迁移再服务」；设为 `0`/`false` 则只服务、不执行 DDL |
 
 ## 相关文档
 
 - 问题清单（审计报告）：[ISSUES.md](ISSUES.md)
-- 存储优化 / 日志表 v1→v2 迁移方案（外部 AI 产出，**待评审**）：[CONVERSATION.md](CONVERSATION.md)
+- 存储优化 / 日志表 v1→v2 迁移方案（外部 AI 产出，**待评审**）：见 [ISSUES.md](ISSUES.md) **附录 A**（原 `CONVERSATION.md`，已合并）
 - 待办清单：[TODO.md](TODO.md)
 - 变更日志：[CHANGELOG.md](CHANGELOG.md)
+- 生产上线评估（第四轮）：[PRODUCTION_READINESS.md](PRODUCTION_READINESS.md)
+- 工作上下文（给下次会话）：[agent-context.md](agent-context.md)
+- 当前任务单：[STEP.md](STEP.md)（其「需要修改 / 可选修改 / 最后」三节已并入本文件）
+
+## 任务单（原 STEP.md）
+
+> 由 `STEP.md` 整理而来。**「授予权限」一节只保留非凭据事实（见上方「生产部署现状」），
+> 连接串与口令不入库**。STEP.md 在 2026-10-02 更新过一次：原来的
+> 「需要修改 / 可选修改」换成了「目前」，下方分区照此调整。
+
+### 目前（当前任务，STEP.md 2026-10-02 更新版）
+
+| # | 任务 | 状态 |
+|---|------|------|
+| 1 | 证书续签问题先不用管 | ✅ 按此执行（未动续签逻辑；第四轮已修的"认领过期回收"与漏选 `email` 保留） |
+| 2 | 压缩数据库数据（或清理 6 个月前的日志，可在控制面板配置，**最小不低于 3 个月**） | ✅ 已实现：控制面板「设置 → 数据保留」配置 90~3650 天（默认 180），gateway 每小时按批清理。**注意**：生产库最早数据 2026-04-25、跨度 160 天，默认 180 天暂时不会删数据 —— 但保留期是长期护栏，且本轮实测该表正以 6.4 倍冗余增长 |
+| 3 | 控制面板可选配置 HTTP/HTTPS proxy 以续签证书 | ✅ **核实后确认无需改代码**：acmex 未调 `.no_proxy()`，reqwest 默认读 `HTTPS_PROXY` 等环境变量。未加面板字段（依赖第 1 条），已记入 [TODO.md](TODO.md) |
+
+### 历史任务（STEP.md 旧版：需要修改 / 可选修改）
+
+| # | 任务 | 状态 |
+|---|------|------|
+| 1 | 保证能在生产环境直接在线迁移并运行 | ✅ 代码与部署编排就绪（migrate 服务 + 列校验）；**生产迁移尚未执行** |
+| 2 | 修 gateway 的 `operation was cancelled` | ✅ 已修复；生产日志实证该错误出现 **8099 次** |
+| 3 | 删除 `CONVERSATION.md`（融合进 `ISSUES.md`） | ✅ 已并入 [ISSUES.md](ISSUES.md) **附录 A** 并删除原文件 |
+| 4 | （旧版「可选修改」）`dashboard/frontend` 的 yarn 换成 pnpm | ✅ 已完成：`pnpm-lock.yaml` 为唯一锁文件，CI 改用 `pnpm/action-setup@v4` + `--frozen-lockfile` |
+
+### 最后（STEP.md 两次版本都有）
+
+| # | 任务 | 状态 |
+|---|------|------|
+| 1 | 把 `STEP.md` 内容融合进本文件 | ✅ 本节；「授予权限」仅保留非凭据事实 |
+| 2 | 把已读取的内容保存到 `agent-context.md` | ✅ 见 [agent-context.md](agent-context.md) |
+
+### 生产环境排查要点（本次只读排查的发现）
+
+- **`operation was canceled` 在生产是真实且高频的**：网关日志 46 万行中出现
+  `Failed to send request: operation was canceled` **8099 次**，另有 7897 次
+  `hyper::Error(Canceled, IncompleteMessage)`。这正是第四轮修复的目标。
+- **`qps_per_5s` 视图仍在被旧镜像使用**：dashboard 日志显示该查询单次耗时 **4.66 秒**
+  （阈值 1s），且前端每 5 秒轮询一次 —— 与 ISSUES.md P0-3 的判断一致。新代码已改为直接过滤
+  `requested_at`。
+- **TLS 握手失败占日志主体**：`BadCertificate` 25.7 万次、`tls handshake eof` 10.4 万次、
+  `NoCipherSuitesInCommon` 6.6 万次。多数是扫描器/爬虫探测，但数量级值得单独排查。
+- 生产镜像 3 周前构建、早于全部审计修复；`/opt/webgateway/.env` 无 `DB_AUTO_MIGRATE`，
+  compose 无 migrate 服务。
+
+## 访问日志保留期（第六轮）
+
+| 项 | 值 |
+|----|-----|
+| 配置位置 | `configurations` 表，key = `access_log_retention` |
+| 字段 | `retention_days`（默认 `180`，夹紧到 `[90, 3650]`）、`enabled`（默认 `true`） |
+| 执行者 | **gateway**（数据面）每小时一次；用 `locks::RETENTION` 的 `pg_try_advisory_lock` 保证单实例执行 |
+| 删除顺序 | size 明细（`access_response_size_logs` → `access_request_size_logs`）→ 响应 → 请求；**顺序不能改**，否则撞外键 |
+| 批量 | 每轮 5 万行、每次最多 20 轮；面板"立即清理"每次最多 25 万行 |
+| API | `GET/POST /settings/retention`、`POST /settings/retention/prune`（写操作需 `user` 及以上） |
+| 前端 | 设置 → 数据保留 |
+
+**注意**：会话级 advisory lock 必须**在同一条连接**上获取与释放。早期实现用连接池
+`fetch_one` 取锁、再 `execute` 解锁，两次很可能落在不同连接上 —— 解锁语句释放的是那条连接
+自己的锁（它并未持有），而真正持有的锁要等连接被复用/关闭才释放，于是后续每一轮都拿不到锁、
+清理**静默停止**。`prune_access_logs` 现在显式 `acquire` 一条连接贯穿始终。
+
+## size 明细表：按秒颗粒度（第七轮）
+
+`access_request_size_logs` / `access_response_size_logs` 的用途是**按秒统计请求/响应体大小**。
+
+| 项 | 说明 |
+|----|------|
+| 唯一键 | `(request_id, at_second)` / `(response_id, at_second)`，`at_second` 截断到整秒 |
+| 写入 | gateway 侧 `SizeAccumulator` 按 `(id, 秒)` 在内存累加 → `ON CONFLICT ... DO UPDATE SET body_length = body_length + EXCLUDED.body_length` |
+| 粒度 | 同一秒内合并成一行；**跨秒仍分开**，秒级颗粒度不丢 |
+| 分批限制 | PostgreSQL **不允许**一条 INSERT 里两次命中同一冲突键（`cannot affect row a second time`），因此落库前用 `merge_same_second` 在内存合并同键行 |
+| 事务 | 累加写入**不做分块提交**：整批单事务，否则"部分成功后重试"会重复累加 |
+| 去重脚本 | 老库若已有同秒重复行，迁移会自动合并（保留行取 `MIN(id)`，字节数为组内 `SUM`，**统计不会变小**） |
+
+**为什么必须带"秒"**：早期版本按 chunk 逐行插入（每 chunk 一个新 ObjectId），生产库因此有
+1600 万行 / 3.6 GB（请求主表的 7 倍，单条 `response_id` 最多 262791 行）。只按 id 聚合成一行
+虽然最省空间，但会**彻底丢掉秒级颗粒度**；按 `(id, 秒)` 聚合两者兼顾。
+
+## 可选：让 ACME 走代理（第六轮核实）
+
+acmex 用 `reqwest::Client::builder()` 构造 HTTP 客户端且**没有**调用 `.no_proxy()`，
+因此 reqwest 会默认读取 `HTTP_PROXY` / `HTTPS_PROXY` / `ALL_PROXY` / `NO_PROXY`。
+给 dashboard-backend 容器设置这些变量即可让证书签发与 DNS API 调用走代理，**无需改代码**。
 
 ## 已知风险提示（给后续 AI）
 
 以下问题已在 [ISSUES.md](ISSUES.md) 中详述，改动相关代码时务必注意。
-**状态**：2026-10-02 第三轮修复后，第 1/2/4/5 条已处理，状态以 [ISSUES.md](ISSUES.md)「修复状态」表为准。
+**状态**：2026-10-02 第四轮修复后，第 1/2/4/5 条已处理，状态以 [ISSUES.md](ISSUES.md)「修复状态」表为准。
 
-1. ~~**两个进程都会执行 DDL**~~ **已修复（P0-7）**：DDL 收敛到迁移入口（`--migrate` / `DB_AUTO_MIGRATE=1`），全程持有 `locks::SCHEMA_INIT` 事务级 advisory lock；服务进程默认 `Serve` 模式，只校验不建表。修改任何初始化 SQL 时请同步修改所有 initializer（它们现在都接收 `&mut Transaction`）。
-2. ~~**访问日志刷盘是"先删内存后写库"**~~ **已修复（P0-1）**：现在是「先写库成功、再清内存」，失败批次留在 `inflight` 下一轮重试。改动刷盘逻辑时**不要**破坏这个顺序；注意 `PendingBuffer` 的 `inflight` 同时承担重试队列的角色。
+1. ~~**两个进程都会执行 DDL**~~ **已修复（P0-7）**：DDL 收敛到**单一迁移入口**，全程持有 `locks::SCHEMA_INIT` 事务级 advisory lock。**第七轮起默认就是自动迁移**（配置见上表），两个服务谁先启动都会得到同一份完整 schema；`DB_AUTO_MIGRATE=0` 可退回"只校验不建表"。修改任何初始化 SQL 时请同步修改 `inner_init_database_with` 里的所有 initializer（它们都接收 `&mut Transaction`）；控制面表的 DDL 在 `crates/shared/src/database/dashboard_schema.rs`。
+2. ~~**访问日志刷盘是"先删内存后写库"**~~ **已修复（P0-1）**：现在是「先写库成功、再清内存」，失败批次留在 `inflight` 下一轮重试。改动刷盘逻辑时**不要**破坏这个顺序；注意 `PendingBuffer` 的 `inflight` 同时承担重试队列的角色。**并且**：批量 INSERT 必须保持幂等（`ON CONFLICT DO NOTHING`），否则"部分成功后整批重试"会永久毒化该队列（详见 CHANGELOG 第四轮）。
 3. **`qps_per_second` / `qps_per_5s` 视图会全表扫描**（仍在仓库中，但**已不再被使用**）：QPS 查询改为直接过滤 `requested_at`。若要重新启用视图，先确认谓词 sargable，且注意前端每 5 秒轮询一次。
 4. ~~**`gateway/src/proxy/` 是已停用的死代码**~~ 仍是死代码（未清理），当前生效的是 `gateway/src/upstream/`。修改代理逻辑时不要改错目录。
-5. ~~**连接池健康检查是无效的**~~ **已修复（P0-5）**：`write(&[])` 恒真检查已删除，改成零长度 `read` 探活；连接只有在响应体读到 EOF 后才允许归还。**新的注意点**：`PooledUpstreamConnection` 的 `reusable` 标志是防串包的唯一防线，任何"提前归还"的改动都可能重新引入跨租户数据泄露。
+5. ~~**连接池健康检查是无效的**~~ **已修复（P0-5）**：`write(&[])` 恒真检查已删除，改成零长度 `read` 探活；连接只有在响应体读到 EOF 后才允许归还。**新的注意点（第四轮）**：`is_reusable()` 现在是「响应体读到 EOF **且** 连接任务仍在运行」两个条件。**连接任务一旦结束就必须关闭连接** —— 把已无 future 驱动的连接放回池中，会让下一个请求投递到没有接收者的队列并**永久挂起**（实测：每隔一个请求超时）。`task_exited` 标志就是为此存在的，不要绕过它。
 6. **新增（P1-16）权限模型**：`users.role` ∈ {`admin`,`user`,`view`}。受保护的 handler 必须从 `Authorizer` 提取器取身份并显式调用 `require_write()` / `require_admin()`，**不要**只用 `AuthJWTInfoExtract` 就认为已经鉴权。新增路由时请一并决定所需角色。
-7. **新增（P0-6 残留）**：连接池上限已生效（默认 256），但空闲复用率仍低 —— 连接由 hyper 的 `Connection` future 持有最长 120s。并发超过上限时请求会排队并在 5s 后快速失败（502），这是有意的背压而非 bug。
+7. **新增（P0-6 残留）**：连接池上限已生效（默认 256），但**空闲复用率进一步下降**（第四轮修复挂起的代价）：连接任务结束即关闭连接，所以"客户端请求结束后的空闲复用"不再发生（同一客户端 keep-alive 连接内的连续请求仍复用）。并发超过上限时请求会排队并在 5s 后快速失败（502），这是有意的背压。要恢复复用需让上游连接生命周期脱离客户端连接任务，属重构。
 8. **新增**：站点匹配前会去掉 Host 头端口（`strip_port()`），因此站点配置里**不要**写带端口的 host。
+9. **新增（第四轮）**：证书签发认领有 `STALE_SIGNING_CLAIM = 10 minutes` 的过期回收（`crates/shared/src/database/certificate.rs`）。改这个常量前先确认正常签发耗时 —— 调得太短会导致多实例重复签发、白白消耗 ACME 配额。
 
 ## 启动模式（P0-7）
 
 | 进程 / 场景 | 启动方式 | 行为 |
 |------------|---------|------|
-| 数据面 gateway | 默认 | `Serve`：只校验 schema，缺失表时明确报错 |
-| 控制面 dashboard | 默认 | `Serve`：同上（但会引导默认管理员账号） |
-| 任一进程（单实例 / 开发） | `DB_AUTO_MIGRATE=1` | 在 advisory lock 下执行全部 DDL，再进入服务 |
+| **任一服务（默认）** | 直接启动 | `AutoMigrate`：在 advisory lock 下执行**全部** DDL（含控制面表），再进入服务 |
+| 只服务不迁移 | `DB_AUTO_MIGRATE=0` | `Serve`：只校验表**与关键列**，缺失时明确报错（逃生开关） |
 | 独立迁移 Job | `--migrate` | 只执行迁移然后退出 |
+| Docker Compose | `docker compose up -d` | 两个服务各自 `DB_AUTO_MIGRATE=1`；无一次性 migrate 服务 |
+
+迁移入口 `inner_init_database_with` 现在包含：`configurations` → `dns_providers` →
+`certificates` → `websites` → `access_*`（含 size 表按秒迁移）→ **`users` /
+`users_client_secrets` / `web_log`**（控制面表，见 `crates/shared/src/database/dashboard_schema.rs`）。
+控制面表的 DDL 之所以从 dashboard 挪到 `shared`，就是为了让两个进程执行**同一份**迁移、
+「谁先启动都行」—— 原先 gateway 先启动会缺 `users` 表。
 
 `gateway` 与 `dashboard` 的迁移共用 `shared::database::locks::SCHEMA_INIT` 这一把锁，因此可以安全地并发启动。

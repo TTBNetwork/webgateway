@@ -33,6 +33,8 @@ async fn main() -> anyhow::Result<()> {
     }
 
     access::init_access_logs().await?;
+    // 历史访问日志清理（保留期可在控制面板配置，默认 180 天，下限 90 天）。
+    access::init_access_log_pruner().await;
     sync::main().await?;
 
     match ctrl_c().await {

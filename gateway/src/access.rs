@@ -260,6 +260,83 @@ impl SizeBuffer {
     }
 }
 
+/// 按 `(ObjectId, 秒)` **聚合**"响应体大小增量"，每轮刷盘每个 (id, 秒) 只写一行。
+///
+/// 为什么需要它：`StatisticsIncoming` 每读到一个 body chunk 就会调用一次
+/// `insert_increase_response_size_log`（见 `transport.rs` 的 `increase_size`），
+/// 而原先的实现会为每次调用**新生成一个 ObjectId 并插一行**。于是一个响应体被分 N 块
+/// 读取就写 N 行 —— 生产库实测 `access_response_size_logs` 有 **1600 万行 / 3.6 GB**，
+/// 是请求主表的 **7 倍**（单条 `response_id` 最多挂 262791 行）。
+///
+/// **为什么键里带"秒"而不是只带 id**：这两张表的用途就是**按秒统计请求/响应体大小**
+/// （需求原文："可以细化到每秒的颗粒度"）。只按 id 聚合成一行会把秒级颗粒度彻底丢掉；
+/// 按 `(id, 秒)` 聚合则：同一秒内的多个 chunk 合并成一行，跨秒仍然分开 —— 粒度不丢，
+/// 行数按"请求数 × 实际跨秒数"收敛（单秒内完成的请求只占一行）。
+///
+/// 落库侧还有 `UNIQUE (xxx_id, at_second)` + `ON CONFLICT DO UPDATE body_length =
+/// body_length + EXCLUDED.body_length` 兜底，因此即使同一秒的数据分两轮刷盘也会累加。
+///
+/// `created_at` 取该 (id, 秒) **首次出现**的时间戳；`at_second` 为截断到整秒的键。
+#[derive(Debug, Default)]
+struct SizeAccumulator {
+    /// key = (id, 截断到整秒的时间)
+    pending: DashMap<(ObjectId, DateTime<Utc>), AccessInsertResponseSize>,
+    inflight: Mutex<Vec<AccessInsertResponseSize>>,
+}
+
+impl SizeAccumulator {
+    fn add(&self, id: ObjectId, size: usize, at: DateTime<Utc>) {
+        // 键用截断到整秒的时间，与落库侧的 UNIQUE (xxx_id, at_second) 对齐。
+        // 必须截断：`DateTime<Utc>` 的小数部分会让同一秒内的 key 互不相等。
+        // 用时间戳算术而不是 `chrono::Rounding::trunc_subsecs`，省一个 trait 导入。
+        let at_second = DateTime::from_timestamp(at.timestamp(), 0).expect("valid timestamp");
+        let key = (id, at_second);
+        self.pending
+            .entry(key)
+            .and_modify(|v| v.body_length += size)
+            .or_insert_with(|| AccessInsertResponseSize::new(id, size, at));
+    }
+
+    fn take_all(&self, limit: usize) -> Vec<AccessInsertResponseSize> {
+        let mut batch = std::mem::take(&mut *lock(&self.inflight));
+        if batch.len() >= limit {
+            return batch;
+        }
+        let take = limit - batch.len();
+        let keys = self
+            .pending
+            .iter()
+            .take(take)
+            .map(|e| *e.key())
+            .collect::<Vec<_>>();
+        for key in keys {
+            if let Some((_, value)) = self.pending.remove(&key) {
+                batch.push(value);
+            }
+        }
+        batch
+    }
+
+    fn commit(&self) {
+        lock(&self.inflight).clear();
+    }
+
+    fn rollback(&self, batch: Vec<AccessInsertResponseSize>) {
+        for item in batch {
+            // 刷盘期间若同一 (id, 秒) 又累加了新字节，必须**相加**而不是覆盖。
+            let key = (item.id, item.at_second);
+            self.pending
+                .entry(key)
+                .and_modify(|v| v.body_length += item.body_length)
+                .or_insert(item);
+        }
+    }
+
+    fn backlog(&self) -> usize {
+        self.pending.len() + lock(&self.inflight).len()
+    }
+}
+
 /// 读取锁被 poison 时直接取回内部值：这些缓冲区只是待落库数据的内存队列，
 /// 没有需要靠 panic 保护的跨对象不变量，让网关继续工作并保留数据更重要。
 fn lock<G>(mutex: &Mutex<G>) -> std::sync::MutexGuard<'_, G> {
@@ -275,8 +352,8 @@ static ACCESS_RESPONSE_SIZE_LOGS: LazyLock<SizeBuffer> = LazyLock::new(SizeBuffe
 
 static ACCESS_REQUEST_INSERT_SIZE_LOGS: LazyLock<PendingBuffer<AccessInsertRequestSize>> =
     LazyLock::new(PendingBuffer::default);
-static ACCESS_RESPONSE_INSERT_SIZE_LOGS: LazyLock<PendingBuffer<AccessInsertResponseSize>> =
-    LazyLock::new(PendingBuffer::default);
+static ACCESS_RESPONSE_INSERT_SIZE_LOGS: LazyLock<SizeAccumulator> =
+    LazyLock::new(SizeAccumulator::default);
 static CURRENT_TIME: LazyLock<RwLock<Arc<DateTime<Utc>>>> =
     LazyLock::new(|| RwLock::new(Arc::new(Utc::now())));
 
@@ -373,13 +450,15 @@ pub async fn sync_inner() {
                     .await
             },
         ),
-        flush_logged(
+        flush_accumulated_size_logs(
             "access response size inserts",
             &ACCESS_RESPONSE_INSERT_SIZE_LOGS,
-            |b| async move {
-                get_database()
-                    .insert_batch_access_response_increase_size_logs(b)
-                    .await
+            |b: Vec<AccessInsertResponseSize>| async move {
+                // 交还批次：失败时 `rollback` 需要它把累加值放回内存。
+                let r = get_database()
+                    .insert_batch_access_response_increase_size_logs(b.clone())
+                    .await;
+                (b, r)
             },
         ),
     );
@@ -515,6 +594,43 @@ where
     }
 }
 
+/// 刷入「按 id 聚合后的响应大小」。与 [`flush_size_logs`] 的区别是：
+/// 它面对的是 `SizeAccumulator`（累加器），失败时要把批次**相加**回 `pending`
+/// 而不是覆盖，否则刷盘期间新到的字节会被丢掉。
+async fn flush_accumulated_size_logs<W, Fut>(
+    name: &'static str,
+    buffer: &'static LazyLock<SizeAccumulator>,
+    write: W,
+) -> bool
+where
+    W: FnOnce(Vec<AccessInsertResponseSize>) -> Fut,
+    Fut: Future<Output = (Vec<AccessInsertResponseSize>, anyhow::Result<()>)>,
+{
+    let batch = buffer.take_all(MAX_ROWS_PER_FLUSH);
+    if batch.is_empty() {
+        return true;
+    }
+    let count = batch.len();
+    // 闭包把批次**交还**回来（成功与失败都交还），失败时据此回滚。
+    // 不能像 `flush_logged` 那样直接 `write(batch)` —— 那样批次被消费掉，
+    // 失败后无法把累加值放回内存，会静默丢失这批字节统计。
+    let (returned, result) = write(batch).await;
+    match result {
+        Ok(()) => {
+            buffer.commit();
+            true
+        }
+        Err(e) => {
+            event!(
+                Level::ERROR,
+                "Failed to flush {name} ({count} rows); keeping them in memory for retry: {e}"
+            );
+            buffer.rollback(returned);
+            false
+        }
+    }
+}
+
 // ==================== 生产者接口 ====================
 //
 // 这些函数运行在请求处理热路径上，只做内存写入，绝不阻塞、绝不 panic。
@@ -542,9 +658,16 @@ pub fn insert_increase_request_size_log(id: ObjectId, size: usize) {
     ACCESS_REQUEST_INSERT_SIZE_LOGS.push(AccessInsertRequestSize::new(id, size, current_time));
 }
 
+/// 与 [`insert_increase_response_size_log`] 相同，但显式指定时间戳（测试用）。
+#[cfg(test)]
+fn insert_increase_response_size_log_at(id: ObjectId, size: usize, at: DateTime<Utc>) {
+    ACCESS_RESPONSE_INSERT_SIZE_LOGS.add(id, size, at);
+}
+
 pub fn insert_increase_response_size_log(id: ObjectId, size: usize) {
+    // 聚合到"每个响应一行"，而不是每个 body chunk 一行（见 `SizeAccumulator` 说明）。
     let current_time = { *CURRENT_TIME.read().unwrap().clone() };
-    ACCESS_RESPONSE_INSERT_SIZE_LOGS.push(AccessInsertResponseSize::new(id, size, current_time));
+    ACCESS_RESPONSE_INSERT_SIZE_LOGS.add(id, size, current_time);
 }
 
 /// 把 `CURRENT_TIME` 推进到当前数据库时间的整秒。
@@ -563,4 +686,99 @@ fn update_time() {
     .unwrap_or_else(Utc::now);
     let mut time = CURRENT_TIME.write().unwrap_or_else(|e| e.into_inner());
     *time = Arc::new(current_time);
+}
+
+// ==================== 历史日志清理（保留期） ====================
+
+/// 清理任务的轮询间隔。保留期以"天"为单位，因此不需要频繁检查；
+/// 真正的推进速度由 `shared::database::access::prune_access_logs` 的
+/// 分批删除控制（每轮 5 万行）。
+const PRUNE_INTERVAL: Duration = Duration::from_secs(3600);
+
+/// 启动历史访问日志清理任务。
+///
+/// 放在数据面（gateway）而不是控制面：这张表由 gateway 写入，清理也应当由
+/// 数据面负责；同时 `prune_access_logs` 内部用 `pg_try_advisory_lock` 保证
+/// 多实例并发时只有一个在执行，因此多副本部署是安全的。
+pub async fn init_access_log_pruner() {
+    tokio::spawn(async move {
+        loop {
+            match shared::database::access::prune_access_logs().await {
+                Ok(0) => {}
+                Ok(n) => event!(Level::INFO, "Pruned {n} historical access log rows"),
+                Err(e) => event!(Level::ERROR, "Failed to prune access logs: {e}"),
+            }
+            tokio::time::sleep(PRUNE_INTERVAL).await;
+        }
+    });
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// 回归测试（生产事故）：同一秒内的多个 body chunk 必须**累积成一行**，
+    /// 但**跨秒**仍要分开 —— 这两张表的用途是按秒统计大小，秒级颗粒度不能丢。
+    ///
+    /// 历史行为是「每个 chunk 生成一个新 ObjectId 并插一行」，导致生产库
+    /// `access_response_size_logs` 涨到 1600 万行 / 3.6 GB（请求主表的 7 倍）。
+    #[test]
+    fn response_size_chunks_accumulate_per_second() {
+        let id = ObjectId::new();
+        let base = DateTime::from_timestamp(1_800_000_000, 0).expect("valid timestamp");
+
+        // 同一秒内的三块
+        insert_increase_response_size_log_at(id, 10, base);
+        insert_increase_response_size_log_at(id, 25, base + TimeDelta::milliseconds(300));
+        insert_increase_response_size_log_at(id, 65, base + TimeDelta::milliseconds(900));
+        // 下一秒的一块
+        insert_increase_response_size_log_at(id, 7, base + TimeDelta::seconds(1));
+
+        let mut batch = ACCESS_RESPONSE_INSERT_SIZE_LOGS.take_all(100);
+        batch.sort_by_key(|v| v.at_second);
+        assert_eq!(batch.len(), 2, "同一个 id 每秒只应有一行（共 2 秒 → 2 行）");
+        assert_eq!(batch[0].at_second, base);
+        assert_eq!(
+            batch[0].body_length,
+            10 + 25 + 65,
+            "同一秒内的 chunk 必须累加"
+        );
+        assert_eq!(batch[1].at_second, base + TimeDelta::seconds(1));
+        assert_eq!(batch[1].body_length, 7, "不同秒的行必须分开，保留秒级颗粒度");
+
+        ACCESS_RESPONSE_INSERT_SIZE_LOGS.commit();
+    }
+
+    /// 回滚必须是**相加**而不是覆盖：刷盘期间同一 (id, 秒) 又到了新字节时，
+    /// 用旧值覆盖会把新字节丢掉。
+    #[test]
+    fn accumulator_rollback_adds_instead_of_overwriting() {
+        let id = ObjectId::new();
+        let base = DateTime::from_timestamp(1_800_000_000, 0).expect("valid timestamp");
+        let acc = SizeAccumulator::default();
+
+        acc.add(id, 100, base);
+        let taken = acc.take_all(10);
+        assert_eq!(taken.len(), 1);
+        assert_eq!(taken[0].body_length, 100);
+
+        // 刷盘进行中，同一秒又有 40 字节到达。
+        acc.add(id, 40, base + TimeDelta::milliseconds(500));
+        // 写库失败 → 回滚。
+        acc.rollback(taken);
+
+        let again = acc.take_all(10);
+        assert_eq!(again.len(), 1, "同一秒必须仍然只有一行");
+        assert_eq!(
+            again[0].body_length,
+            140,
+            "回滚必须与刷盘期间新到的字节相加（100 + 40），不能覆盖成 100"
+        );
+
+        // 不同秒不会被合并
+        acc.add(id, 5, base + TimeDelta::seconds(3));
+        let third = acc.take_all(10);
+        assert_eq!(third.len(), 1);
+        assert_eq!(third[0].at_second, base + TimeDelta::seconds(3));
+    }
 }

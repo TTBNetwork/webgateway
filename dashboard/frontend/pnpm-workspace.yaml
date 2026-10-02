@@ -1,0 +1,7 @@
+# pnpm 12 起，原先写在 package.json `pnpm` 字段里的配置迁移到这里（见 https://pnpm.io/settings）。
+# 这是从 yarn 的 `resolutions` 字段迁移过来的等价配置：锁定 vite 版本。
+overrides:
+  vite: ^8.0.0-beta.13
+
+# 把 pnpm store 固定在工作区内，避免写到家目录（本开发环境的家目录只读）。
+storeDir: ../../target/pnpm-store

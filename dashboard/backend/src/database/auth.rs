@@ -44,61 +44,17 @@ pub trait Authentication {
     async fn set_user_role(&self, id: &ObjectId, role: Role) -> Result<()>;
 }
 
-const INIT_SQL: &str = r#"
-CREATE TABLE IF NOT EXISTS users (
-    id TEXT PRIMARY KEY,
-    username TEXT NOT NULL,
-    totp_secret TEXT NOT NULL,
-    jwt_secret TEXT NOT NULL,
-    role TEXT NOT NULL DEFAULT 'view',
-    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
-    updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
-    last_login TIMESTAMPTZ,
-    last_ip TEXT,
-    addresses TEXT[] NOT NULL DEFAULT '{}',
-    UNIQUE (username)
-);
-
-ALTER TABLE users ADD COLUMN IF NOT EXISTS role TEXT;
--- 已存在的用户按管理员处理，避免升级后把现有使用者锁在门外。
-UPDATE users SET role = 'admin' WHERE role IS NULL;
-ALTER TABLE users ALTER COLUMN role SET DEFAULT 'view';
-ALTER TABLE users ALTER COLUMN role SET NOT NULL;
-ALTER TABLE users DROP CONSTRAINT IF EXISTS users_role_check;
-ALTER TABLE users ADD CONSTRAINT users_role_check CHECK (role IN ('admin', 'user', 'view'));
-
-CREATE TABLE IF NOT EXISTS users_client_secrets (
-    user_id TEXT NOT NULL REFERENCES users (id),
-    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
-    secret TEXT NOT NULL,
-    UNIQUE (user_id, secret)
-);
-
-
-CREATE UNIQUE INDEX IF NOT EXISTS users_username_idx ON users (LOWER(username));
-CREATE INDEX IF NOT EXISTS users_client_secrets_user_id_idx ON users_client_secrets (user_id);
-CREATE INDEX IF NOT EXISTS users_client_secrets_secret_idx ON users_client_secrets (secret);
-
--- 注意：视图必须包含 role，`SELECT * FROM users_info` 才能取到角色（P1-16）。
--- 这里必须先 DROP 再 CREATE：`CREATE OR REPLACE VIEW` 只允许在末尾追加列，
--- 在中间插入 `role` 会报 `cannot change name of view column "created_at" to "role"`。
-DROP VIEW IF EXISTS users_info;
-CREATE VIEW users_info AS
-SELECT
-    id, username, totp_secret, jwt_secret, role,
-    created_at, updated_at, last_login, last_ip, addresses,
-    (SELECT COUNT(*) FROM users_client_secrets WHERE user_id = users.id) AS client_secrets_count,
-    EXISTS (SELECT 1 FROM users_client_secrets cs WHERE cs.user_id = users.id) AS bound_totp
-FROM users;
-"#;
+/// `users` / `users_client_secrets` / `users_info` 的 DDL 已收敛到
+/// [`shared::database::dashboard_schema`]，使 gateway 与 dashboard 执行同一份迁移
+/// （gateway 先启动也能把表建好）。这里不再保留第二份 SQL，避免两处漂移。
+const _: () = ();
 
 #[async_trait::async_trait]
 impl Authentication for Database {
     async fn init_authentication(&self, tx: &mut Transaction<'_, Postgres>) -> Result<()> {
         // 初始化用户表（迁移入口会在 advisory lock 保护下调用）。
-        for statement in split_sql_statements(INIT_SQL) {
-            sqlx::query(&statement).execute(&mut **tx).await?;
-        }
+        // DDL 本体在 shared 里，保证两个进程迁移结果一致。
+        shared::database::dashboard_schema::initialize_users(tx).await?;
         Ok(())
     }
 
@@ -318,25 +274,6 @@ impl Authentication for Database {
 /// 必须逐条执行而不是 `sqlx::raw_sql`：`RawSql` 在 `Executor` 上引入 `'q` 借用参数，
 /// 与 `Transaction` 的 reborrow 组合会触发 "implementation of `Executor` is not
 /// general enough" 编译错误。
-fn split_sql_statements(sql: &str) -> Vec<String> {
-    let mut statements = Vec::new();
-    let mut current = String::new();
-    for line in sql.lines() {
-        let trimmed = line.trim();
-        if trimmed.is_empty() || trimmed.starts_with("--") {
-            continue;
-        }
-        current.push_str(line);
-        current.push('\n');
-        if trimmed.ends_with(';') {
-            statements.push(std::mem::take(&mut current));
-        }
-    }
-    if !current.trim().is_empty() {
-        statements.push(current);
-    }
-    statements
-}
 
 /// 授权模型的集成测试。
 ///

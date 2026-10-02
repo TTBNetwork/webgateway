@@ -15,3 +15,6 @@ ipdb/test
 dev/environment
 
 tests/*
+
+# pnpm 本地 store（固定在仓库内，避免写家目录）
+.pnpm-store

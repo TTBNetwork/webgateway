@@ -1,11 +1,11 @@
 use crate::{
     config::{get_config, init_config},
-    database::{auth::Authentication, log::initialize_web_log_tx},
+    database::auth::Authentication,
     foundation::{CListener, RemoteAddr},
     response::wrapper_router,
 };
 use shared::{
-    database::{DbStartupMode, get_database, init_database_with_mode, locks},
+    database::{DbStartupMode, get_database, init_database_with_mode},
     listener::CustomDualStackTcpListener,
     logger::LoggerConfig,
 };
@@ -33,11 +33,11 @@ async fn main() -> anyhow::Result<()> {
     //   * DB_AUTO_MIGRATE=1 —— 本进程执行迁移（全程持 advisory lock），再进入服务；
     //   * --migrate        —— 只执行迁移然后退出。
     // 控制面自己的 users / web_log 表也必须在同一把锁下迁移，否则会和数据面抢锁。
+    // 控制面的表（users / users_client_secrets / web_log）已经并入共享迁移入口
+    // （`shared::database::dashboard_schema`），因此这里不再单独迁移一次 ——
+    // 这样 gateway 与 dashboard **谁先启动都会得到同一份完整 schema**。
     let mode = DbStartupMode::from_env_args();
     init_database_with_mode(&get_config().database, get_config().max_connections, mode).await?;
-    if mode != DbStartupMode::Serve {
-        migrate_dashboard_schema().await?;
-    }
     if mode == DbStartupMode::Migrate {
         event!(Level::INFO, "Migration finished, exiting");
         return Ok(());
@@ -97,19 +97,3 @@ async fn main() -> anyhow::Result<()> {
     Ok(())
 }
 
-/// 迁移控制面自己的表（`users` / `users_client_secrets` / `web_log`）。
-///
-/// 与 `shared` 的迁移使用同一把 advisory lock，因此 gateway 与 dashboard
-/// 同时启动时不会并发执行 DDL（P0-7 问题 A）。
-async fn migrate_dashboard_schema() -> anyhow::Result<()> {
-    let mut tx = get_database().pool.begin().await?;
-    sqlx::query("SELECT pg_advisory_xact_lock($1)")
-        .bind(locks::SCHEMA_INIT)
-        .execute(&mut *tx)
-        .await?;
-    get_database().init_authentication(&mut tx).await?;
-    initialize_web_log_tx(&mut tx).await?;
-    tx.commit().await?;
-    event!(Level::INFO, "Dashboard schema migration finished");
-    Ok(())
-}

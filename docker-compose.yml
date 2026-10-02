@@ -37,6 +37,7 @@ services:
     networks:
       webgateway:
         ipv4_address: ${SUBNET_PREFIX}.2
+
   gateway:
     container_name: webgateway-gateway
     restart: unless-stopped
@@ -46,6 +47,10 @@ services:
     environment:
       TZ: ${TZ:-Asia/Shanghai}
       DATABASE_URL: ${DATABASE_URL:-postgresql://${POSTGRES_ENCODE_USER:-${POSTGRES_USER:-root}}:${POSTGRES_ENCODE_PASSWORD:-${POSTGRES_PASSWORD}}@webgateway-pg:5432/postgres}
+      # 启动即迁移（无感）：两个服务谁先起来都会在 advisory lock 下把完整 schema 补齐，
+      # 包括控制面的 users / users_client_secrets / web_log。迁移幂等，重复启动安全。
+      # 若要改成"只服务不迁移"，设为 0（此时需自行保证 schema 已由 --migrate 建好）。
+      DB_AUTO_MIGRATE: "1"
     networks:
       webgateway:
         ipv4_address: ${SUBNET_PREFIX}.3
@@ -63,6 +68,8 @@ services:
     environment:
       TZ: ${TZ:-Asia/Shanghai}
       DATABASE_URL: ${DATABASE_URL:-postgresql://${POSTGRES_ENCODE_USER:-${POSTGRES_USER:-root}}:${POSTGRES_ENCODE_PASSWORD:-${POSTGRES_PASSWORD}}@webgateway-pg:5432/postgres}
+      # 见 gateway 服务处的说明。
+      DB_AUTO_MIGRATE: "1"
     networks:
       webgateway:
         ipv4_address: ${SUBNET_PREFIX}.4

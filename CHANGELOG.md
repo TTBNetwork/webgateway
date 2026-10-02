@@ -5,10 +5,222 @@
 
 ## [未发布]
 
+### 2026-10-02（第七轮：size 表按秒颗粒度 + 无感自动迁移，06:24:00Z — 06:46:03Z）
+
+本轮按 [STEP.md](STEP.md) 更新后的「目前」两节实施。**注意：第七轮修正了第六轮的一个设计缺陷**
+—— 第六轮把响应大小按请求聚合成一行，**丢掉了秒级颗粒度**，而这两张表的用途正是"细化到每秒"。
+所有时间戳为 UTC。
+
+- 修复（06:40:00Z，**修正第六轮的过度聚合**）：size 明细表改为按 **`(请求, 秒)`** 聚合。
+  - 第六轮的做法是「同一请求的多个 chunk 合并成一行」，虽然消除了 7 倍膨胀，但**跨秒也合并了**，
+    秒级颗粒度彻底丢失。
+  - 现在：新增 `at_second`（截断到整秒）列，唯一键 `(xxx_id, at_second)`；
+    gateway 侧 `SizeAccumulator` 按 `(id, 秒)` 在内存累加，落库用
+    `ON CONFLICT (xxx_id, at_second) DO UPDATE SET body_length = body_length + EXCLUDED.body_length`。
+    **同一秒内合并、跨秒分开** —— 行数按"请求数 × 实际跨秒数"收敛（单秒内完成的请求只占一行），
+    同时保住每秒颗粒度。
+  - 老库升级：迁移会补 `at_second`、用 `created_at` 回填、**合并同秒重复行**（保留行取组内
+    `MIN(id)`，字节数取组内 `SUM`，因此历史统计**不会变小**）、再建唯一索引。
+    生产库实测有 **298541 组重复、约 417 万行需要合并**，因此**首次启动会明显变慢**（一次性代价）。
+  - 新增 3 个测试：`response_size_chunks_accumulate_per_second`（同秒合并且跨秒分开）、
+    `accumulator_rollback_adds_instead_of_overwriting`、`merge_same_second_folds_duplicate_keys`。
+- 修复（06:42:00Z，**迁移期的真实约束**）：单条 `INSERT ... ON CONFLICT DO UPDATE` **不允许两次命中
+  同一冲突键**（PostgreSQL 报 `ON CONFLICT DO UPDATE command cannot affect row a second time`，
+  已实测）。因此落库前先用 `merge_same_second` 在内存合并批次内的同键行；并改为**整批单事务**
+  —— 累加写不是幂等的，若分块提交，"第一块成功、第二块失败后整批重试"会**重复累加**字节数。
+- 新增（06:45:00Z，**无感自动迁移**）：`DbStartupMode::from_env_args` 的默认值由 `Serve` 改为
+  **`AutoMigrate`** —— 任一服务启动时都会在 `locks::SCHEMA_INIT` 事务级 advisory lock 下补齐完整
+  schema 再进入服务，因此 gateway 与 dashboard **谁先启动都一样**，全新库直接 `up` 即可。
+  早期默认 `Serve` 是因为担心两进程并发重放 DDL（ISSUES.md P0-7 问题 A），而该竞态已由
+  advisory lock + 幂等 DDL 消除。保留逃生开关：`DB_AUTO_MIGRATE=0`（或 `false`）＝只校验不建表。
+- 修复（06:45:00Z，自动迁移的前提）：**控制面的表（`users` / `users_client_secrets` / `web_log`）
+  原本只在 dashboard 的迁移里创建**，gateway 无法调用 —— 于是"gateway 先启动"时库中缺 `users`，
+  而 gateway 的 `verify_database_schema` 恰恰要求它存在，所谓"自动迁移"名不副实。
+  现把这三张表的 DDL 收敛到 `crates/shared/src/database/dashboard_schema.rs` 并纳入共享迁移入口；
+  dashboard 的 `init_authentication` / `initialize_web_log_tx` 改为转调共享实现（不再保留第二份 SQL）。
+  `verify_database_schema` 的必需表清单同步加入 `users_client_secrets`、`web_log`。
+- 变更（06:45:00Z）：`docker-compose.yml` 去掉一次性 `migrate` 服务（不再需要），
+  两个服务各自显式 `DB_AUTO_MIGRATE: "1"` 并 `depends_on: postgres`。
+- 验证：
+  - `cargo check --workspace --all-targets` 零错误；`cargo test --workspace` 全绿
+    （gateway 3 个、shared 6 个等）；
+  - 真实库端到端：同一秒 3 次上报 → **1 行 / 字节和 132**；跨一秒再上报 → **2 行**（秒级颗粒度保留）；
+  - 迁移后在真实库确认：`at_second` 列、两个 `uniq_access_*_second` 唯一索引、`users_info.role`、
+    `configurations` 表与 `access_log_retention` 配置全部就位；
+  - 两个二进制默认启动均为 `Database startup mode: AutoMigrate`；`DB_AUTO_MIGRATE=0` 时为 `Serve`。
+- 说明（数据安全）：生产库**仍为只读**，未执行迁移。上面的重复行统计是只读查询得出的；
+  生产迁移要等部署新镜像时由服务自动完成（建议低峰期，首次会合并约 417 万行）。
+
+### 2026-10-02（第六轮：访问日志保留期 + 修复 size 表存储膨胀，06:02:00Z — 06:23:58Z）
+
+本轮按 [STEP.md](STEP.md) 更新后的「目前」一节实施：① 证书续签暂不处理（用户明确要求）；
+② 压缩/清理数据库历史数据（可在控制面板配置，下限 3 个月）；③ 控制面板可选配置 HTTP/HTTPS
+代理以便续签证书（**经核实无需改代码**，见下）。所有时间戳为 UTC。
+
+- 修复（06:14:00Z，**存储膨胀 7 倍，本轮最重要的发现**）：**响应体大小明细表按 body chunk
+  逐块插行，导致 `access_response_size_logs` 达到 1600 万行 / 3.6 GB（请求主表的 7 倍）。**
+  `StatisticsIncoming::poll_frame` 每读到一个 chunk 就调用一次
+  `insert_increase_response_size_log`，而该函数原来会**为每次调用新生成一个 ObjectId 并插一行**
+  —— 一个响应体被分成 N 块读取就写 N 行。
+  生产库实测：`access_response_size_logs` 16036486 行 vs `access_request_logs` 2280559 行
+  （比值 **7.03**）；近 24 小时仍在以 **6.40 倍**的重复率增长；单条 `response_id`
+  最多挂了 **262791 行**（2026-07-03 起 4 天内）。
+  修法：gateway 侧新增 `SizeAccumulator`，把同一 `id` 的多个 chunk **在内存里累加**，
+  每轮刷盘每个 id 只落一行（`body_length` 为累加值，`created_at` 取首次出现时间以保证与主表
+  时间轴一致、便于保留期裁剪）。刷盘失败时回滚是**相加**而非覆盖，避免丢掉刷盘期间新到的字节。
+  新增 2 个回归测试锁住该行为。
+- 新增（06:16:00Z，控制面板可配，下限 3 个月）：**访问日志保留期 + 自动清理**。
+  - 配置存放于 `configurations` 表（key = `access_log_retention`），字段
+    `retention_days`（默认 **180 天**，夹紧到 **[90, 3650]**）与 `enabled`（默认开启）。
+  - 清理由数据面 gateway 每小时执行一次，按「先删两张 size 明细 → 再删响应 → 最后删请求」
+    的顺序（严格遵守外键依赖），每轮最多 5 万行、最多 20 轮，用**小事务**推进避免长事务持锁
+    与 WAL 暴涨。
+  - 多实例并发安全：用 `pg_try_advisory_lock(locks::RETENTION)` 独占；**全程占用同一条连接**
+    取锁/删数据/解锁 —— 会话级 advisory lock 若跨连接获取与释放会静默失效（本轮修掉的自伤点）。
+  - 新增 API：`GET /settings/retention`、`POST /settings/retention`（需 `user` 及以上）、
+    `POST /settings/retention/prune`（立即清理一轮，最多 25 万行）。
+  - 前端「设置 → 数据保留」页：可改保留天数、开关自动清理、手动触发一轮清理；
+    保存后用**后端返回的实际生效值**回显，避免"设了 30 天但实际 90 天"的静默偏差。
+- 修复（06:16:00Z）：**`configurations` 表从未被创建**。`initialize_configuration` 原先在连接池上
+  直接执行 DDL、且**从未被任何地方调用**，导致这张表在真实库里根本不存在（生产库实测
+  `relation "configurations" does not exist`）。现改为与其他 initializer 一致的事务签名
+  （`&mut Transaction`）、接入 `inner_init_database_with`，并加入 `verify_database_schema`
+  的必需表清单。
+- 变更（06:16:00Z）：迁移时以 `ON CONFLICT (key) DO NOTHING` 写入保留期默认值（180 天），
+  因此重复迁移**不会**覆盖运维已经调整过的值。
+- 核实（06:20:00Z，任务 3「面板可选配置 HTTP/HTTPS 代理以续签证书」）：
+  **无需改代码即可支持**。acmex 用 `reqwest::Client::builder()` 构造客户端且**没有**调用
+  `.no_proxy()`，reqwest 默认读取 `HTTP_PROXY` / `HTTPS_PROXY` / `ALL_PROXY` / `NO_PROXY`
+  环境变量，因此给 dashboard-backend 容器设置 `HTTPS_PROXY` 即可让 ACME 签发走代理。
+  本轮未加面板字段（用户在 STEP.md 中已把证书续签标为"先不用管"），已记录到 [TODO.md](TODO.md)。
+- 验证：`cargo check --workspace --all-targets` 零错误；`cargo test --workspace` 全绿
+  （新增 2 个 gateway 单测 + 2 个保留期夹紧单测）；前端 `pnpm build` 通过；
+  真实库验证保留期配置读写（设 10 天 → 实际生效 90 天）、清理外键顺序
+  （造 200 天前的请求 + 响应 + 两张 size 明细，清理后过期行 0、未过期行保留 1、孤儿行 0）；
+  生产库只读确认 `configurations` 表缺失（印证上面那条修复的必要性）。
+- 说明（数据安全）：清理函数只在 beta 库上执行过，且 beta 库现有数据全部落在保留期内
+  （最早 2026-08-17），实测未删除任何真实数据（仅删掉自造探针数据）。
+  生产库**全程只读**，未执行任何迁移或删除。生产库里 `host='probe'` 的 13 行是历史测试数据
+  （2026-05-20 起），与本次工作无关。
+
+### 2026-10-02（第五轮：release 构建解阻 + pnpm 迁移 + 生产只读排查，05:52:00Z — 06:01:33Z）
+
+本轮处理 [STEP.md](STEP.md) 更新后的内容：解决 release 构建阻塞、前端 yarn→pnpm 迁移、
+生产环境 SSH 只读排查、并把 STEP.md 融合进 [agent.md](agent.md)。所有时间戳为 UTC。
+
+- 修复（05:57:00Z，**release 构建阻塞，第四轮遗留**）：**vendor `acmex` 0.8.0 并去掉硬编码的 `fips` feature。**
+  上游 `acmex/Cargo.toml` 把 `aws-lc-rs = { features = ["fips"] }` 写死且非可选，导致任何下游都必须编译
+  FIPS 版后端 `aws-lc-fips-sys`；其 `bcm-delocated.S` 会被较新的 binutils 拒绝
+  （`error while processing "\t.section\t.data.rel.ro.local...": ".data section found in module"`），
+  整个 workspace 因此产不出 release 产物（退出码 101）。
+  实测：升级 `aws-lc-fips-sys` 0.13.14→0.13.17 **无效**；而关掉 fips 后用的 `aws-lc-sys` 在本机
+  38 秒即编译通过。acmex 全仓**只有一处**用到 aws-lc-rs（`src/storage/encrypted.rs` 的 AES-256-GCM），
+  与 FIPS 认证无关，故去掉该 feature 功能完全等价。
+  做法：`vendor/acmex/`（569 KB，只保留 `src/`、`Cargo.toml`、两个 LICENSE 与 README；
+  上游的 docs / examples / tests / .github 已剔除，不影响构建），并在根 `Cargo.toml` 用
+  `[patch.crates-io] acmex = { path = "vendor/acmex" }` 重定向，补丁处写明原因；
+  `dashboard/backend/Cargo.toml` 仍写 crates.io 版本号，便于上游修复后一行回退。
+- 验证（05:58:00Z）：`cargo build --release --bin dashboard --bin gateway --bin webgateway-mnt`
+  **退出码 0**，产出 `target/release/{dashboard,gateway,webgateway-mnt}`；
+  `cargo tree -p dashboard` 中 `aws-lc-fips-sys` 计数为 **0**；
+  两个 release 二进制对真实库跑 `--migrate` 均退出 0。
+- 变更（05:58:00Z，可选任务）：**前端包管理器 yarn → pnpm**。新增 `dashboard/frontend/pnpm-lock.yaml`
+  （唯一锁文件）与 `pnpm-workspace.yaml`；删除 `yarn.lock`、`.yarnrc.yml`、`.yarn/install-state.gz`
+  （后者是误提交的二进制产物）。`package.json` 增加 `packageManager: pnpm@12.8.1`、
+  `typecheck` / `lint` 脚本，并把 yarn 的 `resolutions` 迁移为 pnpm `overrides`
+  （pnpm 12 起该设置位于 `pnpm-workspace.yaml`，`package.json` 的 `pnpm` 字段已不再被读取）。
+  CI 的 [.github/actions/build-frontend/action.yml](.github/actions/build-frontend/action.yml)
+  改用 `pnpm/action-setup@v4` + `pnpm install --frozen-lockfile` + `pnpm build`。
+  验证：`pnpm install --frozen-lockfile` 通过、`pnpm build` 通过（`vue-tsc -b` + `vite build`）。
+- 移除（05:58:00Z）：仓库根目录的 `package.json` + `yarn.lock`。它们是历史上 `qrcode-vue3`
+  的残留（该依赖已被 `vue3-next-qrcode` 取代），全仓无任何引用，也不参与任何构建。
+- 修复（05:59:00Z）：`.gitignore` 增加 `.pnpm-store`（pnpm store 固定在 `target/pnpm-store`，
+  避免写家目录 —— 本开发环境家目录只读）。
+- 排查（06:00:00Z，**只读，未做任何变更**）：SSH 上生产 `10.240.0.1` 核对现状，要点见
+  [agent.md](agent.md)「生产部署现状」与 [PRODUCTION_READINESS.md](PRODUCTION_READINESS.md)：
+  - 生产库真实库名是 **`postgres`**（STEP.md 里写的 `webgateway` 不存在）；生产库**缺
+    `users.role` 与 `certificates.signing_started_at`**，所以新镜像上线前必须迁移。
+  - 镜像来源是镜像站 **`ghcr.milu.moe`**（`IMAGE_PREFIX=ghcr.milu.moe/ttbnetwork`），
+    不是 `ghcr.io`；部署目录 `/opt/webgateway/`。
+  - 运行中的镜像是 3 周前构建、**早于全部审计修复**（日志无 `Database startup mode: Serve` 特征）；
+    `/opt/webgateway/.env` 无 `DB_AUTO_MIGRATE`，compose 里也没有 migrate 服务。
+  - **生产日志实证了本轮修复的必要性**：46 万行日志中
+    `Failed to send request: operation was canceled` 出现 **8099 次**，
+    `hyper::Error(Canceled, IncompleteMessage)` 7897 次 —— 即用户报告的 `operation was canceled`。
+  - 旧镜像仍在跑 `qps_per_5s` 视图：dashboard 日志显示单次查询 **4.66 秒**（阈值 1s），
+    且前端每 5 秒轮询一次，与 ISSUES.md P0-3 的判断一致。
+  - TLS 握手失败占日志主体（`BadCertificate` 25.7 万次、`tls handshake eof` 10.4 万次、
+    `NoCipherSuitesInCommon` 6.6 万次），多数为扫描器探测，建议单独排查。
+  - 主机规格：Debian 13 / 2 vCPU / **1.9 GiB 内存无 swap** / 根分区 39G 已用 50%。
+- 变更（06:01:33Z）：`STEP.md` 的「需要修改 / 可选修改 / 最后」三节融合进
+  [agent.md](agent.md)（新增「任务单」与「生产部署现状」两节）；「授予权限」按约定
+  **只保留非凭据事实**（测试域名、生产库/SSH 的存在与用途），连接串与口令不入库。
+- 新增（06:01:33Z）：[agent-context.md](agent-context.md) —— 会话上下文与踩坑记录，
+  便于下次接手（环境地址、生产缺失列、`tests/` 非测试目录、`shared` 无 tokio multi-thread、
+  `TrySendError` 用法、后台进程必须用受管任务等）。
+
+### 2026-10-02（第四轮：生产可用性修复，05:24:30Z — 05:45:18Z）
+
+本轮处理 [STEP.md](STEP.md) 提出的三件事：① 保证能在生产环境直接在线迁移并运行；
+② 修 gateway 的 `operation was canceled`；③ 把 `CONVERSATION.md` 合并进 `ISSUES.md`。
+所有时间戳为 UTC。改动文件：`gateway/src/upstream.rs`、`gateway/src/upstream/connection.rs`、
+`crates/shared/src/database.rs`、`crates/shared/src/database/access.rs`、
+`crates/shared/src/database/certificate.rs`、`docker-compose.yml`。
+
+- 修复（05:43:49Z，**P0-5 回归，最严重**）：**上游连接任务结束后连接被放回空闲池，导致后续请求永久挂起。**
+  连接任务把 `poll_without_shutdown` 的 `Ready(Err(e))`（上游 EOF / 出错）当成"正常结束"，
+  于是"响应体已读完"的标志被保留，这条已无 future 驱动的连接被 `Drop` 放回池中；
+  下一个请求复用它时，`try_send_request` 把请求投递给**没有接收者的 dispatch 队列**并永久挂起
+  —— 请求根本到不了上游，客户端只能等到超时。实测表现：**每隔一个请求超时**（`curl` 60 次 =
+  30 成功 / 30 超时；`crates/shared` 探针同样 1 成功 1 超时）。
+  修法：`PooledUpstreamConnection` 新增 `task_exited` 共享标志，连接任务在退出前**无条件**置位；
+  `is_reusable()` 改为「响应体已读到 EOF **且** 连接任务仍在运行」。同时把连接出错日志
+  从 `ERROR` 降为 `DEBUG`（对端正常关闭 keep-alive 不是错误，避免刷屏）。
+  验证：修复前 6/6 中 3 次超时 → 修复后「每次新连接」与「单连接 keep-alive」两种模式各 6/6 全部 200，
+  另跑 `curl` 50 次 50/50 成功。
+- 修复（05:41:00Z）：`try_send_request` 重试——复用的 keep-alive 连接若已被上游关闭，
+  hyper 会返回 `Kind::Canceled`（其 Display 正是用户看到的 `operation was canceled`）。
+  改用 `try_send_request`（而非 `send_request`）以取回请求体，并按 hyper-util `legacy::Client`
+  的判据**只对「取自空闲池 + 请求体被原样交还（一个字节都没发出）」的连接重试一次**；
+  `PooledUpstreamConnection` 增加 `is_reused()` 供该判断使用。
+  **注意**：这条只是把"偶发 502"变成"自动重试"，上面那条挂起才是 `operation was canceled` 的主因。
+- 修复（05:31:00Z，**P0-1 残留**）：访问日志批量 INSERT 改为**幂等**（`ON CONFLICT (id) DO NOTHING`，
+  两个 size 明细表用 `ON CONFLICT DO NOTHING`）。刷盘是「批量取出 → 写库 → 成功才清空内存」，
+  而分块执行不是原子的：前几块提交成功、最后一块失败时，下一轮重试会命中主键冲突并**永久失败**，
+  该类型日志的刷盘队列被彻底毒化（只进不出、内存无限增长直至 OOM）。
+  验证：真实数据库上「整批重试」与「部分成功后整批重试」两个场景均通过。
+- 修复（05:32:21Z，**P0-14 残留**）：证书签发认领增加**过期回收**（`STALE_SIGNING_CLAIM = 10 minutes`）。
+  原先释放只靠 `SigningGuard::drop`，进程被 SIGKILL / OOM / `docker kill` 打断时不会执行，
+  该证书永远停留在"已认领"状态、再也不续签，只能人工改库。
+  验证：真实数据库三场景——1 秒前的认领不被抢占 ✓、30 分钟前的僵死认领被回收 ✓、回收后不会重复签发 ✓。
+- 修复（05:32:21Z，**会导致自动续签 100% 失败**）：`try_claim_certificate_signing` 的 SELECT
+  **漏选 `email` 列**，而 `NeedSignCertificate` 的 `FromRow` 要求该列 → 只要存在满足条件的证书，
+  认领查询就必然报 `no column found for name: email`，证书**永远无法自动续签**（到期后 HTTPS 中断）。
+  这是本轮顺带发现并修复的、比上面两条更直接的生产事故点。
+- 新增（05:32:39Z）：`docker-compose.yml` 增加一次性迁移服务 `migrate`
+  （`dashboard --migrate`，`restart: "no"`，等待 postgres `service_healthy`）；
+  `gateway` 与 `dashboard-backend` 改为 `depends_on: migrate: service_completed_successfully`。
+  原因：服务进程默认 `Serve` 模式（只校验、不建表），而编排里既没有 `DB_AUTO_MIGRATE`
+  也没有迁移 Job —— **全新库直接 `docker compose up` 会因缺表启动失败**，已有库升级也不会创建新列。
+- 修复（05:45:09Z）：`verify_database_schema()` 不再只检查**表**是否存在，同时校验关键**列**
+  （`users.role`、`certificates.signing_started_at`、`certificates.expires_at`、
+  `access_request_logs.requested_at` / `remote_addr`）。原先旧库升级后服务能"启动成功"，
+  直到请求命中才报 `column does not exist`，极难定位。验证：临时改名 `users.role` 后能被正确检出。
+- 变更（05:45:18Z）：`CONVERSATION.md` **合并进 [ISSUES.md](ISSUES.md) 附录 A 并删除原文件**，
+  避免两份文档漂移；文中所有引用（`agent.md`、`TODO.md`、`CHANGELOG.md`、`crates/shared/src/database.rs`）
+  已同步更新。
+- 验证（本轮）：`cargo check --workspace --all-targets` 通过；前端 `vue-tsc -b && vite build` 通过；
+  `gateway --migrate` 与 `dashboard --migrate` 打真实数据库幂等通过；`Serve` 模式启动正常。
+  端到端用真实网关 + 自建上游（应答后关连接 / 保持连接两种）验证，见上。
+- **未做 / 已知限制（诚实记录）**：上游连接**空闲复用率下降**。修复挂起后，连接任务一结束
+  该连接就关闭，因此"客户端请求结束后的空闲复用"不再发生（同一客户端 keep-alive 连接内的
+  连续请求仍会复用）。要恢复复用需要让上游连接的生命周期**脱离**客户端连接任务，属重构，
+  本轮未做。功能正确性优先于复用率。
+
 ### 2026-10-02（第三轮：P0 止血 + 安全 + 前端放大器修复）
 
 本轮按 [ISSUES.md](ISSUES.md)「建议的修复顺序」实施，范围 = **P0 止血 + 安全问题 + 前端放大器 + 角色权限模型**；
-**不含** [CONVERSATION.md](CONVERSATION.md) 的分区/冷迁移方案（需停机迁移，另行排期）。
+**不含**迁移方案（现为 [ISSUES.md](ISSUES.md) **附录 A**）中的分区/冷迁移部分（需停机迁移，另行排期）。
 
 - 修复（P0-1，**数据丢失**）：访问日志刷盘改为「**先写库成功、再从内存移除**」。原实现先 `retain` 删内存再 `insert`，写库失败即永久丢日志且不重试。现在每类日志有 `pending`/`inflight` 两个槽位：写成功才 `commit`，失败则批次留在内存下一轮重试，并记录连续失败轮数与内存积压规模。`gateway/src/access.rs` 基本重写。
 - 修复（P0-1 补充）：`body_length` 的批量 UPDATE 原先在「请求行尚未落库」时会命中 0 行、静默丢失大小统计；由于 `access_request_logs.id` 是主键，超集行仅补 `body_length`、其余为 NULL，实际不会插出孤儿行。已通过真实数据库验证（`access_request_size_logs` 与主表 `body_length` 均正确落库）。
@@ -42,7 +254,7 @@
 - 新增（测试）：`dashboard/backend/src/database/auth.rs` 增加授权链路集成测试（`authorization_chain`），覆盖：真实 `sign_jwt` 签发 → 解令牌 → 查库取 role → `require_write()`/`require_admin()` 判定；`Role::parse` 对非法值降级为 `view`；`Authorizer` 提取器从 `Authorization: Bearer` 解析角色并拒绝缺失令牌；**handler 级**断言 —— `view` 调 `POST /websites/create` 返回 403、`user` 返回 200、`view`/`user` 调 `/auth/users` 返回 403 而 `admin` 返回 200。未设置 `DATABASE_URL` 时自动跳过，不影响无数据库的 CI。
 - 变更：`gateway/src/upstream/connection.rs` 新增 `PooledUpstreamConnection::drained_flag()` / `take_parts()`，`available_permits()` 取代有误导性的 `max_connections()`。
 - 验证：`cargo check` / `cargo test` / `cargo fmt --check` / `cargo clippy`（改动文件零新增告警）全部通过；新增 2 个测试（`strip_port` 单元测试 + 授权链路集成测试，后者含 handler 级 403/200 断言）。另外在真实 PostgreSQL 18.2 + 真实网关进程上做了端到端验证：迁移幂等、QPS 查询走索引、访问日志（请求/响应/size/大小更新）正确落库且不重复、配置改动与删除实时生效、监听端口按需回收、TLS SNI 证书选择与通配符匹配正确、中途断开响应不串包。验证用的临时脚本与测试数据已清理。
-- 已知残留（本轮未做，明确记录以免误解）：① 上游连接池的空闲复用率仍然低（见 P0-6 说明）；② 访问日志表无分区/无 TTL，QPS 查询已走索引但表仍会无限增长（属 [CONVERSATION.md](CONVERSATION.md) 迁移方案范围）；③ 网关仍是单点，未做多后端负载均衡（只用 `backends.first()`）与 PROXY protocol 解析；④ 前端 `eslint` 仍有 102 个**存量**错误（改动文件零新增），且 `eslint.config.ts` 依赖未声明的 `jiti`、未忽略 `dist`，建议后续单独修。
+- 已知残留（本轮未做，明确记录以免误解）：① 上游连接池的空闲复用率仍然低（见 P0-6 说明）；② 访问日志表无分区/无 TTL，QPS 查询已走索引但表仍会无限增长（属 [ISSUES.md](ISSUES.md) 附录 A 迁移方案范围）；③ 网关仍是单点，未做多后端负载均衡（只用 `backends.first()`）与 PROXY protocol 解析；④ 前端 `eslint` 仍有 102 个**存量**错误（改动文件零新增），且 `eslint.config.ts` 依赖未声明的 `jiti`、未忽略 `dist`，建议后续单独修。
 
 ### 更早的未发布条目
 
@@ -79,7 +291,7 @@
 - 已知问题：**证书续签判定方向写反**（`expires_at < NOW() - 7 days`），证书在到期后才开始续签，会导致站点 HTTPS 中断；且多副本部署时无跨进程互斥，会重复消耗 ACME 配额。
 - 已知问题：前端 ky 默认重试在 5xx 时把统计请求放大 3 倍，且所有轮询无 `visibilitychange` 门控 —— 二者是数据库压力的重要放大器。
 - 已知问题（安全）：`/auth/info` 存在越权读取（IDOR），任意已认证用户可枚举他人账号；系统**完全没有角色/权限模型**，任一登录账号即等同管理员，可读取全部 DNS 服务商凭据。
-- AI 修改：归纳并交叉核对外部 AI 产出的《访问日志存储优化 + v1→v2 迁移方案》[CONVERSATION.md](CONVERSATION.md)，核对结论追加为 [ISSUES.md](ISSUES.md) 的「附：交叉核对」章节，并在 [agent.md](agent.md) 登记该文档。
+- AI 修改：归纳并交叉核对外部 AI 产出的《访问日志存储优化 + v1→v2 迁移方案》[CONVERSATION.md]，核对结论追加为 [ISSUES.md](ISSUES.md) 的「附：交叉核对」章节，并在 [agent.md](agent.md) 登记该文档。
 - 待评审：该迁移方案已覆盖 P0-3 / P0-7 / P1-1 / P1-10，但**未覆盖** P0-1（丢数据）、P0-2（分块）、P0-4（循环自激）、P0-13（证书续签）与前端放大器 P0-11 / P0-12；另识别出 6 处技术风险（移除外键会失去孤儿行保护、`get_access_info` 响应侧无法分区裁剪、回滚步骤不含索引与 FK 恢复、`DatabaseQPS` 字段描述与代码不符、PG 版本无法从仓库验证、时区一致性成为硬要求）。
 - 修复：无（本次仅审计与文档，未改动业务代码）。
 

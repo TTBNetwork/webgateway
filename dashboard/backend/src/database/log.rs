@@ -6,24 +6,10 @@ use crate::models::log::{Log, LogAddr, LogContent};
 
 /// 在给定事务中创建 `web_log` 表。
 ///
-/// 独立函数形式是为了让迁移入口（已持有 advisory lock 的事务）直接复用，
-/// 而不必通过 `Database` 实例。
+/// DDL 本体已收敛到 [`shared::database::dashboard_schema`]（gateway 也会执行它，
+/// 因此两个进程的迁移结果一致）。这里保留薄封装，供测试与既有调用点复用。
 pub async fn initialize_web_log_tx(tx: &mut Transaction<'_, Postgres>) -> Result<()> {
-    sqlx::query(
-        r#"
-        CREATE TABLE IF NOT EXISTS web_log (
-            id TEXT PRIMARY KEY,
-            user_id TEXT NOT NULL,
-            content JSONB NOT NULL default '{}',
-            created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
-            address TEXT NOT NULL,
-            FOREIGN KEY (user_id) REFERENCES users(id)
-        )
-    "#,
-    )
-    .execute(&mut **tx)
-    .await?;
-    Ok(())
+    shared::database::dashboard_schema::initialize_web_log(tx).await
 }
 
 /*

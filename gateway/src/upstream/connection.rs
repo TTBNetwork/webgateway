@@ -276,6 +276,8 @@ impl UpstreamConnectionPool {
                             pool: self.clone(),
                             _permit: Some(permit),
                             reusable: Arc::new(AtomicBool::new(false)),
+                            task_exited: Arc::new(AtomicBool::new(false)),
+                            reused: true,
                         });
                     }
                     // 探活失败：丢弃并继续尝试队列中的下一条。
@@ -291,6 +293,8 @@ impl UpstreamConnectionPool {
             pool: self.clone(),
             _permit: Some(permit),
             reusable: Arc::new(AtomicBool::new(false)),
+            task_exited: Arc::new(AtomicBool::new(false)),
+            reused: false,
         })
     }
 
@@ -371,6 +375,25 @@ pub struct PooledUpstreamConnection {
     _permit: Option<tokio::sync::OwnedSemaphorePermit>,
     /// 见上文说明；`false` 表示连接不可复用。
     reusable: Arc<AtomicBool>,
+    /// 「驱动这条连接的 future 是否已经结束」的共享标志。
+    ///
+    /// 这条标志解决的是一个**致命的挂起**：`try_send_request` 把请求投递给由
+    /// 连接任务持有的 dispatch 队列。任务一旦退出（上游 EOF/出错/超时），队列
+    /// 就没有接收者了，此后复用该连接发送请求会**永久挂起**（实测：每隔一个请求
+    /// 超时，且请求根本到不了上游）。
+    ///
+    /// 因此判定"能否放回空闲池"必须同时满足：
+    ///   1. 响应体已读到 EOF（`reusable`，防跨请求串包，P0-5）；
+    ///   2. 连接任务**仍在运行**（本标志为 false）—— 只要任务已结束，这条连接就没人驱动了。
+    /// 把连接任务结束时间点记录下来，而不是在结束时清 `reusable`，是为了不干扰
+    /// "响应体先于任务结束"这一正常复用路径。
+    task_exited: Arc<AtomicBool>,
+    /// 这条连接是否取自**空闲队列**（true）还是本轮新建的（false）。
+    ///
+    /// 用途：连接可能已被上游单方面关闭，而探活与真正发送之间存在时间窗口。
+    /// 只有「复用的连接 + 请求体被交还（即尚未发出任何字节）」这两个条件同时成立时，
+    /// 重试才是安全的 —— 这与 hyper-util `legacy::Client` 的判据一致（`connection_reused`）。
+    reused: bool,
 }
 
 impl PooledUpstreamConnection {
@@ -382,9 +405,22 @@ impl PooledUpstreamConnection {
         self.reusable.clone()
     }
 
-    /// 连接当前是否已被标记为可复用。
+    /// 取得"连接任务已结束"的共享标志，由连接任务在退出前置位。
+    pub fn task_exited_flag(&self) -> Arc<AtomicBool> {
+        self.task_exited.clone()
+    }
+
+    /// 连接当前是否**真的**可以复用：响应体读完 **且** 仍有任务在驱动它。
     pub fn is_reusable(&self) -> bool {
-        self.reusable.load(Ordering::Acquire)
+        self.reusable.load(Ordering::Acquire) && !self.task_exited.load(Ordering::Acquire)
+    }
+
+    /// 这条连接是否来自空闲队列（即"复用"的连接）。
+    ///
+    /// 只有复用的连接才可能"取出来的瞬间已被上游关闭"，因此也只有它值得重试一次；
+    /// 全新建立的连接失败说明上游本身有问题，重试无意义。
+    pub fn is_reused(&self) -> bool {
+        self.reused
     }
 
     /// 取出底层连接、池引用与配套的连接许可，用于在别处（例如 hyper 连接任务
