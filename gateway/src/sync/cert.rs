@@ -3,6 +3,7 @@ use std::{
     time::Duration,
 };
 
+use chrono::Utc;
 use dashmap::DashMap;
 use regex::Regex;
 use rustls::{
@@ -73,6 +74,12 @@ pub async fn sync_certificates() -> anyhow::Result<()> {
     let mut next_full = Vec::new();
     let mut next_lazy = Vec::new();
 
+    // 先解出所有可用证书，并标注它是否已过期。
+    //
+    // 需求（STEP.md）：**过期的证书不加载**，除非加载完发现一张能用的都没有 ——
+    // 那时宁可继续用过期证书顶着（浏览器会告警但至少能连），也不要无证书可用。
+    let now = Utc::now();
+    let mut parsed: Vec<(ObjectId, Arc<CertifiedKey>, bool, Vec<String>)> = Vec::new();
     for certificate in certificates {
         // 手工上传但内容缺失的证书会导致解析失败：跳过它而不是让整轮同步失败，
         // 否则一张坏证书会让网关完全无法加载其它证书。
@@ -100,8 +107,44 @@ pub async fn sync_certificates() -> anyhow::Result<()> {
             }
         };
 
-        next_by_id.push((certificate.id, config.clone()));
-        for domain in certificate.hostnames {
+        // 模型里 `expires_at` 是必填（`DateTime<Utc>`，不是 Option），因此这里只判"是否已过期"。
+        let expired = certificate.expires_at < now;
+        if expired {
+            event!(
+                Level::WARN,
+                "Certificate {} is expired (expires_at = {:?}); it will be ignored unless \
+                 no valid certificate is available",
+                certificate.id,
+                certificate.expires_at
+            );
+        }
+        parsed.push((
+            certificate.id,
+            config,
+            expired,
+            certificate.hostnames,
+        ));
+    }
+
+    // 决定哪些证书参与装载：优先只用未过期的；若一张未过期的都没有，则回退到全部
+    // （宁可继续用过期证书顶着，也不要无证书可用）。
+    let expired_flags: Vec<bool> = parsed.iter().map(|(_, _, expired, _)| *expired).collect();
+    let loadable = loadable_certificates(&expired_flags);
+    if !expired_flags.is_empty() && !expired_flags.iter().any(|e| !*e) {
+        event!(
+            Level::ERROR,
+            "No valid (unexpired) certificate available; falling back to {} expired \
+             certificate(s) so that TLS keeps working — please renew them",
+            parsed.len()
+        );
+    }
+
+    for (idx, (id, config, _expired, hostnames)) in parsed.into_iter().enumerate() {
+        if !loadable.get(idx).copied().unwrap_or(false) {
+            continue;
+        }
+        next_by_id.push((id, config.clone()));
+        for domain in hostnames {
             let domain = domain.to_lowercase();
             if domain.contains('*') {
                 let pattern = domain.replace('.', "\\.").replace('*', r"[-\w]+");
@@ -186,5 +229,44 @@ fn insert_cache(host: &str, cert: Arc<CertifiedKey>) {
         .unwrap_or_else(|e| e.into_inner());
     if !cache.contains_key(host) {
         cache.insert(host.to_string(), cert, **CACHE_CERTIFICATES_EXPIRE);
+    }
+}
+
+/// 决定哪些证书参与装载。
+///
+/// 规则（STEP.md：「过期的证书不加载，除非真的没有可以的证书再说」）：
+/// * 只要存在**未过期**的证书，就**只**装载未过期的；
+/// * 若全部都已过期，则全部装载（有证书总比没证书强，浏览器会提示但不至于连不上）；
+/// * 空列表返回空。
+///
+/// 抽成独立函数是为了能直接单测这条规则 —— 它决定线上 TLS 用哪张证书。
+fn loadable_certificates(expired: &[bool]) -> Vec<bool> {
+    if expired.is_empty() {
+        return Vec::new();
+    }
+    let has_valid = expired.iter().any(|e| !*e);
+    expired.iter().map(|e| if has_valid { !*e } else { true }).collect()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::loadable_certificates;
+
+    #[test]
+    fn skips_expired_when_a_valid_one_exists() {
+        // [未过期, 已过期, 已过期] -> 只装载第一个
+        assert_eq!(loadable_certificates(&[false, true, true]), vec![true, false, false]);
+    }
+
+    #[test]
+    fn falls_back_to_all_when_everything_expired() {
+        // 全过期 -> 全部装载（否则无证书可用）
+        assert_eq!(loadable_certificates(&[true, true]), vec![true, true]);
+    }
+
+    #[test]
+    fn handles_empty_and_all_valid() {
+        assert!(loadable_certificates(&[]).is_empty());
+        assert_eq!(loadable_certificates(&[false, false]), vec![true, true]);
     }
 }

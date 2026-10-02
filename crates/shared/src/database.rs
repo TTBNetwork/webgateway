@@ -495,11 +495,29 @@ async fn migrate_database_schema() -> anyhow::Result<()> {
     // 事务级 advisory lock：提交时自动释放；多实例并发启动会在此串行化，
     // 避免 PostgreSQL `IF NOT EXISTS` 不做并发保护导致的
     // `duplicate key value violates unique constraint "pg_type_typname_nsp_index"`（P0-7 问题 A）。
+    //
+    // **必须限时等待**（2026-10-02 生产事故的教训）：迁移在启动路径上执行，
+    // 若另一个实例正在跑一个很慢的迁移（我们在 1600 万行表上做过数分钟的全表回填），
+    // 后来的进程会**无限期阻塞在取锁上**。容器健康检查/编排会把它判定为"起不来"并重启，
+    // 而重启又让前一个迁移回滚重来 —— 形成永远起不来的循环，且日志里只有一行
+    // 0 行的 `pg_advisory_xact_lock` 慢查询，看不出真正原因。
+    // 限时后最坏情况是**快速失败并给出可操作的报错**，而不是静默挂死。
     let mut tx = get_database().pool.begin().await?;
-    sqlx::query("SELECT pg_advisory_xact_lock($1)")
-        .bind(locks::SCHEMA_INIT)
+    sqlx::query("SET LOCAL lock_timeout = '60s'")
         .execute(&mut *tx)
         .await?;
+    if let Err(e) = sqlx::query("SELECT pg_advisory_xact_lock($1)")
+        .bind(locks::SCHEMA_INIT)
+        .execute(&mut *tx)
+        .await
+    {
+        return Err(anyhow::anyhow!(
+            "Timed out waiting for the schema-migration advisory lock ({e}). \
+             Another instance is probably running a long migration. \
+             Do not restart this service in a loop — wait for it to finish, or run \
+             `--migrate` once as a one-shot job and let the services start afterwards"
+        ));
+    }
     inner_init_database_with(&mut tx).await?;
     tx.commit().await?;
     Ok(())

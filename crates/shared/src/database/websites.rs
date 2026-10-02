@@ -86,6 +86,20 @@ pub trait DatabaseWebsiteModifyRepository {
         &self,
         website: &CreateDatabaseWebsite,
     ) -> anyhow::Result<DatabaseWebsite>;
+
+    /// 按 id **整条覆盖**站点配置。
+    ///
+    /// 语义是替换而不是合并：面板提交的是完整表单（域名/端口/证书/后端），
+    /// 合并语义会让"删掉某个域名/后端"这类操作无法生效。
+    /// 返回受影响行数 —— 0 表示 id 不存在，调用方应据此回 404 而不是假装成功。
+    async fn update_website(
+        &self,
+        id: &ObjectId,
+        website: &CreateDatabaseWebsite,
+    ) -> anyhow::Result<u64>;
+
+    /// 按 id 删除站点，返回受影响行数（0 = 不存在）。
+    async fn delete_website(&self, id: &ObjectId) -> anyhow::Result<u64>;
 }
 
 #[async_trait::async_trait]
@@ -106,5 +120,48 @@ impl DatabaseWebsiteModifyRepository for Database {
             .fetch_one(&self.pool)
             .await?;
         Ok(row)
+    }
+
+    async fn update_website(
+        &self,
+        id: &ObjectId,
+        website: &CreateDatabaseWebsite,
+    ) -> anyhow::Result<u64> {
+        // `updated_at` 由触发器（`update_updated_at()`）维护，这里不手写，
+        // 以免与触发器语义冲突；网关侧靠 NOTIFY + 10s 兜底全量同步感知变更。
+        let result = sqlx::query(
+            "UPDATE websites SET name = $2, hosts = $3, ports = $4, certificates = $5, \
+             backends = $6, config = $7 WHERE id = $1",
+        )
+        .bind(id)
+        .bind(website.name.as_ref())
+        .bind(website.hosts.to_vec())
+        .bind(
+            website
+                .ports
+                .to_vec()
+                .iter()
+                .map(|v| U16::from(*v))
+                .collect::<Vec<U16>>(),
+        )
+        .bind(website.certificates.to_vec())
+        .bind(Json(&website.backends.to_vec()))
+        .bind(Json(
+            website
+                .config
+                .as_ref()
+                .unwrap_or(&DatabaseWebsiteConfig::default()),
+        ))
+        .execute(&self.pool)
+        .await?;
+        Ok(result.rows_affected())
+    }
+
+    async fn delete_website(&self, id: &ObjectId) -> anyhow::Result<u64> {
+        let result = sqlx::query("DELETE FROM websites WHERE id = $1")
+            .bind(id)
+            .execute(&self.pool)
+            .await?;
+        Ok(result.rows_affected())
     }
 }

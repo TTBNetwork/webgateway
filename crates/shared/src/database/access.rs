@@ -298,8 +298,7 @@ pub trait DatabaseAccessLogsModifyRepository {
     /// 删除早于 `retention_days` 天的访问日志，最多删除 `max_rows` 行，返回实际删除数。
     ///
     /// 单轮限量是为了用**小事务**推进清理：一次性 `DELETE` 上千万行会长时间持锁、
-    /// 撑爆 WAL，还会把删除的元组堆在表尾让表**更大**（直到 vacuum 回收）。调用方
-    /// 应循环调用直到返回 0（见 `prune_access_logs`）。
+    /// 撑爆 WAL，还会把删除的元组堆在表尾让表**更大**（直到 vacuum 回收）。
     async fn delete_access_logs_before(
         &self,
         retention_days: u32,
@@ -438,43 +437,17 @@ impl DatabaseAccessLogsModifyRepository for Database {
         if responses.is_empty() {
             return Ok(());
         }
-        // 整个批次放进**一个事务**：这些是"累加"写入（ON CONFLICT DO UPDATE
-        // body_length = body_length + EXCLUDED.body_length），不是幂等的。
-        // 若像其它批量写那样分块提交，第一块成功、第二块失败后整批重试会把
-        // 第一块的字节**重复累加**。单事务保证要么全做要么全不做，重试永远不会重复计数。
-        // 批次上限见 gateway 的 MAX_ROWS_PER_FLUSH（1000 行），单事务足够小。
-        // 先把批次内同键行合并（见 `merge_same_second` 的说明）。
-        let responses = merge_same_second(
-            responses,
-            |r| (r.id, r.at_second),
-            |acc, r| acc.body_length += r.body_length,
-        );
-        let mut tx = self.pool.begin().await?;
-        let mut builder = QueryBuilder::new(
-            "INSERT INTO access_response_size_logs (id, response_id, body_length, at_second, created_at)",
-        );
-        builder.push_values(responses.iter(), |mut b, resp| {
-            b.push_bind(ObjectId::new())
-                .push_bind(resp.id)
-                .push_bind(USize::from(resp.body_length))
-                .push_bind(resp.at_second)
-                .push_bind(resp.created_at);
-        });
-        // 同一 (response_id, at_second) 已存在 → **累加**该秒的字节数（保留每秒颗粒度）。
-        //
-        // 只写一个 ON CONFLICT：PostgreSQL **不允许**多个 ON CONFLICT 子句
-        // （`ON CONFLICT (a) ... ON CONFLICT (b) ...` 会报 syntax error at or near "ON"，
-        // 已实测）。这里选唯一键 (response_id, at_second)；`id` 是新生成的 ObjectId，
-        // 撞主键在数学上可忽略（12 字节含 5 字节随机 + 计数器）。
-        // 注意 `DO UPDATE` 的 SET 只能引用目标表与 EXCLUDED 的列，因此这里显式写出
-        // 表名（`response_id`/`at_second` 不参与计算）。
-        builder.push(
-            " ON CONFLICT (response_id, at_second) DO UPDATE SET \
-               body_length = access_response_size_logs.body_length + EXCLUDED.body_length",
-        );
-        builder.build().execute(&mut *tx).await?;
-        tx.commit().await?;
-        Ok(())
+        accumulate_size_rows(
+            &self.pool,
+            "access_response_size_logs",
+            "access_response_logs",
+            "response_id",
+            responses
+                .into_iter()
+                .map(|r| (r.id, r.body_length, r.at_second, r.created_at))
+                .collect(),
+        )
+        .await
     }
 
     async fn insert_batch_access_request_increase_size_logs(
@@ -484,32 +457,17 @@ impl DatabaseAccessLogsModifyRepository for Database {
         if requests.is_empty() {
             return Ok(());
         }
-        // 同一批次内同键行必须先合并：单条 INSERT 不允许两次命中同一冲突键。
-        let requests = merge_same_second(
-            requests,
-            |r| (r.id, r.at_second),
-            |acc, r| acc.body_length += r.body_length,
-        );
-        // 同上：累加写入必须整批单事务，否则重试会重复累加。
-        let mut tx = self.pool.begin().await?;
-        let mut builder = QueryBuilder::new(
-            "INSERT INTO access_request_size_logs (id, request_id, body_length, at_second, created_at)",
-        );
-        builder.push_values(requests.iter(), |mut b, req| {
-            b.push_bind(ObjectId::new())
-                .push_bind(req.id)
-                .push_bind(USize::from(req.body_length))
-                .push_bind(req.at_second)
-                .push_bind(req.created_at);
-        });
-        // 同上：只允许一个 ON CONFLICT，选 (request_id, at_second) 做累加。
-        builder.push(
-            " ON CONFLICT (request_id, at_second) DO UPDATE SET \
-               body_length = access_request_size_logs.body_length + EXCLUDED.body_length",
-        );
-        builder.build().execute(&mut *tx).await?;
-        tx.commit().await?;
-        Ok(())
+        accumulate_size_rows(
+            &self.pool,
+            "access_request_size_logs",
+            "access_request_logs",
+            "request_id",
+            requests
+                .into_iter()
+                .map(|r| (r.id, r.body_length, r.at_second, r.created_at))
+                .collect(),
+        )
+        .await
     }
 
     async fn delete_access_logs_before(
@@ -663,37 +621,6 @@ pub async fn prune_access_logs_with(round_rows: i64, max_rounds: usize) -> anyho
     }
 }
 
-/// 把同一批次内 `(id, at_second)` 相同的行合并成一行（字节相加）。
-///
-/// 为什么必须做：PostgreSQL 的 `INSERT ... ON CONFLICT DO UPDATE` 在**同一条语句**
-/// 里不允许两次命中同一个冲突键，会报
-/// `ON CONFLICT DO UPDATE command cannot affect row a second time`。
-/// gateway 侧的内存累加器已经保证正常情况下不会出现同键多行，但刷盘是**多轮**的、
-/// 且接口是公开的，这里再兜一层，保证任何调用方都能安全使用。
-fn merge_same_second<T, F, G>(
-    rows: Vec<T>,
-    key: F,
-    merge: G,
-) -> Vec<T>
-where
-    T: Clone,
-    F: Fn(&T) -> (ObjectId, chrono::DateTime<chrono::Utc>),
-    G: Fn(&mut T, &T),
-{
-    let mut out: Vec<T> = Vec::with_capacity(rows.len());
-    let mut seen: HashMap<(ObjectId, chrono::DateTime<chrono::Utc>), usize> = HashMap::new();
-    for row in rows {
-        match seen.get(&key(&row)) {
-            Some(&idx) => merge(&mut out[idx], &row),
-            None => {
-                seen.insert(key(&row), out.len());
-                out.push(row);
-            }
-        }
-    }
-    out
-}
-
 /// 在**指定连接**上执行一轮分批删除，返回删除行数。
 ///
 /// 之所以要求传入连接：调用方需要在同一条连接上持有会话级 advisory lock
@@ -785,24 +712,28 @@ async fn delete_access_logs_before_on_impl(
     Ok(deleted)
 }
 
-/// size 明细表的升级迁移：补 `at_second` 列、回填、**收敛重复行**、建唯一索引。
+/// size 明细表的升级迁移：补 `at_second` 列 + **部分唯一索引**（不触碰历史行）。
 ///
-/// 必须在 `SCHEMA_INIT` 事务里调用（调用方已持锁）。整个过程幂等：
-/// * 补列用 `ADD COLUMN IF NOT EXISTS`；
-/// * 回填只处理 `at_second IS NULL` 的行；
-/// * 去重只删"同一 (xxx_id, 秒) 里多余的行"；
-/// * 建索引用 `CREATE UNIQUE INDEX IF NOT EXISTS`。
+/// ## 为什么不做回填与去重（重要教训）
 ///
-/// **首次在老库上执行会较慢**（要为每行算 `at_second` 并合并重复行；生产库实测
-/// 417 万行需要合并）。已迁移过的库只会走一次廉价的 `NOT EXISTS` 判断。
+/// 早期实现是「补列 → 全表回填 → 合并同秒重复行 → 建全量唯一索引」，全部放在**启动路径**的
+/// 一个事务里。在 1600 万行的生产表上这是灾难：
+/// * 全表 `UPDATE` + 删 417 万行 + 建 1600 万行索引需要数分钟，且全程持有 `SCHEMA_INIT`
+///   排他锁 —— 另一个服务只能干等，容器被健康检查/重启打断后事务整体回滚，**重来一遍**，
+///   形成"永远起不来"的循环（2026-10-02 生产事故）。
+///
+/// 现在的做法把代价降到**与表大小无关**：
+/// * `at_second` 允许为 NULL：PostgreSQL 11+ 加一个可空列是元数据操作，**不重写表**；
+/// * 唯一索引是**部分索引** `WHERE at_second IS NOT NULL` —— 只覆盖新写入的行，
+///   建索引时老行直接被谓词排除，因此不需要回填、不需要去重、不用扫全表；
+/// * 写入侧用 `ON CONFLICT (xxx_id, at_second) WHERE at_second IS NOT NULL` 与索引谓词精确匹配
+///   （已实测：部分索引必须带同样的 WHERE 才能被推断）。
+///
+/// 结果：**新数据按秒聚合并累加**，历史行原样保留（`at_second` 为 NULL）。
+/// 历史行的秒级信息本来就在 `created_at` 上（一行一个 chunk），不需要也无法可靠还原。
 async fn migrate_size_logs_second_granularity(
     tx: &mut Transaction<'_, Postgres>,
 ) -> anyhow::Result<()> {
-    // 迁移期的长语句是预期的：临时放宽语句超时，避免被默认超时打断后整事务回滚。
-    sqlx::query("SET LOCAL statement_timeout = 0")
-        .execute(&mut **tx)
-        .await?;
-
     for (table, id_col, uniq_name) in [
         (
             "access_request_size_logs",
@@ -815,80 +746,29 @@ async fn migrate_size_logs_second_granularity(
             "uniq_access_response_size_logs_resp_second",
         ),
     ] {
-        // 1) 补列
+        // 1) 可空列（不重写表；历史行为 NULL，表示"未按秒归一"）
         sqlx::query(&format!(
             "ALTER TABLE {table} ADD COLUMN IF NOT EXISTS at_second TIMESTAMPTZ"
         ))
         .execute(&mut **tx)
         .await?;
 
-        // 2) 回填：历史行的 `created_at` 就是它的时间轴，截断到整秒即可。
-        let backfilled = sqlx::query(&format!(
-            "UPDATE {table} SET at_second = date_trunc('second', created_at) \
-              WHERE at_second IS NULL"
-        ))
-        .execute(&mut **tx)
-        .await?
-        .rows_affected();
-        if backfilled > 0 {
-            event!(
-                Level::INFO,
-                "Retention migration: backfilled at_second for {backfilled} rows in {table}"
-            );
-        }
-
-        // 3) 去重：同一 (id_col, at_second) 只保留一行，保留的字节数**合并**其余行，
-        //    以免历史统计凭空变小。
-        let has_dup: bool = sqlx::query_scalar(&format!(
-            "SELECT EXISTS (SELECT 1 FROM {table} \
-              GROUP BY {id_col}, at_second HAVING COUNT(*) > 1)"
-        ))
-        .fetch_one(&mut **tx)
-        .await?;
-
-        if has_dup {
-            event!(
-                Level::WARN,
-                "Retention migration: {table} contains rows sharing the same ({id_col}, second); \
-                 merging them into one row each. This is a one-time cost and may take a while"
-            );
-            // 分组谓词只写一次，DELETE 与 INSERT 共用，保证两次聚合结果完全一致。
-            // 做法：**先删掉组内所有行、再插回一行合并值**。
-            // 不能只 `SET body_length = 自己` —— 那样被删行的字节会被丢掉，
-            // 历史统计会凭空变小；也不做多余的预 UPDATE（删完就没了）。
-            let groups = format!(
-                "SELECT {id_col}, at_second, MIN(id) AS keep_id, SUM(body_length)::uint8 AS total \
-                   FROM {table} GROUP BY {id_col}, at_second HAVING COUNT(*) > 1"
-            );
-            let deleted = sqlx::query(&format!(
-                "DELETE FROM {table} t USING ({groups}) g \
-                  WHERE t.{id_col} = g.{id_col} AND t.at_second = g.at_second"
-            ))
-            .execute(&mut **tx)
-            .await?
-            .rows_affected();
-            let merged_rows = sqlx::query(&format!(
-                "INSERT INTO {table} (id, {id_col}, body_length, at_second, created_at) \
-                 SELECT g.keep_id, g.{id_col}, g.total, g.at_second, NOW() FROM ({groups}) g"
-            ))
-            .execute(&mut **tx)
-            .await?
-            .rows_affected();
-            event!(
-                Level::INFO,
-                "Retention migration: {table} merged {deleted} duplicate rows into \
-                 {merged_rows} aggregated rows (byte totals preserved)"
-            );
-        }
-
-        // 4) 约束与索引
+        // 2) 若曾被早期版本加上 NOT NULL，这里解除（否则新写入的历史兼容路径会失败）。
         sqlx::query(&format!(
-            "ALTER TABLE {table} ALTER COLUMN at_second SET NOT NULL"
+            "ALTER TABLE {table} ALTER COLUMN at_second DROP NOT NULL"
         ))
         .execute(&mut **tx)
         .await?;
+
+        // 3) 部分唯一索引：只约束新写入的行。老行不在索引里 → 无需回填、无需去重。
+        //    注意写入侧必须带**相同的谓词**
+        //    （`ON CONFLICT (xxx_id, at_second) WHERE at_second IS NOT NULL`），
+        //    否则 PostgreSQL 无法推断该索引，会报
+        //    "there is no unique or exclusion constraint matching the ON CONFLICT specification"
+        //    （已实测）。
         sqlx::query(&format!(
-            "CREATE UNIQUE INDEX IF NOT EXISTS {uniq_name} ON {table} ({id_col}, at_second)"
+            "CREATE UNIQUE INDEX IF NOT EXISTS {uniq_name} \
+               ON {table} ({id_col}, at_second) WHERE at_second IS NOT NULL"
         ))
         .execute(&mut **tx)
         .await?;
@@ -896,41 +776,72 @@ async fn migrate_size_logs_second_granularity(
     Ok(())
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    /// PostgreSQL 单条 `INSERT ... ON CONFLICT DO UPDATE` 不允许两次命中同一冲突键
-    /// （实测报 `ON CONFLICT DO UPDATE command cannot affect row a second time`）。
-    /// 因此批量写入前必须在内存里把同键行合并，否则同一秒的两行会让整批失败。
-    #[test]
-    fn merge_same_second_folds_duplicate_keys() {
-        let id = ObjectId::new();
-        let other = ObjectId::new();
-        let base = chrono::DateTime::from_timestamp(1_800_000_000, 0).unwrap();
-
-        let rows = vec![
-            AccessInsertRequestSize::new(id, 10, base),
-            AccessInsertRequestSize::new(id, 25, base + chrono::TimeDelta::milliseconds(400)),
-            AccessInsertRequestSize::new(id, 5, base + chrono::TimeDelta::seconds(1)),
-            AccessInsertRequestSize::new(other, 7, base),
-        ];
-        let merged = merge_same_second(
-            rows,
-            |r| (r.id, r.at_second),
-            |acc, r| acc.body_length += r.body_length,
-        );
-
-        assert_eq!(merged.len(), 3, "同一 (id, 秒) 的两行必须合成一行，跨秒不合并");
-        let same_second = merged
-            .iter()
-            .find(|r| r.id == id && r.at_second == base)
-            .expect("应保留 (id, base) 这一行");
-        assert_eq!(same_second.body_length, 10 + 25, "同一秒的字节必须相加");
-        assert!(
-            merged.iter().any(|r| r.id == id && r.at_second == base + chrono::TimeDelta::seconds(1)),
-            "跨秒的行必须单独保留"
-        );
-        assert!(merged.iter().any(|r| r.id == other), "其它 id 不受影响");
+/// 把「(请求, 秒) → 字节数」的增量**累加**进 size 明细表。
+///
+/// 每一行按 `DELETE 该键已有行（RETURNING 取回旧值） → INSERT 旧值+增量` 执行，整批一个事务。
+///
+/// ## 为什么不用 `INSERT ... ON CONFLICT DO UPDATE`（重要）
+///
+/// 累加语义要求冲突目标必须能解析到唯一索引，而**两种索引的语法不兼容**：
+/// * 全量唯一索引 `(xxx_id, at_second)`：`ON CONFLICT (xxx_id, at_second)` 可以，
+///   但带谓词的 `ON CONFLICT (...) WHERE at_second IS NOT NULL` **推断不出来**；
+/// * 部分唯一索引 `WHERE at_second IS NOT NULL`：反过来，必须带同样的谓词才行。
+///
+/// 生产库在 2026-10-02 的事故中已经建成了**全量**唯一索引（当时那版迁移跑完了），
+/// 而仓库新方案建的是**部分**索引 —— 若代码只认其中一种，换一次部署就会让刷盘整批失败。
+/// `DELETE + INSERT` 不依赖冲突推断，对两种索引都成立（已实测）。
+///
+/// 并发安全：`DELETE` 会锁住该键的已有行；并发事务要么先看到我们插入的最终值（在其
+/// `DELETE` 中取回并继续累加），要么被行锁阻塞到我们提交为止。因此不会丢增量。
+async fn accumulate_size_rows(
+    pool: &sqlx::PgPool,
+    table: &str,
+    parent: &str,
+    id_col: &str,
+    rows: Vec<(ObjectId, usize, chrono::DateTime<chrono::Utc>, chrono::DateTime<chrono::Utc>)>,
+) -> anyhow::Result<()> {
+    // 同一批次内同键必须先合并：否则后面的行会覆盖前面的累加结果。
+    let mut merged: HashMap<(ObjectId, chrono::DateTime<chrono::Utc>), (ObjectId, usize, chrono::DateTime<chrono::Utc>, chrono::DateTime<chrono::Utc>)> =
+        HashMap::new();
+    for (id, size, at_second, created_at) in rows {
+        merged
+            .entry((id, at_second))
+            .and_modify(|v| v.1 += size)
+            .or_insert((id, size, at_second, created_at));
     }
+
+    // 整批单事务：累加写不是幂等的，分块提交后重试会重复累加。
+    let mut tx = pool.begin().await?;
+    for ((id, at_second), (_id, size, _at, created_at)) in merged {
+        let prev: Option<USize> = sqlx::query_scalar(&format!(
+            "DELETE FROM {table} WHERE {id_col} = $1 AND at_second = $2 RETURNING body_length"
+        ))
+        .bind(id)
+        .bind(at_second)
+        .fetch_optional(&mut *tx)
+        .await?;
+
+        let total = usize::from(prev.unwrap_or_else(|| USize::from(0))) + size;
+        // **父行守卫**：size 表对主表有外键（`response_id → access_response_logs.id`）。
+        // 若父行尚未落库（或已被清理/迁移删除），这条 INSERT 会抛外键错误，
+        // 而累加批次是"失败就整批留内存重试"的语义 —— 于是**一个坏行会把整批永久卡住**，
+        // 响应大小统计从此停止写入（2026-10-02 生产实测，日志里的
+        // `violates foreign key constraint "access_response_size_logs_response_id_fkey"`）。
+        // 用 `INSERT ... SELECT ... WHERE EXISTS` 把这种行变为**静默跳过**：
+        // 该 id 的大小统计本就依赖主表，主表没有它就没有统计对象。
+        sqlx::query(&format!(
+            "INSERT INTO {table} (id, {id_col}, body_length, at_second, created_at) \
+             SELECT $1, $2, $3, $4, $5 \
+              WHERE EXISTS (SELECT 1 FROM {parent} p WHERE p.id = $2)"
+        ))
+        .bind(ObjectId::new())
+        .bind(id)
+        .bind(USize::from(total))
+        .bind(at_second)
+        .bind(created_at)
+        .execute(&mut *tx)
+        .await?;
+    }
+    tx.commit().await?;
+    Ok(())
 }
