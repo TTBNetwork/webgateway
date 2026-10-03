@@ -1,16 +1,9 @@
 use anyhow::Result;
 use shared::{database::Database, objectid::ObjectId};
-use sqlx::{Postgres, Transaction, types::Json};
+use sqlx::types::Json;
+
 
 use crate::models::log::{Log, LogAddr, LogContent};
-
-/// 在给定事务中创建 `web_log` 表。
-///
-/// DDL 本体已收敛到 [`shared::database::dashboard_schema`]（gateway 也会执行它，
-/// 因此两个进程的迁移结果一致）。这里保留薄封装，供测试与既有调用点复用。
-pub async fn initialize_web_log_tx(tx: &mut Transaction<'_, Postgres>) -> Result<()> {
-    shared::database::dashboard_schema::initialize_web_log(tx).await
-}
 
 /*
 use serde::{Deserialize, Serialize};

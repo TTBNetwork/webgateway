@@ -18,8 +18,9 @@
                         v-model:tags="domains"
                         :muitloptions="true"
                     />
-                    <InputEdit label="签发证书邮箱" v-model="email" />
-                    <InputEdit label="域名解析" v-model="domains" />
+                    <!-- `InputEdit` 的模型名是 `value` / `tags`，没有 `modelValue`：
+                         写成 `v-model` 绑不上，字段永远是空的。 -->
+                    <InputEdit label="签发证书邮箱" v-model:value="email" />
                 </template>
                 <template v-if="active == 1">
                     <DragFileIntoInput v-model:value="fullchain"
@@ -120,11 +121,12 @@ async function submit() {
 </script>
 
 <style lang="css" scoped>
+/* 左右内边距由 Dialog 的 `.dialog-content` 统一提供，这里只留分组间距。 */
 .content {
     width: 100%;
-    padding: 16px;
+    padding: 0;
     display: flex;
     flex-direction: column;
-    gap: 12px;
+    gap: 16px;
 }
 </style>

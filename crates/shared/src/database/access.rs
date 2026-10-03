@@ -16,8 +16,6 @@ use sqlx::{Postgres, QueryBuilder, Transaction, types::Json};
 use sqlx_pg_ext_uint::{c_u16::U16, c_usize::USize};
 use tracing::{Level, event};
 
-const INIT_SQL: &str = include_str!("../../../../assets/sqls/access_init.sql");
-
 /// 单条语句的最大绑定参数个数上限（PostgreSQL 扩展查询协议用 Int16 表示参数个数）。
 const PG_MAX_BIND_PARAMS: usize = 65_535;
 /// 批量写入的目标分块行数：在语句数与参数数之间取平衡。
@@ -32,7 +30,11 @@ const fn chunk_rows(binds_per_row: usize) -> usize {
     if rows < BATCH_ROWS { rows } else { BATCH_ROWS }
 }
 
-/// 在调用方提供的（可由 advisory lock 保护的）事务中创建访问日志相关对象。
+/// 在调用方提供的（可由 advisory lock 保护的）事务中初始化访问日志相关对象。
+///
+/// **不再创建 v1 表结构**（2026-10-02 决策）：访问日志只有 v2 一种形态。
+/// 表结构的创建在 `access_v2::install_v2_schema`，新库会紧接着
+/// `access_v2::activate_fresh_v2` 把逻辑名交给 v2。
 pub trait DatabaseAccessLogsInitializer {
     fn initialize_access_logs<'a>(
         &'a self,
@@ -46,13 +48,17 @@ impl DatabaseAccessLogsInitializer for Database {
         tx: &'a mut Transaction<'_, Postgres>,
     ) -> BoxFuture<'a, anyhow::Result<()>> {
         Box::pin(async move {
-            // 注意：这里必须逐条执行，不能用 `sqlx::raw_sql`。
-            // `RawSql` 会在 `Executor` 上引入 `'q` 借用参数，与 `Transaction`
-            // 的 reborrow 组合后会触发 "implementation of `Executor` is not
-            // general enough" 的编译错误。
-            for statement in split_sql_statements(INIT_SQL) {
-                sqlx::query(&statement).execute(&mut **tx).await?;
-            }
+            // **这里不再创建 v1 表结构**（2026-10-02 决策）：访问日志只有 v2 一种形态
+            // ——按周 RANGE 分区的 `access_v2_*`，切换后接管逻辑名 `access_*`。
+            //
+            // 原先这里执行 `assets/sqls/access_init.sql`（四张普通表 + 索引）。
+            // 在"新库直接是 v2"的目标下那份 DDL 只会造成两种 bad case：
+            // * 新库：建出四张空的 v1 表，随后启动路径又把它们改名成 `*_v1`，白建；
+            // * 已切换的库：逻辑名已经是 v2 分区表，这份 DDL 会再建出四张空的普通表
+            //   （相当于"v3"），既占元数据又容易让后来的查询指错对象。
+            //
+            // 因此建表职责完全交给 `access_v2::install_v2_schema`（建 `access_v2_*`
+            // 分区表 + 分区管理函数），并在其后立刻激活（`activate_fresh_v2`）。
 
             // 保留期配置的默认值（180 天）。`ON CONFLICT DO NOTHING` 保证
             // 不会覆盖运维已经调整过的值，因此每次迁移重跑都是安全的。
@@ -85,31 +91,12 @@ impl DatabaseAccessLogsInitializer for Database {
     }
 }
 
-/// 把 DDL 脚本拆成单条语句。
+/// 面板读路径（只读查询）。
 ///
-/// `access_init.sql` 中没有字符串字面量里的分号，也没有 `$$ ... $$` 函数体，
-/// 因此按行累积、遇到以 `;` 结尾的行即切分即可；注释行与空行会被跳过。
-fn split_sql_statements(sql: &str) -> Vec<String> {
-    let mut statements = Vec::new();
-    let mut current = String::new();
-    for line in sql.lines() {
-        let trimmed = line.trim();
-        if trimmed.is_empty() || trimmed.starts_with("--") {
-            continue;
-        }
-        current.push_str(line);
-        current.push('\n');
-        if trimmed.ends_with(';') {
-            statements.push(std::mem::take(&mut current));
-        }
-    }
-    if !current.trim().is_empty() {
-        statements.push(current);
-    }
-    statements
-}
-
-// 以下为占位的空实现，可根据后续需求填充方法
+/// **`get_access_info` / `get_today_metrics_info_of_websites` 走日汇总表**
+/// （`access_stats_daily`，见 `access_v2::install_stats_schema` / `refresh_stats_days`）：
+/// 把"近 N 天汇总"从"扫百万行 + 关联主表"压到"读几十行"（实测 3.68 秒 → 1.1 毫秒）。
+/// QPS 与按 IP 聚合仍是实时查询 —— 它们要的是**秒级**数据，汇总表（按天）给不了。
 #[async_trait]
 pub trait DatabaseAccessLogsRepository {
     async fn get_qps_per_second(&self, count: usize) -> anyhow::Result<ResponseQPS>;
@@ -125,7 +112,7 @@ pub trait DatabaseAccessLogsRepository {
 impl DatabaseAccessLogsRepository for Database {
     async fn get_qps_per_second(&self, count: usize) -> anyhow::Result<ResponseQPS> {
         let max_limit = count;
-        // 直接在 requested_at 上过滤（sargable），使 idx_requested_at 可用。
+        // 直接在 requested_at 上过滤（sargable），使分区的 requested_at 索引可用。
         // 旧写法 `WHERE time >= ...` 中的 time 是 date_trunc(...) 的别名，
         // 无法走索引，每次都退化为全表聚合 + 排序（见 ISSUES.md P0-3）。
         let rows = sqlx::query_as::<_, DatabaseQPS>(
@@ -163,42 +150,34 @@ impl DatabaseAccessLogsRepository for Database {
         })
     }
     async fn get_access_info(&self, in_days: usize) -> anyhow::Result<AccessInfo> {
-        // 使用 LEFT JOIN 关联请求表和响应表，一次性获取所有统计指标
+        // 走**日汇总表**（`access_stats_daily`）：把"近 N 天汇总"从"扫百万行 +
+        // 关联主表"变成"读几十行"。
+        //
+        // 背景（实测）：原来每次都在扫原始日志，30 天窗口 3.7 秒，其中最贵的一段是
+        // 为了拿 `website_id` 而把 size 明细关联回主表（原始形态 **44 秒**）。
+        // 汇总表按 `(day, website_id)` 预计算，面板只需 SUM 几十行。
+        //
+        // 口径：汇总只统计 `website_id` 非空的日志；`total_ips` 是**每日独立 IP 求和**
+        // （同一 IP 跨天会重复计入），与"整窗口精确去重"不同 —— 汇总表的意义是
+        // 面板的快速概览，精确去重仍可用 `get_requests_of_ips` 那条实时路径。
         let row = sqlx::query_as::<_, (i64, i64, i64, i64, i64, USize, USize)>(
-            r#"        
-            WITH
-            req_size_agg AS (
-                SELECT request_id, SUM(body_length) AS total_request_size
-                FROM access_request_size_logs
-                WHERE created_at > NOW() - INTERVAL '1 day' * $1
-                GROUP BY request_id
-            ),
-            resp_size_agg AS (
-                SELECT response_id, SUM(body_length) AS total_response_size
-                FROM access_response_size_logs
-                WHERE created_at > NOW() - INTERVAL '1 day' * $1
-                GROUP BY response_id
-            )
+            r#"
             SELECT
-                COUNT(req.id) AS total_requests,
-                COUNT(DISTINCT req.remote_addr) AS total_ips,
-                COUNT(resp.id) FILTER (WHERE resp.status >= 400 AND resp.status <= 499) AS e4xx_requests,
-                COUNT(resp.id) FILTER (WHERE resp.status >= 500 AND resp.status <= 599) AS e5xx_requests,
-                COUNT(req.id) FILTER (WHERE resp.id IS NULL) AS backend_error_requests,
-                COALESCE(SUM(req_agg.total_request_size), 0)::uint8 AS total_requests_size,
-                COALESCE(SUM(resp_agg.total_response_size), 0)::uint8 AS total_response_size
-            FROM access_request_logs req
-            LEFT JOIN access_response_logs resp ON req.id = resp.id
-            LEFT JOIN req_size_agg req_agg ON req.id = req_agg.request_id
-            LEFT JOIN resp_size_agg resp_agg ON req.id = resp_agg.response_id
-            WHERE req.requested_at > NOW() - INTERVAL '1 day' * $1
+                COALESCE(SUM(total_requests), 0)::bigint,
+                COALESCE(SUM(total_ips), 0)::bigint,
+                COALESCE(SUM(e4xx_requests), 0)::bigint,
+                COALESCE(SUM(e5xx_requests), 0)::bigint,
+                COALESCE(SUM(backend_error_requests), 0)::bigint,
+                COALESCE(SUM(total_requests_size), 0)::uint8,
+                COALESCE(SUM(total_response_size), 0)::uint8
+              FROM access_stats_daily
+             WHERE day > CURRENT_DATE - ($1::int)
         "#,
         )
-        .bind(in_days as i64)  // 绑定天数参数
+        .bind(in_days as i64)
         .fetch_one(&self.pool)
         .await?;
 
-        // 将数据库返回的 i64 转换为 usize（注意溢出风险，通常天数范围内的请求数不会超过 usize 最大值）
         Ok(AccessInfo {
             total_requests: row.0 as usize,
             total_ips: row.1 as usize,
@@ -211,9 +190,11 @@ impl DatabaseAccessLogsRepository for Database {
     }
 
     async fn get_requests_of_ips(&self, in_days: usize) -> anyhow::Result<HashMap<String, usize>> {
+        // 这是"按 IP 聚合"的实时路径（访问地图用）。它**不**走日汇总表：
+        // 汇总表的粒度是 (日, 站点)，无法还原 IP 明细。
         let rows = sqlx::query_as::<_, (String, i64)>(
-            "SELECT remote_addr, COUNT(id) FROM access_request_logs 
-             WHERE requested_at > NOW() - INTERVAL '1 day' * $1 
+            "SELECT remote_addr, COUNT(id) FROM access_request_logs
+             WHERE requested_at > NOW() - INTERVAL '1 day' * $1
              GROUP BY remote_addr",
         )
         .bind(in_days as i64)
@@ -226,44 +207,29 @@ impl DatabaseAccessLogsRepository for Database {
             .collect())
     }
 
+    /// 今日按站点的指标：走日汇总表 —— 站点卡片"今日"就是汇总表里
+    /// `day = CURRENT_DATE` 的那些行（原来是实时聚合三张表 + 关联，每张卡片都要等它）。
     async fn get_today_metrics_info_of_websites(
         &self,
     ) -> anyhow::Result<Vec<TodayMetricsInfoOfWebsite>> {
-        let rows = sqlx::query_as::<_, TodayMetricsInfoOfWebsite>
-            (r#"
-                WITH
-                req_size_agg AS (
-                    SELECT ars.request_id, SUM(ars.body_length) AS total_request_size
-                    FROM access_request_size_logs ars
-                    INNER JOIN access_request_logs ar ON ars.request_id = ar.id
-                    WHERE ar.requested_at >= CURRENT_DATE AND ar.requested_at < CURRENT_DATE + INTERVAL '1 day'
-                    GROUP BY ars.request_id
-                ),
-                resp_size_agg AS (
-                    SELECT ars.response_id, SUM(ars.body_length) AS total_response_size
-                    FROM access_response_size_logs ars
-                    INNER JOIN access_response_logs ar ON ars.response_id = ar.id
-                    WHERE ar.responsed_at >= CURRENT_DATE AND ar.responsed_at < CURRENT_DATE + INTERVAL '1 day'
-                    GROUP BY ars.response_id
-                )
-                SELECT 
-                    req.website_id as website_id,
-                    COUNT(req.id) AS total_requests,
-                    COUNT(DISTINCT req.remote_addr) AS total_ips,
-                    COUNT(resp.id) AS total_responses,
-                    COUNT(resp.id) FILTER (WHERE resp.status >= 400 AND resp.status <= 499) AS e4xx_requests,
-                    COUNT(resp.id) FILTER (WHERE resp.status >= 500 AND resp.status <= 599) AS e5xx_requests,
-                    COUNT(req.id) FILTER (WHERE resp.id IS NULL) AS backend_error_requests,
-                    COALESCE(SUM(req_agg.total_request_size), 0)::uint8 AS total_requests_size,
-                    COALESCE(SUM(resp_agg.total_response_size), 0)::uint8 AS total_response_size
-                FROM access_request_logs req
-                LEFT JOIN access_response_logs resp ON req.id = resp.id
-                LEFT JOIN req_size_agg req_agg ON req.id = req_agg.request_id
-                LEFT JOIN resp_size_agg resp_agg ON req.id = resp_agg.response_id
-                WHERE req.requested_at >= CURRENT_DATE AND req.requested_at < CURRENT_DATE + INTERVAL '1 day'
-                GROUP BY req.website_id
-                "#
-            ).fetch_all(&self.pool).await?;
+        let rows = sqlx::query_as::<_, TodayMetricsInfoOfWebsite>(
+            r#"
+            SELECT website_id,
+                   total_requests::bigint         AS total_requests,
+                   total_responses::bigint        AS total_responses,
+                   total_ips::bigint              AS total_ips,
+                   backend_error_requests::bigint AS backend_error_requests,
+                   e4xx_requests::bigint          AS e4xx_requests,
+                   e5xx_requests::bigint          AS e5xx_requests,
+                   total_requests_size            AS total_requests_size,
+                   total_response_size            AS total_response_size
+              FROM access_stats_daily
+             WHERE day = CURRENT_DATE
+               AND website_id <> '__unknown__'
+            "#,
+        )
+        .fetch_all(&self.pool)
+        .await?;
         Ok(rows)
     }
 }
@@ -338,7 +304,12 @@ impl DatabaseAccessLogsModifyRepository for Database {
             // PG 重启、语句超时都会）时，下一轮重试会把已提交的行再写一次，
             // 命中主键冲突 —— 没有 ON CONFLICT 的话该批次会**永远**失败，
             // 刷盘队列被永久毒化：新日志只进不出，内存无限增长直至 OOM。
-            builder.push(" ON CONFLICT (id) DO NOTHING");
+            //
+            // **冲突目标故意省略**（不写 `(id)`）：v2 是分区表，主键是
+            // `(id, requested_at)` —— 分区表的唯一索引必须包含分区键，
+            // 因此 `ON CONFLICT (id)` 在 v2 上推断不出索引，切换之后刷盘会整批失败。
+            // 不带目标时 v1（`PK(id)`）与 v2（`PK(id, requested_at)`）都成立。
+            builder.push(" ON CONFLICT DO NOTHING");
             builder.build().execute(&self.pool).await?;
         }
         Ok(())
@@ -366,7 +337,9 @@ impl DatabaseAccessLogsModifyRepository for Database {
                     .push_bind(resp.website_id);
             });
             // 与请求日志同理：必须幂等，否则部分成功的批次会在重试时永久失败。
-            builder.push(" ON CONFLICT (id) DO NOTHING");
+            // 冲突目标同样省略，以同时适配 v1 的 `PK(id)` 与 v2 的分区主键
+            // `(id, responsed_at)`（原因见上）。
+            builder.push(" ON CONFLICT DO NOTHING");
             builder.build().execute(&self.pool).await?;
         }
         Ok(())
@@ -631,7 +604,8 @@ async fn delete_access_logs_before_on_impl(
     retention_days: u32,
     max_rows: i64,
 ) -> anyhow::Result<u64> {
-    // 删除顺序由外键决定（见 assets/sqls/access_init.sql）：
+    // 删除顺序按"子表 → 主表"（v1 时代由外键决定；v2 去掉了外键，顺序不再致命，
+    // 但保持这个顺序对两种结构都安全）：
     //   access_response_size_logs.response_id -> access_response_logs.id
     //   access_request_size_logs.request_id   -> access_request_logs.id
     //   access_response_logs.id               -> access_request_logs.id
@@ -644,36 +618,59 @@ async fn delete_access_logs_before_on_impl(
     let window = format!("NOW() - ($1 || ' days')::INTERVAL");
     let mut deleted = 0u64;
 
-    // 1) 响应大小明细
-    deleted += sqlx::query(&format!(
-        "WITH victims AS ( \
-             SELECT id FROM access_response_size_logs \
-              WHERE created_at < {window} LIMIT $2 \
-         ) \
-         DELETE FROM access_response_size_logs t USING victims v WHERE t.id = v.id"
-    ))
-    .bind(retention_days.to_string())
-    .bind(max_rows)
-    .execute(&mut *conn)
-    .await?
-    .rows_affected();
+    // 1) 响应大小明细。
+    //
+    // 两条谓词各删一轮，而不是合成一条 `OR`：
+    // * `at_second < window` —— **v2 的分区键就是 at_second**，这样能直接裁剪分区
+    //   （生产库 v1 也已是 `at_second NOT NULL`，同样正确）；
+    // * `at_second IS NULL AND created_at < window` —— 兼容还没按秒归一的历史行
+    //   （早期/beta 库才有；v2 上该分支恒为空）。
+    // 合并成 `OR` 会让优化器无法裁剪分区，退化成每次扫全部周分区。
+    for predicate in [
+        format!("at_second < {window}"),
+        format!("at_second IS NULL AND created_at < {window}"),
+    ] {
+        if deleted >= max_rows as u64 {
+            break;
+        }
+        deleted += sqlx::query(&format!(
+            "WITH victims AS ( \
+                 SELECT id FROM access_response_size_logs \
+                  WHERE {predicate} LIMIT $2 \
+             ) \
+             DELETE FROM access_response_size_logs t USING victims v WHERE t.id = v.id"
+        ))
+        .bind(retention_days.to_string())
+        .bind(max_rows - deleted as i64)
+        .execute(&mut *conn)
+        .await?
+        .rows_affected();
+    }
     if deleted >= max_rows as u64 {
         return Ok(deleted);
     }
 
-    // 2) 请求大小明细
-    deleted += sqlx::query(&format!(
-        "WITH victims AS ( \
-             SELECT id FROM access_request_size_logs \
-              WHERE created_at < {window} LIMIT $2 \
-         ) \
-         DELETE FROM access_request_size_logs t USING victims v WHERE t.id = v.id"
-    ))
-    .bind(retention_days.to_string())
-    .bind(max_rows - deleted as i64)
-    .execute(&mut *conn)
-    .await?
-    .rows_affected();
+    // 2) 请求大小明细（口径同上）。
+    for predicate in [
+        format!("at_second < {window}"),
+        format!("at_second IS NULL AND created_at < {window}"),
+    ] {
+        if deleted >= max_rows as u64 {
+            break;
+        }
+        deleted += sqlx::query(&format!(
+            "WITH victims AS ( \
+                 SELECT id FROM access_request_size_logs \
+                  WHERE {predicate} LIMIT $2 \
+             ) \
+             DELETE FROM access_request_size_logs t USING victims v WHERE t.id = v.id"
+        ))
+        .bind(retention_days.to_string())
+        .bind(max_rows - deleted as i64)
+        .execute(&mut *conn)
+        .await?
+        .rows_affected();
+    }
     if deleted >= max_rows as u64 {
         return Ok(deleted);
     }
@@ -731,6 +728,16 @@ async fn delete_access_logs_before_on_impl(
 ///
 /// 结果：**新数据按秒聚合并累加**，历史行原样保留（`at_second` 为 NULL）。
 /// 历史行的秒级信息本来就在 `created_at` 上（一行一个 chunk），不需要也无法可靠还原。
+/// 判断 `public` 下的某张表是不是 **分区表**（`relkind = 'p'`）。
+///
+/// 抽成常量是为了让"v2 表要跳过 v1 升级 DDL"这条约定有单一出处并被单测钉住：
+/// v2 里 `at_second` 是分区键兼主键的一部分，对它执行
+/// `ALTER COLUMN at_second DROP NOT NULL` 会报 `column "at_second" is in a primary key`，
+/// 整个迁移事务回滚（实测：把已切到 v2 的库回滚成 v1 名字后，`--migrate` 直接失败）。
+const IS_PARTITIONED_SQL: &str = "SELECT COALESCE((SELECT c.relkind = 'p' FROM pg_class c \
+                                    JOIN pg_namespace n ON n.oid = c.relnamespace \
+                                   WHERE n.nspname = 'public' AND c.relname = $1), false)";
+
 async fn migrate_size_logs_second_granularity(
     tx: &mut Transaction<'_, Postgres>,
 ) -> anyhow::Result<()> {
@@ -746,6 +753,20 @@ async fn migrate_size_logs_second_granularity(
             "uniq_access_response_size_logs_resp_second",
         ),
     ] {
+        // 0) 表不存在就跳过。
+        //
+        //    全新库只创建 v2 分区表（逻辑名 `access_*`），压根没有 v1 表；
+        //    本函数出现在 v2 建表**之前**，不加守卫会直接报
+        //    `relation "access_request_size_logs" does not exist`（实测踩到）。
+        //    老库（有 v1 普通表）会正常走到下面的升级步骤。
+        let exists: bool = sqlx::query_scalar("SELECT to_regclass($1) IS NOT NULL")
+            .bind(format!("public.{table}"))
+            .fetch_one(&mut **tx)
+            .await?;
+        if !exists {
+            continue;
+        }
+
         // 1) 可空列（不重写表；历史行为 NULL，表示"未按秒归一"）
         sqlx::query(&format!(
             "ALTER TABLE {table} ADD COLUMN IF NOT EXISTS at_second TIMESTAMPTZ"
@@ -753,14 +774,30 @@ async fn migrate_size_logs_second_granularity(
         .execute(&mut **tx)
         .await?;
 
-        // 2) 若曾被早期版本加上 NOT NULL，这里解除（否则新写入的历史兼容路径会失败）。
+        // 2) 已经是 **v2 分区表** 的表必须原样跳过。
+        //
+        //    v2 里 `at_second` 是**分区键**、也是主键的一部分，因此：
+        //    * `DROP NOT NULL` 会直接报 `column "at_second" is in a primary key`，
+        //      整个迁移事务回滚 —— 表现为"回滚过 v2 的库再也起不来"（实测踩到）；
+        //    * v2 的唯一索引是**整表**唯一索引（分区表的唯一索引必须含分区键），
+        //      不需要也不应该再建 v1 那个 `WHERE at_second IS NOT NULL` 的部分索引。
+        //    这个判断让 `--migrate` 在切到 v2 之后依然幂等。
+        let partitioned: bool = sqlx::query_scalar(IS_PARTITIONED_SQL)
+            .bind(table)
+            .fetch_one(&mut **tx)
+            .await?;
+        if partitioned {
+            continue;
+        }
+
+        // 3) 若曾被早期版本加上 NOT NULL，这里解除（否则新写入的历史兼容路径会失败）。
         sqlx::query(&format!(
             "ALTER TABLE {table} ALTER COLUMN at_second DROP NOT NULL"
         ))
         .execute(&mut **tx)
         .await?;
 
-        // 3) 部分唯一索引：只约束新写入的行。老行不在索引里 → 无需回填、无需去重。
+        // 4) 部分唯一索引：只约束新写入的行。老行不在索引里 → 无需回填、无需去重。
         //    注意写入侧必须带**相同的谓词**
         //    （`ON CONFLICT (xxx_id, at_second) WHERE at_second IS NOT NULL`），
         //    否则 PostgreSQL 无法推断该索引，会报
@@ -844,4 +881,33 @@ async fn accumulate_size_rows(
     }
     tx.commit().await?;
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// v2 分区表必须被 v1 的 size 升级 DDL 跳过。
+    ///
+    /// v2 里 `at_second` 是分区键兼主键的一部分，对它跑
+    /// `ALTER COLUMN at_second DROP NOT NULL` 会报
+    /// `column "at_second" is in a primary key` 并把整个迁移事务回滚 ——
+    /// 实测发生在"把已切到 v2 的库回滚成 v1 名字后再启动"的场景，
+    /// 表现为服务再也起不来。守卫 SQL 必须只认 `relkind = 'p'`。
+    #[test]
+    fn size_ddl_guard_only_skips_partitioned_tables() {
+        assert!(
+            IS_PARTITIONED_SQL.contains("c.relkind = 'p'"),
+            "守卫必须只认分区表：{IS_PARTITIONED_SQL}"
+        );
+        assert!(
+            IS_PARTITIONED_SQL.contains("relname = $1"),
+            "守卫必须按表名判断，不能写死"
+        );
+        // 兜底 false：表不存在时不能当成"已分区"而跳过升级。
+        assert!(
+            IS_PARTITIONED_SQL.contains("COALESCE"),
+            "表不存在时必须回退 false（否则新库会被误跳过建索引）"
+        );
+    }
 }

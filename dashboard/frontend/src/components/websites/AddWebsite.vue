@@ -3,44 +3,82 @@
         <template #header>{{ isEdit ? '编辑站点' : '添加站点' }}</template>
         <template #content>
             <div class="content">
-                <InputEdit
-                    label="网站名称"
-                    placeholder="可选，便于在面板中识别"
-                    v-model:value="state.name"
-                />
-                <InputEdit
-                    label="匹配域名"
-                    :muitloptions="true"
-                    placeholder="支持 * 以匹配网站域名"
-                    v-model:tags="config.domains.value"
-                />
-                <InputEdit
-                    label="开放端口"
-                    :muitloptions="true"
-                    v-model:tags="config.ports.value"
-                />
-                <InputEdit
-                    label="网站证书"
-                    placeholder="留空自动选择证书（填证书 ID）"
-                    :muitloptions="true"
-                    v-model:tags="config.cert.value"
-                />
-                <div v-for="(backend, idx) in state.backends" :key="idx">
-                    <AddWebsiteBackend
-                        v-model:url="backend.url"
-                        v-model:balance="backend.balance"
+                <section class="group">
+                    <h3 class="group-title">基本信息</h3>
+                    <InputEdit
+                        label="网站名称"
+                        placeholder="可选，便于在面板中识别"
+                        v-model:value="state.name"
                     />
-                </div>
+                </section>
+
+                <section class="group">
+                    <h3 class="group-title">监听规则</h3>
+                    <InputEdit
+                        label="匹配域名"
+                        :muitloptions="true"
+                        placeholder="回车添加，支持 * 通配，例如 *.example.com"
+                        v-model:tags="state.domains"
+                    />
+                    <InputEdit
+                        label="开放端口"
+                        :muitloptions="true"
+                        placeholder="回车添加，例如 80 / 443"
+                        v-model:tags="state.ports"
+                    />
+                    <InputEdit
+                        label="网站证书"
+                        placeholder="回车添加证书 ID；留空则自动选择"
+                        :muitloptions="true"
+                        v-model:tags="state.cert"
+                    />
+                </section>
+
+                <section class="group">
+                    <div class="group-head">
+                        <h3 class="group-title">上游后端</h3>
+                        <button type="button" class="add-backend" @click="addBackend">
+                            + 添加后端
+                        </button>
+                    </div>
+                    <p v-if="state.backends.length === 0" class="empty-tip">
+                        还没有后端，点「+ 添加后端」至少添加一个回源地址。
+                    </p>
+                    <div
+                        v-for="(backend, idx) in state.backends"
+                        :key="idx"
+                        class="backend-row"
+                    >
+                        <span class="backend-index">{{ idx + 1 }}</span>
+                        <AddWebsiteBackend
+                            v-model:url="backend.url"
+                            v-model:balance="backend.balance"
+                        />
+                        <button
+                            type="button"
+                            class="remove-backend"
+                            :disabled="state.backends.length <= 1"
+                            :title="
+                                state.backends.length <= 1
+                                    ? '至少保留一个后端'
+                                    : '删除这一行'
+                            "
+                            @click="removeBackend(idx)"
+                        >
+                            删除
+                        </button>
+                    </div>
+                </section>
             </div>
         </template>
         <template #footer
-            ><DialogClose @cancel="cancel" @confirm="submit"
+            ><DialogClose type="submit" @cancel="cancel" @confirm="submit"
         /></template>
     </Dialog>
 </template>
 
 <script setup lang="ts">
-import { computed, reactive, ref, toRefs, watch } from 'vue';
+import { computed, nextTick, reactive, ref, watch } from 'vue';
 import Dialog from '../../plugins/dialog/Dialog.vue';
 import DialogClose from '../../plugins/dialog/DialogClose.vue';
 import InputEdit from '../InputEdit.vue';
@@ -81,17 +119,44 @@ const state = reactive<{
               }))
             : [{ url: '', balance: 0 }],
 });
-const config = toRefs(state);
+
+function addBackend() {
+    state.backends.push({ url: '', balance: 0 });
+}
+
+function removeBackend(idx: number) {
+    if (state.backends.length <= 1) return;
+    state.backends.splice(idx, 1);
+}
 
 // 编辑模式下预填不算"已修改"，否则每次关掉编辑框都会被追问是否放弃修改。
+//
+// 判定方式是"与打开时的快照比较"，而不是"任意一次变更就算改过"：
+// 后者会被程序性变更（新增/删除一行后端）误触发 —— 用户点了「+ 添加后端」
+// 再点「取消」，就会莫名其妙被追问"是否放弃修改"。
+const initialSnapshot = ref('');
+function currentSnapshot(): string {
+    return JSON.stringify({
+        name: state.name,
+        ports: state.ports,
+        domains: state.domains,
+        cert: state.cert,
+        backends: state.backends,
+    });
+}
 const modified = ref(false);
 watch(
-    () => [state.name, state.ports, state.domains, state.cert, state.backends],
-    () => {
-        modified.value = true;
+    () => currentSnapshot(),
+    (now) => {
+        modified.value = now !== initialSnapshot.value;
     },
     { deep: true },
 );
+
+// 首帧之后再抓快照：`InputEdit` 之类子组件可能在挂载时补写默认值。
+nextTick(() => {
+    initialSnapshot.value = currentSnapshot();
+});
 
 function cancel() {
     if (modified.value) {
@@ -145,11 +210,75 @@ async function submit() {
 </script>
 
 <style lang="css" scoped>
+/*
+ * 内边距交给 Dialog 的 `.dialog-content` 统一提供（左右 24px），
+ * 这里只负责分组与间距 —— 以前是 24 + 16 = 40px 的双层内边距，窄屏下很浪费。
+ */
 .content {
     width: 100%;
-    padding: 16px;
+    display: flex;
+    flex-direction: column;
+    gap: 20px;
+    padding: 0;
+    box-sizing: border-box;
+}
+.group {
     display: flex;
     flex-direction: column;
     gap: 12px;
+}
+.group-head {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    gap: 12px;
+}
+.group-title {
+    margin: 0;
+    font-size: 13px;
+    font-weight: 600;
+    color: var(--text-color);
+    opacity: 0.7;
+    letter-spacing: 0.02em;
+}
+.add-backend,
+.remove-backend {
+    font: inherit;
+    font-size: 13px;
+    line-height: 1;
+    padding: 6px 10px;
+    border-radius: 6px;
+    cursor: pointer;
+    border: 1px solid rgba(127, 127, 127, 0.4);
+    background: transparent;
+    color: var(--text-color);
+    transition:
+        background-color 150ms,
+        opacity 150ms;
+}
+.add-backend:hover,
+.remove-backend:not(:disabled):hover {
+    background-color: rgba(127, 127, 127, 0.16);
+}
+.remove-backend:disabled {
+    opacity: 0.4;
+    cursor: not-allowed;
+}
+.backend-row {
+    display: flex;
+    align-items: center;
+    gap: 12px;
+}
+.backend-index {
+    flex: 0 0 20px;
+    text-align: center;
+    font-size: 12px;
+    opacity: 0.6;
+    font-variant-numeric: tabular-nums;
+}
+.empty-tip {
+    margin: 0;
+    font-size: 13px;
+    opacity: 0.6;
 }
 </style>

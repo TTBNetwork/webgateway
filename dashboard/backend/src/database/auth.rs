@@ -24,7 +24,12 @@ pub trait Authentication {
         totp_secret: &str,
         role: Role,
     ) -> Result<DatabaseAuthentication>;
-    /// 在给定事务中创建用户表与相关视图（由迁移入口在 advisory lock 下调用）。
+    /// 在给定事务中创建用户表与相关视图。
+    ///
+    /// **已不再由 dashboard 调用**：这三张表的 DDL 已收敛到共享迁移入口
+    /// （`shared::database::dashboard_schema`），使 gateway 先启动时也能建好表。
+    /// 保留该方法是为了让外部调用方（如果有）仍能显式建表，实现体只是转调共享实现。
+    #[allow(dead_code)]
     async fn init_authentication(&self, tx: &mut Transaction<'_, Postgres>) -> Result<()>;
     /// 表结构就绪后确保存在一个管理员账号（默认账号引导）。
     async fn ensure_default_admin(&self) -> Result<()>;

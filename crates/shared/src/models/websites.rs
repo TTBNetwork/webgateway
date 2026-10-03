@@ -51,6 +51,15 @@ pub struct DatabaseWebsiteBackend {
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct DatabaseWebsiteConfig {
+    /// 取客户端 IP 的方式。
+    ///
+    /// **必须带 `#[serde(default)]`**：数据库里 `config` 可能是一个空对象
+    /// （`{}` —— 旧版本写入的行，或前端提交了不完整的配置）。没有默认值时
+    /// 反序列化会报 `missing field get_request_ip`，而网关启动时的
+    /// `sync_first_config()` 会把这个错误直接抛出 → **整个网关起不来**
+    /// （实测踩到：一行脏数据 = 一次停机）。字段本身已经有 `#[default] Raw`，
+    /// 加上 default 后空对象退化成"按最朴素的方式取 IP"，而不是崩溃。
+    #[serde(default)]
     pub get_request_ip: DatabaseWebsiteRequestIp,
 }
 

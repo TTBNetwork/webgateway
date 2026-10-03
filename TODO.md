@@ -63,7 +63,7 @@ P0 事故级：
 - [x] P0-1 访问日志刷盘改为"先写库成功、再删内存"，失败批次留在内存重试（`gateway/src/access.rs` 已重写）
 - [x] P0-2 批量 INSERT 按 ≤1000 行分块；批量 UPDATE 改 `FROM (VALUES ...)`（`crates/shared/src/database/access.rs`）
 - [x] P0-3 QPS 查询改为直接过滤 `requested_at`（sargable，`EXPLAIN` 确认走索引）；视图去掉冗余 `ORDER BY`
-- [x] P0-3（残留，第六轮部分完成）**保留期自动清理**已实现：控制面板「设置 → 数据保留」可配 90~3650 天（默认 180），gateway 每小时按批清理。**仍未做**：分区（按周 RANGE）方案，见 [ISSUES.md](ISSUES.md) 附录 A
+- [x] P0-3（残留，第六轮部分完成）**保留期自动清理**已实现：控制面板「设置 → 数据保留」可配 90~3650 天（默认 180），gateway 每小时按批清理。**分区（按周 RANGE）方案已完成**（第十轮结构 + 第十一轮 v1→v2 后台自动迁移：搬迁、切换、整周 DROP 回收，零停机），见 [CHANGELOG.md](CHANGELOG.md) 第十/十一轮；生产执行待确认
 - [x] 新增（第六轮）修复 `access_response_size_logs` 的 7 倍存储膨胀：同一响应的多个 body chunk 改为内存累加、每响应只落一行
 - [ ] 新增（第六轮待办）控制面板配置 HTTP/HTTPS 代理以续签证书。**经核实无需改代码**：acmex 用 `reqwest::Client::builder()` 且未调 `.no_proxy()`，给 dashboard-backend 设 `HTTPS_PROXY` / `HTTP_PROXY` / `NO_PROXY` 环境变量即可。若要做成面板字段，需在 `certificate.rs` 构造 acmex 客户端时读取配置（acmex 未暴露代理入口，需改 vendor 副本）
 - [x] P0-1（残留，第四轮修复）批量 INSERT 改为幂等（`ON CONFLICT DO NOTHING`），部分成功后整批重试不再永久毒化刷盘队列

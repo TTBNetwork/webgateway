@@ -87,11 +87,12 @@ async function submit() {
 </script>
 
 <style lang="css" scoped>
+/* 左右内边距由 Dialog 的 `.dialog-content` 统一提供，这里只留分组间距。 */
 .content {
     width: 100%;
-    padding: 16px;
+    padding: 0;
     display: flex;
     flex-direction: column;
-    gap: 12px;
+    gap: 16px;
 }
 </style>

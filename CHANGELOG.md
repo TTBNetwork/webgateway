@@ -5,6 +5,120 @@
 
 ## [未发布]
 
+### 2026-10-02（第十一轮：访问日志 v1→v2 **自动迁移**落地，零停机，10:00Z — ）
+
+第十轮完成了 v2 的**结构层**（按周 RANGE 分区 + 轮换函数），剩下"数据搬迁 + 读写切换 +
+回收旧表"没做 —— 因为 2026-10-02 的事故已经证明**不能在启动路径上做重活**。
+本轮把它做成**服务起来之后的后台任务**：启动只建空结构（与表大小无关），
+服务照常提供；后台按天分批搬迁（控制台进度条、进度入库、可续传），搬完自动切换读写，
+核对行数后回收旧表。**网关全程不停服**，切换瞬间只暂停"日志落库"（请求照常代理）。
+
+- 新增（搬迁引擎，`crates/shared/src/database/access_v2.rs`）：
+  - 单行进度表 `access_log_v2_migration`：`phase`（pending/backfilling/switching/done）、
+    `cutoff`（搬迁上界）、`current_table` + `cursor_at`（时间游标）、`copied_rows`、`last_error`。
+    **进度落库**是"可续传"的关键：进程被杀/重启后从游标继续，不会像单事务迁移那样整体回滚重来。
+  - `copy_window`：按天把 v1 复制进 v2。
+    - 主表用**不带冲突目标**的 `ON CONFLICT DO NOTHING`；
+    - size 明细表按 `(父 id, 秒)` **聚合**后写入（兼容 `at_second IS NULL` 的历史行），
+      冲突目标是 `(xxx_id, at_second)`；补增量阶段改用 `DO UPDATE` **覆盖**成 v1 的完整聚合值。
+  - `perform_switch`：补增量（从 cutoff 那天**再往前两天**重算，修正"仍在按秒累加"的行）
+    → 删除 `qps_per_second` / `qps_per_5s` / `daily_traffic_by_website` 三个旧视图
+    （它们绑的是表 OID，换名后会跟着指向 `*_v1`，也会挡住 `DROP TABLE`）
+    → **单事务换名**（v1 → `access_*_v1`，v2 的 `access_*_p` → 逻辑名）。
+  - `verify_after_switch` / `drop_v1_tables`：**核对口径按表区分** —— 主表比行数，
+    size 表比**字节总量**（v2 按秒归并后行数天然更少，用行数核对会误判）；
+    核对通过才 `DROP` 旧表（`DROP TABLE` 立即把空间还给操作系统）。
+    核对失败则置 `phase = verify_failed` 并**保留**旧表，等人工确认（不会每次启动都重扫一遍）。
+  - 分区维护函数改为 `wg_access_partition_parents()` **动态解析父表名**：迁移中父表叫
+    `access_*_p`、切换后叫逻辑名，硬编码任何一套都会让换名后的分区轮换**静默失效**。
+  - `install_v2_schema` 会**跳过已经是分区表**的逻辑表 —— 否则换名之后会再建出一张空的
+    `access_*_p`，与真正的 v2 表并存，后续判断全部错乱。
+- 新增（`gateway/src/migration.rs`）：后台迁移任务 + 控制台进度条。
+  `[access-v2] [████░░░░] 42.3% 2/4 access_response_size_logs 已写入 3120000 行 用时 5m12s 剩余 ~7m03s`
+  （终端里原地刷新，docker logs 里每 15 秒一行）。失败会退避重试 5 次，进度保留。
+- 新增（`gateway/src/access.rs`）：**刷盘闸门** `FLUSH_GATE`。切换时迁移任务持有它
+  （补增量 + 换名，秒级到分钟级），保证换名那一刻没有新日志写进 v1；请求热路径只写内存，
+  因此**不丢日志、不挡请求**，落库只是晚几秒。
+- 新增：`gateway --migrate-v2` 一次性命令 —— 用同一份实现把搬迁+切换同步跑完再退出，
+  供低峰期运维使用（默认仍是后台自动）。
+- 修复（**分区表兼容**，`crates/shared/src/database/access.rs`）：主表批量插入的
+  `ON CONFLICT (id) DO NOTHING` 去掉冲突目标。分区表的唯一索引**必须包含分区键**，
+  v2 的主键是 `(id, 时间列)`，因此 `ON CONFLICT (id)` 在 v2 上推断不出索引 ——
+  切换之后刷盘会整批失败。不带目标时 v1 `PK(id)` 与 v2 `PK(id, 时间)` 都成立。
+- 变更（保留期清理提速）：size 明细表的删除谓词从 `created_at < 窗口` 改为
+  `at_second < 窗口`（`at_second` 是 v2 的**分区键**，可直接裁剪分区），
+  并补一条 `at_second IS NULL AND created_at < 窗口` 兼容未按秒归一的历史行。
+  两条独立语句而不是 `OR` —— 合并会破坏分区裁剪。
+- 新增（`crates/shared/examples/pg_sync.rs`）：生产 → beta 的**流式 COPY 同步工具**
+  （本机没有 `psql`/`pg_dump`）。二进制 COPY 直传、支持 `--days N` / `--since` / `--before`
+  窗口、`--sql` / `--query` 免 psql 查库。**踩坑**：源库在线时只按时间上界过滤子表会撞外键
+  （响应主表的 `created_at` 是**落库时间**，而 size 明细的 `created_at` 是**传输中**的时间，
+  大响应可以传几分钟才落主表行）—— 因此子表逐级用 `EXISTS` 复述父表**自己的**复制条件，
+  只有父行确实会被复制，子行才允许复制。
+- 新增（`crates/shared/examples/access_logs_check.rs`）：访问日志读写探针 ——
+  对着真实库跑一遍刷盘/读路径（幂等写入、按秒累加、父行守卫、批量 UPDATE、
+  QPS/汇总/地图查询），v1 与 v2 都适用。
+- 变更（部署配置）：`docker-compose.yml` 与 `.env.default` 文档化 `ACCESS_LOG_V2`、
+  `ACCESS_LOG_V2_DROP_V1_AFTER_SECS`、`ACCESS_LOG_V2_KEEP_V1`。
+- 验证：
+  - `cargo test -p shared -p gateway` **25 个单测全绿**（新增：复制 SQL 的冲突目标/聚合语义、
+    分区函数动态解析父表、进度表单行、进度条渲染、`--before` 谓词等）；
+  - **空库结构安装**：`gateway --migrate` 在全新库上建出 4 张 v2 分区表（每张预建 4 周分区，
+    `2026_w39`~`w42`）+ 单行进度表 + 4 个 `wg_*` 函数，且 v1 表照旧；
+  - SQL 原语在真实库上实测：分区表上的 `ON CONFLICT DO NOTHING`（无目标）可用；
+    size 表的 `GROUP BY (id, COALESCE(at_second, date_trunc('second', created_at)))` +
+    `SUM(...)::uint8` + `ON CONFLICT (id, at_second)` 输出正确的"同秒一行、跨秒分开"；
+  - 从生产只读拉取**最近 90 天**（`--days 90`，约 1.4 GiB / 120 万请求）灌入 beta，
+    用于按生产量级演练搬迁。
+- **仍未做（需要你确认）**：**生产执行**。代码已就绪，部署新镜像即会在后台自动完成；
+  生产搬迁期间的磁盘预算（v1 与 v2 并存约需 2 倍数据空间）与建议步骤见
+  [PRODUCTION_READINESS.md](PRODUCTION_READINESS.md) 第十节。
+
+### 2026-10-02（第十轮：统计表 v2 按周分区落地 + 网站卡片排版，08:10:00Z — 08:35:42Z）
+
+按 STEP.md 最新版推进：目前-1（统计表 v2 + **按周轮换**）的**结构层**已落地并验证；
+目前-3 的排版按"卡片式、信息分层、按钮对齐"重做。所有时间戳为 UTC。
+
+- 新增（08:25:00Z，目前-1）：**统计表 v2 的按周分区结构**（`crates/shared/src/database/access_v2.rs`）。
+  - 四张表改为 **RANGE 分区**（每周一个分区），分区键沿用 v1 的列名
+    （`requested_at` / `responsed_at` / `at_second`），查询侧不需要改列名。
+  - v2 用**独立物理名**（`*_p`）而非就地转换：PostgreSQL 没有
+    `ALTER TABLE ... PARTITION BY`，"建新表 → 搬数据 → 换名"期间两者必须并存，
+    独立名字让建表/搬数据/校验全程不影响线上读写。
+  - **size 表的分区键选 `at_second` 而不是 `created_at`**：分区表的唯一索引**必须包含分区键**，
+    而"按 (请求, 秒) 累加"的唯一键是 `(request_id, at_second)`；若分区键用 `created_at`
+    就得把它拉进唯一键，而落库时无法预知它的值，`ON CONFLICT` 也无从推断。
+    两者本是同一时刻（`at_second = date_trunc('second', created_at)`），因此等价。
+  - 外键按方案全部移除（分区表无法被单列 `id` 引用），引用完整性由应用层的
+    **父行守卫**承接（第八轮已加）。
+  - 新增三个数据库函数：`wg_ensure_weekly_partition`（建周分区，二级 advisory lock 防 TOCTOU）、
+    `wg_ensure_upcoming_weeks`（预建上周~未来两周）、
+    `wg_drop_partitions_older_than`（**整周 DETACH+DROP** 回收，内含 90 天下限硬校验）。
+- 新增（08:30:00Z）：gateway 的每小时清理任务接入**分区维护**：
+  预建未来两周分区、按保留期整周回收过期分区（v1 表上这些函数查不到分区，会安全地返回 0），
+  然后再走原有的逐行清理路径。
+- 验证（08:30:00Z，真实库）：
+  - 安装后自动建出 **4 张表 × 4 周 = 16 个分区**（含上周兜底与未来两周）；
+  - 四张表 `relkind='p'` 确认是分区表；写入能正确路由（父表查询到 1 行）；
+  - **轮换**：手工建一个 2025 年第 1 周的过期分区 → 按 90 天回收 → 过期分区被删、
+    **当前周分区保留**；保留期传 30 天被数据库函数拒绝（下限保护）。
+- 修复（08:35:00Z）：`install_v2_schema` 里按 `;` 切分建表 DDL 的逻辑加了断言 ——
+  该切分**只对建表语句安全**，若把 `$$ ... $$` 的 plpgsql 函数体也按分号切会切碎、
+  建函数静默失败（实测踩到：表建好了但一个分区都没有）。函数一律整条执行。
+- 变更（08:35:00Z，目前-3）：**网站卡片排版重做**。改用 CSS Grid
+  （`repeat(auto-fill, minmax(320px, 1fr))`）保证"每行三个、卡片等宽等高、互不挤压"；
+  卡片内改为信息分层：标题（名称 + 域名，均单行省略并带 title 提示）→ 上游地址（单行省略）
+  → 今日请求/流量（带底色的两列统计块）→ 端口/后端数标签 → 操作按钮
+  （`margin-top: auto` 让所有卡片的按钮对齐到同一基线）。
+- 清理（08:35:00Z）：删除 `initialize_web_log_tx`（DDL 已在第八轮收敛到共享迁移，
+  该封装已无调用方）；`init_authentication` 标注为保留给外部调用方并 `#[allow(dead_code)]`。
+- **仍未做（需要你确认）**：目前-1 的**数据搬迁与读写切换**（把 v1 的 1380 万行搬进 v2、
+  切换读写、换名、回收旧表）。结构已就绪，但搬迁要在生产上做，必须停机窗口；
+  方案与磁盘预算见 [PRODUCTION_READINESS.md](PRODUCTION_READINESS.md) 第十节。
+- 说明（数据安全）：v2 的所有验证都在 beta 库上进行，**验证后已删除全部 v2 探针结构**
+  （分区表、函数），生产库未执行任何 v2 相关命令。
+
+
 ### 2026-10-02（第九轮：证书过期过滤 + 站点编辑/删除，07:45:00Z — 07:58:41Z）
 
 本轮实施 [STEP.md](STEP.md) 新版「目前」的第 2、3 项。第 1、4 项（统计表 v2 + 按周分区 +

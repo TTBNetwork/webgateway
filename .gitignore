@@ -18,3 +18,6 @@ tests/*
 
 # pnpm 本地 store（固定在仓库内，避免写家目录）
 .pnpm-store
+
+# 用户粘贴到工作区的截图（不随代码提交）
+screenshots/

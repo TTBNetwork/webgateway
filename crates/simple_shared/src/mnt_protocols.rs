@@ -7,12 +7,23 @@ use serde::{Deserialize, Serialize};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
 use crate::objectid::ObjectId;
+/// 默认 socket 路径；后端可用 `MNT_SOCKET` 覆盖（客户端用 `--socket` 指定）。
 pub static MNT_PATH: &str = "/tmp/webgateway-mnt.sock";
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
 #[serde(tag = "type", content = "payload")]
 pub enum ClientRequestContent {
     AdminTOTP,
+    /// 把 `access_log_v2_migration` 里记录的 v1 历史数据**分批搬进 v2 分区表**。
+    ///
+    /// 这条命令是长任务（千万行级别、分钟到小时），因此**不是一问一答**：
+    /// 服务端会先连续推送若干 [`ServerResponseContent::MigrateV2Progress`]，
+    /// 最后推送一个 [`ServerResponseContent::MigrateV2Done`]。
+    /// 客户端读到 `Done`（或收到 `error`）才算结束。
+    ///
+    /// `reset = true` 表示从零重搬（丢弃已有进度与 v2 中已搬入的行）；
+    /// 否则从进度表的游标**续跑**。
+    MigrateV2 { reset: bool },
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
@@ -25,7 +36,25 @@ pub struct ClientRequest {
 #[derive(Debug, Clone, Deserialize, Serialize)]
 #[serde(tag = "type", content = "payload")]
 pub enum ServerResponseContent {
-    AdminTOTP { user: String, totp: String },
+    AdminTOTP {
+        user: String,
+        totp: String,
+    },
+    /// 搬迁进度（可多次推送）。
+    MigrateV2Progress {
+        phase: String,
+        table: String,
+        copied_rows: i64,
+        total_rows: i64,
+        message: String,
+    },
+    /// 搬迁结束（成功）。
+    MigrateV2Done {
+        copied_rows: i64,
+        v1_rows: i64,
+        v2_rows: i64,
+        message: String,
+    },
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]

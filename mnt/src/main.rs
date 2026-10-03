@@ -2,9 +2,10 @@ use std::io::{Read, Write};
 use std::os::unix::net::UnixStream;
 
 use anyhow::Result;
-use clap::Parser;
+use clap::{Parser, Subcommand};
 use simple_shared::mnt_protocols::{
-    ClientRequest, ClientRequestContent, ServerResponse, SyncZigZagVarint, MNT_PATH,
+    ClientRequest, ClientRequestContent, ServerResponse, ServerResponseContent, SyncZigZagVarint,
+    MNT_PATH,
 };
 use simple_shared::objectid::ObjectId;
 
@@ -16,15 +17,23 @@ struct Args {
     #[arg(short, long, default_value = MNT_PATH)]
     socket: String,
 
-    /// 要发送的请求类型（目前仅支持 admin-totp）
-    #[arg(value_enum, default_value_t = RequestType::AdminTotp)]
-    request: RequestType,
+    #[command(subcommand)]
+    command: Command,
 }
 
-#[derive(clap::ValueEnum, Debug, Clone)]
-enum RequestType {
+#[derive(Subcommand, Debug, Clone)]
+enum Command {
+    /// 获取某个管理员的 TOTP 验证码
     AdminTotp,
-    // 将来可以扩展其他请求类型
+    /// 把 `access_*_v1` 里的历史访问日志分批搬进 v2 分区表
+    ///
+    /// 服务端会持续推送进度，搬完打印汇总。**不会删除 v1** ——
+    /// 核对无误后请手工 `DROP TABLE access_*_v1`（或先留着当备份）。
+    MigrateV2 {
+        /// 从零重搬：清空 v2 四表并重置进度（默认从上次游标续跑）
+        #[arg(long)]
+        reset: bool,
+    },
 }
 
 fn main() -> Result<()> {
@@ -34,14 +43,14 @@ fn main() -> Result<()> {
     let mut stream = UnixStream::connect(&args.socket)?;
 
     // 2. 根据命令行参数构造请求
-    let request_content = match args.request {
-        RequestType::AdminTotp => ClientRequestContent::AdminTOTP,
+    // `streaming` 要在请求被 move 之前算出来：搬迁是流式命令，其余是一问一答。
+    let streaming = matches!(args.command, Command::MigrateV2 { .. });
+    let request_content = match args.command {
+        Command::AdminTotp => ClientRequestContent::AdminTOTP,
+        Command::MigrateV2 { reset } => ClientRequestContent::MigrateV2 { reset },
     };
 
-    // 生成一个请求 ID（实际应用中应使用唯一 ID，这里简单使用固定值 1）
-    // 假设 ObjectId 实现了 From<u64> 或者有一个 new 方法
-    let id = ObjectId::new(); // 根据您的 ObjectId 定义调整
-
+    let id = ObjectId::new();
     let request = ClientRequest {
         id,
         content: request_content,
@@ -52,26 +61,60 @@ fn main() -> Result<()> {
     stream.write_zigzag_varint::<usize>(buf.len())?;
     stream.write_all(&buf)?;
 
-    // 4. 读取响应长度和数据
-    let size = stream.read_zigzag_varint::<usize>()?;
-    let mut buf = vec![0; size];
-    stream.read_exact(&mut buf)?;
+    // 4. 读响应。搬迁是长任务：服务端会先连推若干条进度，最后给 Done 或 error，
+    //    因此这里循环读到"终态"为止（一问一答的命令读一条就结束）。
+    loop {
+        let size = stream.read_zigzag_varint::<usize>()?;
+        let mut buf = vec![0; size];
+        stream.read_exact(&mut buf)?;
+        let response: ServerResponse = serde_json::from_slice(&buf)?;
 
-    // 5. 解析响应
-    let response: ServerResponse = serde_json::from_slice(&buf)?;
+        if let Some(err) = response.error {
+            eprintln!("服务端返回错误: {err}");
+            std::process::exit(1);
+        }
 
-    // 如果响应中包含错误，以非零退出码退出
-    if response.error.is_some() {
-        eprintln!("服务端返回错误: {:?}", response.error);
-        std::process::exit(1);
-    }
+        // `done` 必须在 move 之前判定（下面要把 content 取出来用）。
+        let done = !streaming
+            || matches!(
+                response.content,
+                Some(ServerResponseContent::MigrateV2Done { .. })
+            );
 
-    let response_content = response.content.unwrap();
+        match response.content {
+            Some(ServerResponseContent::AdminTOTP { user, totp }) => {
+                println!("User: {user}");
+                println!("TOTP: {totp}");
+            }
+            Some(ServerResponseContent::MigrateV2Progress { message, .. }) => {
+                // 进度用 `\r` 覆盖同一行；非终端环境（日志/重定向）下退化成逐行输出。
+                use std::io::IsTerminal;
+                if std::io::stdout().is_terminal() {
+                    print!("\r{message}\x1b[K");
+                    let _ = std::io::stdout().flush();
+                } else {
+                    println!("{message}");
+                }
+            }
+            Some(ServerResponseContent::MigrateV2Done {
+                copied_rows,
+                v1_rows,
+                v2_rows,
+                message,
+            }) => {
+                println!("\n{message}");
+                println!(
+                    "统计：本次写入 {copied_rows} 行；v1 共 {v1_rows} 行；v2 共 {v2_rows} 行"
+                );
+            }
+            None => {
+                eprintln!("服务端返回了空响应");
+                std::process::exit(1);
+            }
+        }
 
-    match response_content {
-        simple_shared::mnt_protocols::ServerResponseContent::AdminTOTP { user, totp } => {
-            println!("User: {user}");
-            println!("TOTP: {totp}");
+        if done {
+            break;
         }
     }
 

@@ -45,8 +45,8 @@ pub async fn access_map(
 ) -> APIResponse<HashMap<String, usize>> {
     // 修复（P1-1）：原先这里在 `#[cfg(not(debug_assertions))]` 下直接返回空表，
     // 导致 release/生产构建的访问地图**永远没有数据**（疑似临时熔断，已确认是缺陷）。
-    // 代价问题改由查询侧解决：`access_request_logs` 增加了
-    // `(remote_addr, requested_at)` 复合索引（见 assets/sqls/access_init.sql）。
+    // 代价问题改由查询侧解决：`remote_addr` 上有索引（v2 的每个周分区都带
+    // `(remote_addr, requested_at)` 复合索引，见 `access_v2::v2_ddl_for`）。
     let res = match get_database()
         .get_requests_of_ips(query.in_days.into())
         .await

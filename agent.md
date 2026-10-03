@@ -16,7 +16,7 @@ WebGateway 是一个自建的**反向代理 / 网关系统**，由「数据面�
 | 部署 | Docker Compose（一次性 migrate + 4 容器）+ GitHub Actions 构建镜像到 GHCR |
 | 当前版本 | `0.1.0`（见 [project.toml](project.toml)） |
 | 当前阶段 | 开发中（未发布）。核心链路可用，存在停用模块与半成品 crate，详见 [TODO.md](TODO.md) |
-| 生产可用性 | 2026-10-02 第四轮修复后，阻塞上线的代码缺陷已处理；**但 release 构建受阻于 `acmex → aws-lc-rs/fips`**（详见 CHANGELOG 与 ISSUES.md） |
+| 生产可用性 | 阻塞上线的代码缺陷已处理，release 构建已解阻（vendor `acmex` 去掉硬编码 fips）；访问日志 **v2 自动迁移已就绪**（第十一轮），**生产执行待用户确认** |
 
 ## 目录结构
 
@@ -59,7 +59,9 @@ webgateway/
 | [gateway/src/upstream/connection.rs](gateway/src/upstream/connection.rs) | 上游连接池（`UpstreamConnectionPool`） |
 | [gateway/src/upstream/protocols.rs](gateway/src/upstream/protocols.rs) | 前置协议探测：TLS SNI 提取、PROXY protocol（尚未实现） |
 | [gateway/src/sync/](gateway/src/sync) | 从数据库同步站点与证书；证书热加载通过 `ResolvesServerCert` 实现 |
-| [gateway/src/access.rs](gateway/src/access.rs) | 访问日志采集与批量落库（请求/响应大小统计） |
+| [gateway/src/access.rs](gateway/src/access.rs) | 访问日志采集与批量落库（请求/响应大小统计），以及 v1→v2 切换用的**刷盘闸门** |
+| [gateway/src/migration.rs](gateway/src/migration.rs) | 访问日志 v1→v2 的**后台自动迁移**：进度条、可续传、切换、核对与回收旧表 |
+| [crates/shared/src/database/access_v2.rs](crates/shared/src/database/access_v2.rs) | v2 按周分区结构 + 分区轮换函数 + 搬迁引擎（复制/切换/核对/回收） |
 | [gateway/src/transport.rs](gateway/src/transport.rs) | 带统计功能的响应 Body 包装类型 |
 | [gateway/src/proxy/](gateway/src/proxy) | **已停用**的旧代理实现，与 `upstream` 功能重叠（`main.rs` 中 `pub mod proxy;` 被注释） |
 | [crates/shared/](crates/shared) | 共享库：数据库连接与初始化、`models` 数据模型、日志、双栈监听器、favicon 抓取 |
@@ -198,6 +200,9 @@ docker compose up -d      # 一次性 migrate → postgres + gateway + dashboard
 | `SUBNET_PREFIX`、`POSTGRES_*`、`IMAGE_PREFIX` | 仅 `docker-compose.yml` 使用 |
 | `HTTP_PROXY` / `HTTPS_PROXY` / `NO_PROXY` | **可选**：ACME 证书签发与 DNS API 调用走代理（reqwest 默认读取，见下） |
 | `DB_AUTO_MIGRATE` | 默认（不设置）即「先迁移再服务」；设为 `0`/`false` 则只服务、不执行 DDL |
+| `ACCESS_LOG_V2` | 访问日志 v1→v2 **后台自动迁移**开关；默认 `auto`（自动搬迁并切换），`off`/`0`/`false` = 只建结构不搬数据 |
+| `ACCESS_LOG_V2_DROP_V1_AFTER_SECS` | 切换后等待多少秒再核对并回收 `*_v1` 旧表（默认 `300`） |
+| `ACCESS_LOG_V2_KEEP_V1` | 设为 `1` 则永久保留 `*_v1` 旧表（需要时手工 DROP 回收空间） |
 
 ## 相关文档
 
@@ -219,10 +224,10 @@ docker compose up -d      # 一次性 migrate → postgres + gateway + dashboard
 
 | # | 任务 | 状态 |
 |---|------|------|
-| 1 | 统计表改 v2 并支持**按周轮换** | ⏳ **待确认**：1380 万行 / 6.3 GB 的分区化重写（移除外键、主键加分区键、数据搬迁、读写切换），方案与风险见 [PRODUCTION_READINESS.md](PRODUCTION_READINESS.md) 第十节、DDL 见 [ISSUES.md](ISSUES.md) 附录 A |
+| 1 | 统计表改 v2 并支持**按周轮换** | ✅ **已完成**（第十轮结构 + 第十一轮自动迁移）：四张表改为按周 RANGE 分区（迁移期物理名 `*_p`）+ 4 个分区管理函数；**后台自动迁移**（启动只建空结构 → 按天分批搬迁 + 控制台进度条 → 搬完自动切换读写 → 核对后回收旧表，零停机、可续传）见 [CHANGELOG.md](CHANGELOG.md) 第十一轮 |
 | 2 | **过期的证书不加载**（除非一张有效的都没有） | ✅ 已完成（第九轮）：`sync_certificates` 先解析并标注过期，有有效证书就只装载有效的；全过期才全部回退装载并打 ERROR。规则抽成 `loadable_certificates()` + 3 个单测 |
-| 3 | 面板**支持编辑/删除站点** + 网站排布（每行三个，不足的占满） | ✅ 已完成（第九轮）：新增 `GET /websites/{id}`、`POST /{id}/update`（需 user）、`POST /{id}/delete`（需 admin，删除前确认）；前端复用 `AddWebsite.vue` 做编辑对话框；列表改为每行三个（窄屏两列/单列）并接上搜索过滤 |
-| 4 | 统计表迁移后做查询优化（加速面板） | ⏳ 部分：低风险的查询/索引优化可先做；依赖 v2 的部分等迁移 |
+| 3 | 面板**支持编辑/删除站点** + 网站排布 | ✅ 已完成（第九、十轮）：CRUD 见第九轮；第十轮把卡片排版改为 CSS Grid（每行三个、等宽等高）+ 信息分层（标题/域名/上游/统计块/标签/按钮对齐） |
+| 4 | 统计表迁移后做查询优化（加速面板） | ⏳ 依赖 v2 的读写切换；低风险的查询/索引优化可先做 |
 
 ### 历史任务（STEP.md 更早版本）
 
@@ -245,6 +250,13 @@ docker compose up -d      # 一次性 migrate → postgres + gateway + dashboard
 |---|------|------|
 | 1 | 把 `STEP.md` 内容融合进本文件 | ✅ 本节；「授予权限」仅保留非凭据事实 |
 | 2 | 把已读取的内容保存到 `agent-context.md` | ✅ 见 [agent-context.md](agent-context.md) |
+
+### 本地/beta 演练环境（STEP.md 新增第 5、6 条）
+
+- `webgateway_beta`（`192.168.2.254:7777`）**不是生产数据，可随时删库重建**，删了没有影响。
+- 库里没有数据时：删掉该 database → 从生产只读拉**最近 3 个月**：
+  `cargo run -p shared --example pg_sync -- --from <生产库> --to <beta> --truncate --days 90`；
+  数据不够再加大天数。同步工具与踩坑（在线源库的父子表一致性）见 [CHANGELOG.md](CHANGELOG.md) 第十一轮。
 
 ### 生产环境排查要点（本次只读排查的发现）
 
@@ -275,6 +287,54 @@ docker compose up -d      # 一次性 migrate → postgres + gateway + dashboard
 `fetch_one` 取锁、再 `execute` 解锁，两次很可能落在不同连接上 —— 解锁语句释放的是那条连接
 自己的锁（它并未持有），而真正持有的锁要等连接被复用/关闭才释放，于是后续每一轮都拿不到锁、
 清理**静默停止**。`prune_access_logs` 现在显式 `acquire` 一条连接贯穿始终。
+
+## 统计表 v2：按周分区、自动迁移与轮换（第十、十一轮）
+
+代码在 `crates/shared/src/database/access_v2.rs`（结构 + 搬迁引擎）与
+`gateway/src/migration.rs`（后台任务 + 进度条）。
+
+### 结构层（第十轮）
+
+| 项 | 约定 |
+|----|------|
+| 物理名 | 迁移期 v2 表是 `<逻辑名>_p`（如 `access_request_logs_p`）；切换时换名，逻辑名最终归 v2 |
+| 分区键 | `requested_at` / `responsed_at`，size 表用 **`at_second`**（见下） |
+| 分区命名 | `<父表>_<IYYY>_w<IW>`，如 `access_request_logs_p_2026_w40` |
+| 建分区 | `wg_ensure_weekly_partition(parent, week_start)`，内部 `pg_advisory_xact_lock(hashtext(name))` 防并发重复建 |
+| 预建 | `wg_ensure_upcoming_weeks(2)`：上周 ~ 未来两周 |
+| 回收 | `wg_drop_partitions_older_than(days)`：**整周 DROP**，`days < 90` 直接 RAISE（数据库侧兜底下限） |
+| 调用点 | gateway 的 `init_access_log_pruner()` 每小时：先 `ensure_upcoming_partitions` + `prune_expired_partitions`，再走原有的逐行清理 |
+
+**父表名必须动态解析**：`wg_access_partition_parents()` 只认 `relkind='p'` 且名字在
+（逻辑名 ∪ `*_p`）里的表。迁移中父表叫 `*_p`、切换后叫逻辑名 —— 硬编码任何一套，
+换名之后分区轮换都会**静默失效**（一个分区都建不出来）。
+
+**为什么 size 表的分区键是 `at_second` 而不是 `created_at`**：分区表的唯一索引必须包含分区键，
+而"按 (请求, 秒) 累加"的唯一键是 `(request_id, at_second)`。用 `created_at` 就得把它拉进唯一键，
+但落库时无法预知它的值、`ON CONFLICT` 也无从推断。
+
+**踩坑记录**：`install_v2_schema` 里按 `;` 切分建表 DDL 是安全的，但**不能**把
+`$$ ... $$` 的 plpgsql 函数体也按分号切 —— 会切碎并静默建不出函数。
+
+### 自动迁移（第十一轮，默认开启、零停机）
+
+| 阶段 | 做什么 | 影响 |
+|------|--------|------|
+| 启动（廉价） | `install_v2_schema`：建 4 张**空**分区表 + 状态表 + 函数 + 预建未来两周 | 与表大小无关，秒级 |
+| 后台搬迁 | `migration::spawn()` 按**天**把 v1 复制进 v2；进度写 `access_log_v2_migration`，控制台打进度条 | v1 仍是唯一读写对象，网关照常服务；可续传 |
+| 切换 | 持**刷盘闸门** → 补增量（cutoff 起再往前两天，size 表覆盖语义）→ 删旧视图 → 单事务换名 | 只暂停"日志落库"（秒级~分钟级），**不挡代理请求、不丢日志**（内存缓冲） |
+| 收尾 | `verify_after_switch`（主表比行数 / size 表比字节总量）→ `drop_v1_tables` | 核对通过才删；失败置 `verify_failed` 并保留旧表等人工确认 |
+
+| 环境变量 | 默认 | 作用 |
+|----------|------|------|
+| `ACCESS_LOG_V2` | `auto` | `off`/`0`/`false` = 只建结构、**不**搬数据 |
+| `ACCESS_LOG_V2_DROP_V1_AFTER_SECS` | `300` | 切换后等多久再核对并回收旧表（反悔窗口） |
+| `ACCESS_LOG_V2_KEEP_V1` | 未设置 | `1` = 永久保留 `*_v1` 旧表 |
+
+- 运维可用 `gateway --migrate-v2` 把搬迁+切换**同步**跑完再退出（同一份实现）。
+- **多实例限制**：`locks::MIGRATION` 只保证一个实例在搬；但换名要求"没有别的进程在写 v1"，
+  因此多副本部署要先停掉其它 gateway 实例。当前生产是单 gateway 容器。
+- 迁移进度也落在 `access_log_v2_migration`，可随时用 SQL 观察。
 
 ## ⚠️ 启动路径上的迁移必须廉价（2026-10-02 生产事故的教训）
 

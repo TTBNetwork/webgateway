@@ -15,9 +15,9 @@
 | 目前-1 | 证书续签先不用管 | ✅ 按此执行 |
 | 目前-2 | 压缩/清理数据库历史数据（面板可配，下限 3 个月） | ✅ 已实现（设置 → 数据保留，90~3650 天，默认 180；gateway 每小时清理） |
 | 目前-3 | 面板可选配置 HTTP/HTTPS 代理以续签证书 | ✅ 核实无需改代码（reqwest 默认读 `HTTPS_PROXY` 等） |
-| 目前(第九轮)-1 | 统计表 v2 + 按周轮换 | ⏳ **待确认**（大表分区化重写，需停机窗口；方案见 PRODUCTION_READINESS 第十节） |
+| 目前(第十/十一轮)-1 | 统计表 v2 + 按周轮换 + **自动迁移** | ✅ 已完成：结构层（第十轮）+ 后台自动搬迁/切换/回收（第十一轮，零停机、可续传、进度条）。生产执行待确认 |
 | 目前(第九轮)-2 | 过期证书不加载 | ✅ 已完成（有有效证书则只用有效的；全过期才回退，附 3 个单测） |
-| 目前(第九轮)-3 | 面板站点编辑/删除 + 每行三个布局 | ✅ 已完成（含 admin 才能删除、404 语义、搜索过滤） |
+| 目前(第十轮)-3 | 面板站点编辑/删除 + 排版 | ✅ 已完成（CRUD 见第九轮；第十轮排版改为 CSS Grid 三列 + 信息分层） |
 | 目前(第九轮)-4 | 迁移后查询优化（面板加速） | ⏳ 部分（低风险索引/查询可先做，其余等 v2） |
 | 目前(第七轮)-1 | size 表要能"细化到每秒颗粒度" | ✅ 改为按 `(请求, 秒)` 聚合（第六轮曾过度聚合成一行、丢了秒级颗粒度，第七轮已纠正） |
 | 目前(第七轮)-2 | 任一服务启动即自动迁移（无感） | ✅ `AutoMigrate` 成为默认；控制面表纳入共享迁移；compose 去掉一次性 migrate 服务 |
@@ -33,7 +33,7 @@
 | 生产主机 | `sj-pub`，Debian 13，**2 vCPU / 1.9 GiB 内存无 swap**，根分区 39G 用 50% |
 | 生产库版本 | PostgreSQL 18.2 (Debian 18.2-1.pgdg12+1)，扩展 `btree_gin` / `uint128` / `plpgsql` |
 | 生产库账号权限 | `root` 是 **superuser** —— 务必只读操作（STEP.md 要求"仅访问，不可修改"） |
-| 开发/beta 库 | `postgres://webgateway:***@192.168.2.254:7777/webgateway_beta`（凭据见 `dev/environment`，已 gitignore） |
+| 开发/beta 库 | `postgres://webgateway:***@192.168.2.254:7777/webgateway_beta`（凭据见 `dev/environment`，已 gitignore）。**可随时删库重建**（STEP.md 新增第 5/6 条）：没数据时删库 → 从生产拉最近 3 个月（`pg_sync --days 90`）。2026-10-02 重建过一次 |
 | 生产 SSH | `root@10.240.0.1`，密钥用 `~/.ssh/id_personal`（`id_ed25519` / `id_rsa` 均被拒） |
 | SSH 可写路径 | 家目录只读，必须指定 `-o UserKnownHostsFile=$PWD/target/ssh/known_hosts`，否则连不上 |
 | SSH 变更限制 | **执行任何变更命令前必须经用户确认**（STEP.md 要求） |
@@ -138,24 +138,61 @@
 - **前端**：`AddWebsite.vue` 现在同时承担新增与编辑（传 `website` prop）；
   网站列表每行三个，搜索框已接上过滤。
 
+## 4.8 第十轮新增（v2 按周分区）
+
+- 代码：`crates/shared/src/database/access_v2.rs`。**v2 表物理名带 `_p` 后缀**
+  （`access_request_logs_p` 等），逻辑名留给 v1，切换时才改名。
+- 分区命名 `<父表>_<IYYY>_w<IW>`；建分区函数 `wg_ensure_weekly_partition` 内部用
+  `pg_advisory_xact_lock(hashtext(name))` 防并发重复建。
+- **size 表分区键是 `at_second`**（不是 `created_at`）—— 分区表唯一索引必须含分区键，
+  而按秒累加的唯一键是 `(request_id, at_second)`。
+- gateway 每小时调 `ensure_upcoming_partitions` + `prune_expired_partitions`
+  （v1 表上安全返回 0）。
+- **别踩的坑**：`install_v2_schema` 按 `;` 切分只对建表 DDL 安全；
+  plpgsql 函数体（`$$`）必须整条执行，否则会静默建不出函数、一个分区都没有。
+- **未做**：数据搬迁与读写切换（需停机窗口，见 PRODUCTION_READINESS 第十节）。
+  beta 上的 v2 探针结构在验证后**已全部删除**。
+
+## 4.9 第十一轮新增（v1→v2 后台自动迁移，零停机）
+
+- 引擎：`crates/shared/src/database/access_v2.rs`；编排 + 进度条：`gateway/src/migration.rs`。
+- **启动路径只建空结构**（`install_v2_schema`，与表大小无关）；数据搬迁是服务起来之后的
+  后台任务，按**天**分批，进度写单行表 `access_log_v2_migration`（phase/cutoff/current_table/
+  cursor_at/copied_rows），**可续传**。
+- **刷盘闸门**：`gateway/src/access.rs` 的 `FLUSH_GATE`（tokio Mutex）。切换时迁移持有它，
+  刷盘循环每轮先取；请求热路径只写内存 → 不丢日志、不挡请求，落库晚几秒。
+- **分区维护函数必须动态解析父表名**：`wg_access_partition_parents()`（只认 `relkind='p'`，
+  名字取 逻辑名 ∪ `*_p`）。硬编码任何一套，换名后轮换静默失效。
+- **主表 `ON CONFLICT` 不能带冲突目标**：v2 主键是 `(id, 时间)`，分区表推断不出 `(id)`；
+  用不带目标的 `ON CONFLICT DO NOTHING` 才能同时适配 v1/v2。
+- **核对口径按表区分**：主表比行数；size 表比**字节总量**（v2 按秒归并后行数更少）。
+  失败 → `phase=verify_failed` 且保留旧表，不会每次启动重扫。
+- 环境变量：`ACCESS_LOG_V2`（默认 auto）、`ACCESS_LOG_V2_DROP_V1_AFTER_SECS`（默认 300）、
+  `ACCESS_LOG_V2_KEEP_V1`。一次性命令：`gateway --migrate-v2`。
+- **多实例限制**：换名要求没有别的进程写 v1；生产是单 gateway 容器，多副本需先停其它实例。
+- 工具：`crates/shared/examples/pg_sync.rs`（生产→beta 流式 COPY，支持 `--days/--since/--before`
+  与 `--sql/--query`；子表用 `EXISTS` 保证父行会被复制，否则在线源库必撞外键）、
+  `crates/shared/examples/access_logs_check.rs`（读写探针）。
+- **STEP.md 新增 5/6 条**：`webgateway_beta` 可随时删库重建（非生产数据）；
+  没数据时删库后从生产拉**最近 3 个月**（`--days 90`）。本轮据此重建过一次 beta。
+
 ## 5. 未解决 / 需注意
 
-1. **release 构建受阻（与本次改动无关）**：`acmex 0.8.0` 硬编码 `aws-lc-rs` 的 `fips` feature，
-   必然编译 `aws-lc-fips-sys`；本机 GCC 15.2 + binutils 2.46 拒绝其 `.data.rel.ro.local` 段
-   （[aws-lc-rs#614](https://github.com/aws/aws-lc-rs/issues/614)）。CI 的 `ubuntu-latest` 大概能过，属撞运气。
+1. **release 构建已解阻**（第五轮）：vendor `acmex` 去掉硬编码 fips。本机历史问题见
+   [aws-lc-rs#614](https://github.com/aws/aws-lc-rs/issues/614)。
 2. **上游连接空闲复用率下降**：修复挂起的代价。连接任务结束即关闭连接；
    同一客户端 keep-alive 连接内的连续请求仍复用。恢复复用需把上游连接生命周期从客户端连接任务中拆出（重构）。
-3. 访问日志表**无分区**（保留期清理已实现，分区方案仍未做，见 ISSUES.md 附录 A）。
-   生产 `access_response_size_logs` 3606 MB；**当前最早数据 2026-04-25、跨度 160 天**，
-   因此默认 180 天保留期暂时不会删任何数据 —— 要立刻回收空间需把保留期调到 90~160 天之间，
-   或手工清理。
+3. 访问日志表已改为**按周分区（v2）**，自动迁移已实现（第十一轮），**生产尚未执行**。
+   生产 `access_response_size_logs` 约 3.6 GB；**最早数据 2026-04-25、跨度 160 天**，
+   因此默认 180 天保留期不会删任何数据 —— 搬迁前若想省磁盘，可先把保留期调到 90~160 天之间。
 4. 生产两张证书的 `email` / `dns_provider_id` 都是 NULL，**自动续签不会生效**；
    `6a2b8ef3…` 已过期。上线后若期望自动续签，需要在面板补这两个字段。
 
 ## 6. 已确认的工程约束（踩过的坑）
 
-- `tests/` 目录是运行期产物（证书/日志），**不是**测试目录，且被 gitignore；
-  `cargo test` 的探针要放 `crates/shared/tests/`，用完必须删除（本轮已反复如此操作）。
+- `tests/` 目录是运行期产物（证书/日志），**不是**测试目录，且被 gitignore。
+  一次性探针放 `crates/shared/tests/`（用完删）或做成 `crates/shared/examples/` 里的
+  常用工具（现在有 `pg_sync`（生产→beta 同步 + 免 psql 查库）与 `access_logs_check`（读写探针））。
 - `gateway` crate **没有** `sqlx` 直接依赖，探针脚本不能用 `sqlx::`；需访问数据库时把探针放到 `shared`。
 - `shared` 的 tokio 未开 `rt-multi-thread`/`macros`，`#[tokio::test]` 与 `Runtime::new()` 不可用，
   要用 `Builder::new_current_thread().enable_all().build()`。

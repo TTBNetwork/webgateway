@@ -51,6 +51,23 @@ services:
       # 包括控制面的 users / users_client_secrets / web_log。迁移幂等，重复启动安全。
       # 若要改成"只服务不迁移"，设为 0（此时需自行保证 schema 已由 --migrate 建好）。
       DB_AUTO_MIGRATE: "1"
+      # 访问日志 v2（按周分区）的**显式激活**模式（2026-10-02 起默认 "off"）：
+      # * off（默认）：启动只建 v2 空结构（秒级），**不搬数据、不自动切换**。
+      #   全新库会自动把逻辑名交给 v2（无需人工操作）；老库（逻辑名上还是 v1 普通表）
+      #   需要一个显式动作来切换，见 ACCESS_LOG_V2_ACTIVATE。
+      # * auto：启动后**后台自动搬迁历史数据并在搬完后自动回收 `*_v1`**
+      #   （旧行为；只有确实想一次搬完并丢弃 v1 时才用）。
+      # 注意：换名要求"没有别的实例在写 v1"，多副本部署时应先停掉其它实例。
+      ACCESS_LOG_V2: ${ACCESS_LOG_V2:-off}
+      # 设为 1 时**启动即激活 v2**：把逻辑名交给 v2 分区表，v1 改名成 `*_v1` 保留
+      # （不搬数据、不自动回收）。适用于"历史日志先留着、以后用 mnt 工具慢慢搬"。
+      # 也可不设此项，改为执行一次一次性命令（推荐，可控性更好；脚本会先停网关）：
+      #   docker compose stop gateway
+      #   docker compose exec -e ACCESS_LOG_V2_ACTIVATE=1 dashboard-backend \
+      #     /opt/webgateway/dashboard --activate-v2-keep-v1
+      #   docker compose start gateway
+      # 或者直接用仓库里的 dev/activate-v2.sh（含状态打印、确认与校验）。
+      ACCESS_LOG_V2_ACTIVATE: ${ACCESS_LOG_V2_ACTIVATE:-0}
     networks:
       webgateway:
         ipv4_address: ${SUBNET_PREFIX}.3

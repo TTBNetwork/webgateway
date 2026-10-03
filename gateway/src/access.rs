@@ -32,6 +32,21 @@ const FLUSH_LAG_WARN: Duration = Duration::from_secs(3);
 /// 因此 DB 长时间不可用会导致内存增长 —— 必须让运维看到这个积压。
 const FLUSH_BACKLOG_WARN: usize = 200_000;
 
+/// 「刷盘闸门」：v1→v2 切换期间由迁移任务持有，保证换名那一刻**没有新的访问日志
+/// 写进 v1** —— 否则那些行会落在换名后的 `*_v1` 表里被丢掉。
+///
+/// 刷盘循环每轮先取这把锁；请求热路径上的生产者不受影响，照常写内存缓冲，
+/// 因此切换只会让日志落库晚几秒，不会丢数据、也不会挡住代理请求。
+static FLUSH_GATE: LazyLock<tokio::sync::Mutex<()>> =
+    LazyLock::new(|| tokio::sync::Mutex::new(()));
+
+/// 取得刷盘闸门。**持有期间数据库不会收到新的访问日志写入。**
+///
+/// 调用方应在拿到锁之后立刻完成"补增量 + 换名"，不要做无关的长任务。
+pub async fn acquire_flush_gate() -> tokio::sync::MutexGuard<'static, ()> {
+    FLUSH_GATE.lock().await
+}
+
 #[derive(Debug, Clone)]
 pub struct RequestLog {
     pub inner: AccessCreateRequest,
@@ -377,10 +392,15 @@ pub async fn background_update_access_logs() -> anyhow::Result<()> {
     let offset = (next_time - time).to_std()?;
     let _ = tokio::time::sleep(offset).await;
     loop {
-        let cycle_start = Instant::now();
-        update_time();
-        sync().await;
-        let elapsed = cycle_start.elapsed();
+        // 与 v1→v2 切换互斥：迁移持有闸门时**不写库**，等它换完名再继续。
+        // 只包住一轮刷盘；睡眠期间故意不持有，避免迁移白等一秒。
+        let elapsed = {
+            let _gate = FLUSH_GATE.lock().await;
+            let cycle_start = Instant::now();
+            update_time();
+            sync().await;
+            cycle_start.elapsed()
+        };
 
         if elapsed > FLUSH_LAG_WARN {
             event!(
@@ -700,9 +720,68 @@ const PRUNE_INTERVAL: Duration = Duration::from_secs(3600);
 /// 放在数据面（gateway）而不是控制面：这张表由 gateway 写入，清理也应当由
 /// 数据面负责；同时 `prune_access_logs` 内部用 `pg_try_advisory_lock` 保证
 /// 多实例并发时只有一个在执行，因此多副本部署是安全的。
+/// 日汇总刷新是否启用（`ACCESS_STATS_ROLLUP=off` 可急停）。
+///
+/// 为什么需要这个开关：首次部署要回填最近 30 天的汇总，在 2 vCPU 的小机器上
+/// 会占几十秒的数据库 CPU。数据完整性不受影响（面板退回实时聚合口径，只是慢），
+/// 因此给运维一个"先关掉、避峰再开"的旋钮。
+fn stats_rollup_enabled() -> bool {
+    !matches!(
+        std::env::var("ACCESS_STATS_ROLLUP").as_deref(),
+        Ok("off") | Ok("0") | Ok("false") | Ok("OFF") | Ok("False")
+    )
+}
+
 pub async fn init_access_log_pruner() {
     tokio::spawn(async move {
         loop {
+            // 1) 分区维护（仅当库已切成 v2 分区表时才有意义）：
+            //    预建未来两周的分区，并整周回收过期分区（DETACH+DROP，
+            //    比逐行 DELETE 快几个数量级，见 `shared::database::access_v2`）。
+            if let Err(e) = shared::database::access_v2::ensure_upcoming_partitions(
+                &shared::database::get_database().pool,
+            )
+            .await
+            {
+                event!(Level::WARN, "Failed to ensure upcoming partitions: {e}");
+            }
+            match shared::database::access::get_retention_config().await {
+                Ok(cfg) if cfg.should_prune() => {
+                    if let Err(e) = shared::database::access_v2::prune_expired_partitions(
+                        &shared::database::get_database().pool,
+                        cfg.retention_days,
+                    )
+                    .await
+                    {
+                        event!(Level::WARN, "Failed to prune expired partitions: {e}");
+                    }
+                }
+                _ => {}
+            }
+
+            // 1.5) 日汇总刷新（面板加速）：重算最近几天 + 逐步往前补历史。
+            //      可急停：`ACCESS_STATS_ROLLUP=off` 时完全不跑 —— 万一首次回填
+            //      在低配机器上影响服务，运维可以先关掉它（面板会退回实时聚合口径，
+            //      数据仍完整，只是查询变慢）。
+            //      放在分区维护之后、逐行清理之前 —— 清理会删掉老数据，
+            //      汇总值一旦算好就不受清理影响（这正是汇总表的意义）。
+            match if stats_rollup_enabled() {
+                shared::database::access_v2::refresh_recent_stats(
+                    &shared::database::get_database().pool,
+                )
+                .await
+            } else {
+                Ok((0, 0))
+            } {
+                Ok((days, rows)) => event!(
+                    Level::INFO,
+                    "Access stats rollup refreshed: {days} day(s), {rows} row(s)"
+                ),
+                Err(e) => event!(Level::WARN, "Failed to refresh access stats rollup: {e}"),
+            }
+
+            // 2) 逐行清理（v1 表路径；v2 分区表上这条基本无事可做，
+            //    因为整周分区已被上一步直接 DROP 掉）。
             match shared::database::access::prune_access_logs().await {
                 Ok(0) => {}
                 Ok(n) => event!(Level::INFO, "Pruned {n} historical access log rows"),

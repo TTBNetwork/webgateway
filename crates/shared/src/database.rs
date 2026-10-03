@@ -4,7 +4,7 @@ use chrono::{DateTime, TimeDelta, Utc};
 use futures::{Stream, StreamExt};
 use sqlx::{
     Pool, Postgres, Row,
-    postgres::{PgListener, PgNotification, PgPoolOptions},
+    postgres::{PgConnection, PgListener, PgNotification, PgPoolOptions},
 };
 use tracing::{Level, event};
 
@@ -15,6 +15,7 @@ use crate::database::{
 };
 
 pub mod access;
+pub mod access_v2;
 pub mod certificate;
 pub mod configuration;
 pub mod dashboard_schema;
@@ -26,12 +27,39 @@ pub mod websites;
 pub mod locks {
     /// 所有 schema 初始化 DDL 共用的一把锁。
     pub const SCHEMA_INIT: i64 = 0x4143_434C_0000_0001;
-    /// 冷迁移（v1→v2）专用，当前尚未实现，先占位。
+    /// 冷迁移（v1→v2 访问日志分区表）专用：保证同一时刻只有一个实例在搬数据/切换。
     pub const MIGRATION: i64 = 0x4143_434C_0000_0002;
     /// 访问日志保留期清理专用：保证同一时刻只有一个实例在删历史数据。
     pub const RETENTION: i64 = 0x4143_434C_0000_0004;
     /// 分区维护专用，当前尚未实现，先占位。
     pub const PARTITION: i64 = 0x4143_434C_0000_0003;
+}
+
+/// 在一条**独占连接**上尝试获取会话级 advisory lock。
+///
+/// 返回 `Some(conn)` 表示拿到锁，`None` 表示别的实例正持有。
+/// 调用方必须把这条连接一直留着，并在结束时用 [`unlock_session`] 释放 ——
+/// 会话级锁与**连接**绑定，换一条连接去解锁会释放"那条连接自己的锁"
+/// （它根本没持有），真正的锁要等连接归还/关闭才释放（`RETENTION` 就踩过这个坑）。
+pub async fn try_lock_session(
+    pool: &Pool<Postgres>,
+    key: i64,
+) -> anyhow::Result<Option<sqlx::pool::PoolConnection<Postgres>>> {
+    let mut conn = pool.acquire().await?;
+    let locked: bool = sqlx::query_scalar("SELECT pg_try_advisory_lock($1)")
+        .bind(key)
+        .fetch_one(&mut *conn)
+        .await?;
+    Ok(if locked { Some(conn) } else { None })
+}
+
+/// 释放 [`try_lock_session`] 在**同一条连接**上取得的会话级 advisory lock。
+pub async fn unlock_session(conn: &mut PgConnection, key: i64) -> anyhow::Result<()> {
+    sqlx::query("SELECT pg_advisory_unlock($1)")
+        .bind(key)
+        .execute(conn)
+        .await?;
+    Ok(())
 }
 
 /// 服务启动时对 schema 的处理方式。
@@ -474,6 +502,18 @@ async fn inner_init_database_with(tx: &mut sqlx::Transaction<'_, Postgres>) -> a
     get_database().initialize_certificates(tx).await?;
     get_database().initialize_websites(tx).await?;
     get_database().initialize_access_logs(tx).await?;
+
+    // v2（按周 RANGE 分区的统计表）**结构**：建空的分区表 + 分区管理函数 + 预建未来两周。
+    // 这些都与表大小无关（建空表是元数据操作），因此可以放在启动路径上。
+    // 数据搬迁与读写切换**不在这里**：那是后台任务（`access_v2::copy_window` 等），
+    // 见 `gateway/src/migration.rs` —— 2026-10-02 的事故就是因为把重活放进了启动路径。
+    crate::database::access_v2::install_v2_schema(tx).await?;
+    // 全新库（逻辑名上既没有 v2 分区表、也没有老 v1 表）在这里把逻辑名直接交给 v2：
+    // 服务读写用的是逻辑名，`access_v2_*` 只是迁移期间的物理名。
+    // 老库不受影响 —— 逻辑名上有普通表时它会跳过，交由 `--activate-v2-keep-v1` 处理。
+    crate::database::access_v2::activate_fresh_v2(tx).await?;
+    // 面板加速用的日汇总表（建表与表大小无关，可以放启动路径）。
+    crate::database::access_v2::install_stats_schema(tx).await?;
 
     // 控制面的表（users / users_client_secrets / web_log）。
     // 放在共享迁移里，使 gateway 与 dashboard **谁先启动都得到同一份 schema** ——

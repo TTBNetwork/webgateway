@@ -42,6 +42,37 @@ async fn main() -> anyhow::Result<()> {
         event!(Level::INFO, "Migration finished, exiting");
         return Ok(());
     }
+
+    // 一次性运维命令：把访问日志切到 v2 分区表（**不搬数据**，v1 改名成
+    // `access_*_v1` 保留，不会被自动回收）。执行完即退出，不进服务循环。
+    //
+    // 为什么放在后端：后端本来就连数据库、也由 `DB_AUTO_MIGRATE=1` 负责结构迁移，
+    // 运维只需在**已经跑着的后端容器**里执行一条命令即可（`docker compose exec`），
+    // 不必给网关镜像也塞一份 CLI、也不必让两个容器共享 socket。
+    //
+    // 前提：**激活时不要有别的进程在写 v1** —— 换名是 `ALTER TABLE ... RENAME`，
+    // 对持有旧表引用的写入方不友好。因此调用方应先停掉网关：
+    //   docker compose stop gateway
+    //   docker compose exec dashboard-backend /opt/webgateway/dashboard --activate-v2-keep-v1
+    //   docker compose start gateway
+    if std::env::args().any(|a| a == "--activate-v2-keep-v1") {
+        let enabled = matches!(
+            std::env::var("ACCESS_LOG_V2_ACTIVATE").as_deref(),
+            Ok("1") | Ok("true") | Ok("TRUE") | Ok("True") | Ok("yes")
+        );
+        if !enabled {
+            // 与网关侧同一个开关语义：不加开关时拒绝执行，避免误触发结构切换。
+            eprintln!(
+                "拒绝执行：请显式设置 ACCESS_LOG_V2_ACTIVATE=1 再跑 `--activate-v2-keep-v1`\
+                 （结构切换不可逆，默认不执行）"
+            );
+            std::process::exit(2);
+        }
+        shared::database::access_v2::activate_v2_keeping_v1(&get_database().pool).await?;
+        println!("Access log v2 activated (v1 kept as *_v1), exiting");
+        return Ok(());
+    }
+
     // 表结构就绪后引导默认管理员账号。
     get_database().ensure_default_admin().await?;
 
