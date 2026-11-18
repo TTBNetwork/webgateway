@@ -1,0 +1,161 @@
+# CI（测试流程）：只做检查与构建验证，不产出发布物。
+#
+# 触发：任意分支 push、PR、手动触发。
+# 任务：
+#   - detect            探测仓库里存在哪些可构建目标
+#   - frontend-lint     oxlint + eslint + prettier --check
+#   - frontend-build    vue-tsc 类型检查 + vite build
+#   - rust-fmt          cargo fmt --check（workspace 落地后才运行）
+#   - rust-check        cargo clippy -D warnings + cargo test（workspace 落地后才运行）
+#   - ci-success        汇总任务结果，分支保护只需要盯这一个检查
+#
+# 约定：
+#   - Rust 任务依赖仓库根目录的 Cargo.toml。v2 目前尚未落地 Rust 代码，
+#     detect 会在缺失时把这些任务标记为 skipped；等 workspace 提交后自动生效，
+#     不需要再改这个 workflow。
+#   - 前端安装一律使用 --frozen-lockfile：dashboard/frontend/pnpm-lock.yaml
+#     与 package.json 不一致时直接失败，保证 CI 与本地依赖树一致。
+#   - 新增 job 时记得把它加入 ci-success 的 needs，否则它失败不会阻断合并。
+name: CI
+
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+  RUST_BACKTRACE: 1
+
+jobs:
+  detect:
+    name: Detect build targets
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    outputs:
+      rust: ${{ steps.rust.outputs.enabled }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Detect Rust workspace
+        id: rust
+        shell: bash
+        run: |
+          if [ -f Cargo.toml ]; then
+            echo "enabled=true" >> "$GITHUB_OUTPUT"
+            echo "Root Cargo.toml found; Rust jobs will run."
+          else
+            echo "enabled=false" >> "$GITHUB_OUTPUT"
+            echo "::notice title=Rust checks skipped::No root Cargo.toml yet, Rust jobs are skipped."
+          fi
+
+  rust-fmt:
+    name: Rust format
+    needs: detect
+    if: needs.detect.outputs.rust == 'true'
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Rust
+        uses: ./.github/actions/setup-rust
+
+      - name: Check formatting
+        run: cargo fmt --all -- --check
+
+  rust-check:
+    name: Rust clippy + tests
+    needs: detect
+    if: needs.detect.outputs.rust == 'true'
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Rust
+        uses: ./.github/actions/setup-rust
+
+      - name: Clippy
+        run: cargo clippy --workspace --all-targets --locked -- -D warnings
+
+      - name: Tests
+        run: cargo test --workspace --locked
+
+  frontend-lint:
+    name: Frontend lint + format
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    defaults:
+      run:
+        working-directory: dashboard/frontend
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js and pnpm
+        uses: ./.github/actions/setup-frontend
+
+      - name: Install dependencies
+        run: pnpm install --frozen-lockfile
+
+      - name: Lint
+        run: pnpm lint:check
+
+      - name: Check formatting
+        run: pnpm format:check
+
+  frontend-build:
+    name: Frontend build
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    defaults:
+      run:
+        working-directory: dashboard/frontend
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js and pnpm
+        uses: ./.github/actions/setup-frontend
+
+      - name: Install dependencies
+        run: pnpm install --frozen-lockfile
+
+      - name: Type-check and build
+        run: pnpm build
+
+  ci-success:
+    name: CI success
+    if: always()
+    needs:
+      - detect
+      - rust-fmt
+      - rust-check
+      - frontend-lint
+      - frontend-build
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: Check job results
+        shell: bash
+        env:
+          NEEDS: ${{ toJSON(needs) }}
+          FAILED: ${{ contains(needs.*.result, 'failure') || contains(needs.*.result, 'cancelled') }}
+        run: |
+          echo "$NEEDS"
+          if [ "$FAILED" = "true" ]; then
+            echo "::error::At least one CI job failed or was cancelled."
+            exit 1
+          fi
+          echo "All required CI jobs passed (skipped jobs are not applicable yet)."

@@ -1,0 +1,30 @@
+# 复用的前端环境准备：pnpm + Node.js + pnpm 依赖下载缓存。
+# 只负责装工具，不负责 pnpm install（由各 job 在 dashboard/frontend 下执行）。
+name: Setup frontend toolchain
+description: Install Node.js and pnpm, and configure the pnpm download cache.
+
+inputs:
+  node-version:
+    description: Node.js version; must satisfy the engines field of dashboard/frontend/package.json.
+    required: false
+    default: "24"
+  pnpm-version:
+    description: pnpm version; must match the version that generated dashboard/frontend/pnpm-lock.yaml.
+    required: false
+    default: "12.14.0"
+
+runs:
+  using: composite
+  steps:
+    # setup-node 的 pnpm 缓存需要先有 pnpm 在 PATH 上，所以顺序不能反过来。
+    - name: Install pnpm
+      uses: pnpm/action-setup@v4
+      with:
+        version: ${{ inputs.pnpm-version }}
+
+    - name: Setup Node.js
+      uses: actions/setup-node@v4
+      with:
+        node-version: ${{ inputs.node-version }}
+        cache: pnpm
+        cache-dependency-path: dashboard/frontend/pnpm-lock.yaml

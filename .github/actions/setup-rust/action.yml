@@ -1,0 +1,18 @@
+# 复用的 Rust 环境准备：工具链（含 rustfmt/clippy）+ cargo 构建缓存。
+# 具体工具链版本由仓库根目录的 rust-toolchain.toml 决定。
+name: Setup Rust
+description: Install the Rust toolchain with rustfmt/clippy and restore the cargo build cache.
+
+runs:
+  using: composite
+  steps:
+    - name: Install Rust toolchain
+      uses: dtolnay/rust-toolchain@stable
+      with:
+        components: rustfmt, clippy
+
+    - name: Restore cargo cache
+      uses: Swatinem/rust-cache@v2
+      with:
+        # 构建失败时也保存缓存，方便排查只有 CI 才会出现的编译错误。
+        cache-on-failure: true
