@@ -1,0 +1,35 @@
+FROM postgres:18-bookworm
+
+# ========== 步骤 1: 安装基础构建依赖 ==========
+RUN set -ex; \
+    apt-get update && \
+    apt-get install -y --no-install-recommends \
+        curl gnupg ca-certificates \
+        git gcc make \
+        patch \
+        libbson-dev libbson-1.0-0 \
+        postgresql-server-dev-18 && \
+    apt-get clean && \
+    rm -rf /var/lib/apt/lists/* && \
+    # 配置 Pigsty 仓库
+    curl -fsSL https://repo.pigsty.cc/key -o /tmp/pigsty-key && \
+    gpg --dearmor -o /etc/apt/keyrings/pigsty.gpg /tmp/pigsty-key && \
+    echo "deb [signed-by=/etc/apt/keyrings/pigsty.gpg] https://repo.pigsty.cc/apt/infra generic main" > /etc/apt/sources.list.d/pigsty-io.list && \
+    echo "deb [signed-by=/etc/apt/keyrings/pigsty.gpg] https://repo.pigsty.cc/apt/pgsql/bookworm bookworm main" >> /etc/apt/sources.list.d/pigsty-io.list && \
+    apt-get update && \
+    apt-get install -y --no-install-recommends \
+        postgresql-18-vchord \
+        postgresql-18-cron \
+        postgresql-18-pg-uint128 \
+        postgresql-18-pg-mooncake && \
+    apt-get purge -y --auto-remove curl gnupg patch && \
+    apt-get clean && \
+    rm -rf /var/lib/apt/lists/*
+
+# ========== 步骤 3: 设置健康检查 ==========
+HEALTHCHECK --interval=30s --timeout=10s --start-period=5s --retries=3 \
+    CMD pg_isready -U $POSTGRES_USER || exit 1
+
+EXPOSE 5432
+
+CMD ["postgres"]
