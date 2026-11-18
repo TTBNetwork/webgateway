@@ -1,0 +1,12 @@
+# Copy this file to config.toml (ignored by git) and adjust the values, or
+# provide the same settings through environment variables (environment wins).
+
+[database]
+url = "postgres://user:password@host:5432/webgateway_beta_v2"
+max_connections = 10
+connect_timeout_secs = 10
+init_lock_timeout_secs = 60
+wait_timeout_secs = 300
+
+[server]
+port = 3000
