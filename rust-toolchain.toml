@@ -1,0 +1,5 @@
+# 本地与 CI 使用同一个工具链，避免 rustfmt/clippy 版本差异导致格式判断不一致。
+[toolchain]
+channel = "stable"
+components = ["rustfmt", "clippy"]
+profile = "minimal"

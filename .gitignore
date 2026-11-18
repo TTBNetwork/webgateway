@@ -1,2 +1,5 @@
 .lh
 old_project/
+
+# Rust
+target/
