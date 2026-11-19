@@ -72,7 +72,7 @@
 | ID | Feature | 状态 | 说明 |
 |---|---|---|---|
 | F-39 | 网关单测 | ✅ | 34 个；fmt/clippy 全通过 |
-| F-40 | shared 测试 | ✅ | 12 单测 + 3 集成（临时库，含 stats 回填/分区回收） |
+| F-40 | shared 测试 | ✅ | 13 单测 + 3 集成（临时库，含 stats 回填/分区回收、schema v5） |
 | F-41 | 本地 E2E | ✅ | NOTIFY、headers、PROXY、路由、日志、统计、缓存、TLS、WS、CONNECT、h3、权重、TOTP/JWT；Nezha gRPC 与 MCSManager WS 联调；证书上传与 Let's Encrypt 真实签发 |
 
 ### 1.6 证书管理
@@ -309,7 +309,7 @@
 ## 5. 当前状态
 
 - 最新分支：feat/dashboard-rbac（叠加在 feat/certificates 之后）
-- 测试：网关 34、dashboard 8、shared 12 + 3 集成（含 stats 回填/分区回收）；前端 format/lint/type-check/build 通过
+- 测试：网关 34、dashboard 8、shared 13 + 3 集成（含 stats 回填/分区回收）；前端 format/lint/type-check/build 通过
 - 数据库：schema v5；2026-11-19 联调/统计/证书/CRUD 验证的临时数据已清理（websites/gateways/users/logs/stats = 0；测试证书已删除）
 - 管理面：站点/网关/用户 CRUD + admin/user/view RBAC + token_version 撤销；面板站点/用户编辑页完成
 - 证书：手动上传 + ACME（Let's Encrypt 实测签发；ZeroSSL 需 EAB）→ 网关 SNI 加载验证通过，见 `certificates.md`
