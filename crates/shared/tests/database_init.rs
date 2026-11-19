@@ -61,6 +61,11 @@ async fn master_init_unlocks_gateway_readiness() -> anyhow::Result<()> {
 
     // The master applies migrations.
     let master = Database::connect(&config).await?;
+    let master_timezone: String = sqlx::query_scalar("SHOW TimeZone")
+        .fetch_one(master.pool())
+        .await?;
+    assert_eq!(master_timezone, "UTC", "master sessions must run in UTC");
+
     master.initialize_master(&config).await?;
     master.verify_schema().await?;
 
@@ -97,6 +102,10 @@ async fn master_init_unlocks_gateway_readiness() -> anyhow::Result<()> {
         ..config.clone()
     })
     .await?;
+    let gateway_timezone: String = sqlx::query_scalar("SHOW TimeZone")
+        .fetch_one(gateway.pool())
+        .await?;
+    assert_eq!(gateway_timezone, "UTC", "gateway sessions must run in UTC");
     gateway.verify_schema().await?;
 
     master.pool().close().await;
