@@ -445,8 +445,11 @@ $fn$ LANGUAGE plpgsql;
 - 每个可更新表的 `updated_at` 触发器 `BEFORE UPDATE` 调用 `wg_update_updated_at()`。
 - 配置类表额外挂 `AFTER INSERT OR UPDATE` 的 `*_notify` 触发器，频道为 `<表名>_updater`：
   `configurations_updater`、`websites_updater`、`certificates_updater`、`dns_providers_updater`。
+- 迁移 0002 增加 `AFTER DELETE` 的 `*_notify_delete` 触发器（负载带 `operation: delete`），
+  删除配置时网关也能收到通知，不需要轮询。
 - 通知负载示例：`{"table":"websites","id":"...","key":"...","updated_at":"2026-11-18T..."}`。
-  网关后续按 `key` 增量拉取（当前同步策略在后续任务确定）。
+  网关收到通知后触发一次全量同步；LISTEN 连接（重）连时先比较 `(COUNT(*), MAX(updated_at))` 水位，
+  相同则跳过全量同步。
 - 触发器在迁移事务里 `DROP TRIGGER IF EXISTS` + `CREATE TRIGGER`，对其它会话原子可见。
 
 ### 5.2 访问日志分区函数
@@ -495,19 +498,19 @@ $fn$;
 
 ## 6. 迁移方案
 
-- 使用 **sqlx 迁移文件**（`crates/shared/migrations/0001_initial_schema.sql`），编译期通过
-  `sqlx::migrate!("./migrations")` 嵌入二进制；部署只需可执行文件，不依赖运行目录下的 SQL 文件。
+- 使用 **sqlx 迁移文件**（`crates/shared/migrations/0001_initial_schema.sql`、`0002_notify_deletes.sql`），
+  编译期通过 `sqlx::migrate!("./migrations")` 嵌入二进制；部署只需可执行文件，不依赖运行目录下的 SQL 文件。
 - 选择理由：
   1. 迁移有版本记录（`_sqlx_migrations`）与 checksum，历史清晰、不会重复执行；
   2. 每个迁移文件在独立事务中执行，PostgreSQL 的 DDL 事务性保证失败整体回滚；
   3. 主控独占迁移入口（只有 dashboard 二进制调用 `Migrator::run`），网关没有迁移代码路径。
-- 迁移文件一经部署**不再修改**（checksum 校验会失败，fail-closed）；schema 变更新增 `0002_*.sql`，
-  在文件末尾 `SELECT wg_mark_schema_version(2);`，代码中的「期望版本」取自内嵌迁移的最大版本号，自动跟上。
+- 迁移文件一经部署**不再修改**（checksum 校验会失败，fail-closed）；schema 变更新增 `0003_*.sql`，
+  在文件末尾 `SELECT wg_mark_schema_version(3);`，代码中的「期望版本」取自内嵌迁移的最大版本号，自动跟上。
 - 滚动升级注意：迁移应保持向后兼容（旧网关照常可读写），破坏性变更（删列/改类型）必须拆成多步迁移；
   建议先升级并等待主控迁移完成，再升级网关。
 - 扩展创建放在迁移事务内（实测 PostgreSQL 18.2 允许），失败随迁移整体回滚；扩展是**数据库级**对象，
   `CREATE EXTENSION IF NOT EXISTS` 幂等。
-- 第一版迁移内容顺序：
+- 0001 迁移内容顺序：
   1. `CREATE EXTENSION IF NOT EXISTS uint128;` + `CREATE EXTENSION IF NOT EXISTS btree_gin;`
   2. `schema_state` + 触发器函数 + `wg_mark_schema_version()`
   3. `configurations` + 触发器
@@ -518,6 +521,7 @@ $fn$;
   8. 四张访问日志分区表 + 分区函数 + `wg_ensure_upcoming_weeks(2)`
   9. `access_stats_daily` + 触发器
   10. `SELECT wg_mark_schema_version(1);`
+- 0002 迁移：`wg_notify_delete()` + 四张配置表的 `AFTER DELETE` 触发器 + `SELECT wg_mark_schema_version(2);`。
 - `verify_schema()`（主控迁移后、网关就绪后各跑一次，纯只读）：
   - `schema_state.version >= 期望版本`；
   - 必需表存在：`schema_state`、`configurations`、`users`、`users_client_secrets`、`web_log`、
@@ -611,8 +615,8 @@ pub async fn wait_for_master_schema(cfg: &DatabaseConfig) -> anyhow::Result<Data
 - **集成测试（设置 `DATABASE_URL` 才跑，否则自动跳过）**：
   1. 连接服务器，创建临时数据库 `webgateway_it_<随机>`（用完 `DROP DATABASE ... WITH (FORCE)`，beta 库不受影响）；
   2. 未初始化时网关等待：`wait_timeout_secs=2` 以 `timed out` 失败；
-  3. 主控 `initialize_master`：`schema_state.version = 1`，扩展 `uint128`/`btree_gin` 已安装，
-     `gateways` 表存在，四张日志表的周分区已预建；
+  3. 主控 `initialize_master`：`schema_state.version` 等于当前迁移最大版本（当前 2），
+     扩展 `uint128`/`btree_gin` 已安装，`gateways` 表存在，四张日志表的周分区已预建；
   4. 再次执行 `initialize_master`：幂等（sqlx 跳过已应用迁移）；
   5. 网关等待：立即成功并通过 `verify_schema`；
   6. 清理临时库。
@@ -624,12 +628,14 @@ pub async fn wait_for_master_schema(cfg: &DatabaseConfig) -> anyhow::Result<Data
 
 **已完成**：workspace（`shared` + `dashboard` + `gateway`）、完整 schema 迁移、主控迁移与就绪标记、
 `verify_schema`、dashboard `/health`、单元测试 + 集成测试（临时库）；
-网关二进制（等待就绪、`gateways` 上下线与心跳、站点/证书同步、HTTP/HTTPS 反向代理、节点 header）。
+网关二进制（等待就绪、`gateways` 上下线与心跳、HTTP/HTTPS 反向代理、站点级 headers、节点 header）；
+配置同步改为 LISTEN/NOTIFY（迁移 0002 覆盖 DELETE）+ 水位校验，已移除 10s 全量轮询。
 
 **下一步**：
 1. 访问日志写入与秒级/分钟级/日级汇总、保留期清理；
-2. 网关缓存（主控下发）与 IP/UA 拦截；
-3. 配置表的 LISTEN/NOTIFY 增量同步、CRUD/仓储层、REST API、认证、ACME、前端对接。
+2. 网关缓存（主控下发）、IP/UA 拦截；
+3. 网关后端协议扩展：WebSocket / gRPC / HTTP/3 / 特殊 RFC；
+4. CRUD/仓储层、REST API、认证、ACME、前端对接。
 
 ## 11. 决策记录（2026-11-18）
 
@@ -642,4 +648,9 @@ pub async fn wait_for_master_schema(cfg: &DatabaseConfig) -> anyhow::Result<Data
 - 迁移使用 sqlx 迁移文件，主控独占执行；网关无 DDL 路径。
 - 网关等待默认 300s（`DATABASE_WAIT_TIMEOUT=0` 表示无限），版本高于期望时 WARN 继续。
 - 主控连接失败即退出，不在主控内无限重试。
+- 配置同步改为 LISTEN/NOTIFY（迁移 0002 增加 DELETE 通知）+ 水位对比，不再每 10s 全量同步。
+- 代理请求头下沉到 `websites.config.headers`（set/remove + `$remote_addr`/`$scheme`/`$host` 占位符），
+  未配置时使用默认四个头；逐跳头始终剔除。
+- `X-WebGateway-Node` 格式为 `<country-city>-<fnv1a64(location+machine_id) 16 hex>`，例如 `cn-shanghai-18411588dcb04048`。
+- 网关后续支持 WebSocket / gRPC / HTTP/3 / 特殊 RFC（分阶段实现）。
 - 日志/错误输出使用英文（AGENT.md）。

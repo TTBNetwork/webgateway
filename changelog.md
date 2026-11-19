@@ -44,3 +44,13 @@
 - 单元测试 9 个；beta 库 E2E 验证 HTTP/HTTPS/404/在线/心跳/离线（测试数据已清理）。
 - 文档 `gateway.md`，`database.md` 更新实施状态。
 - 未实现（下一步）：访问日志与统计、缓存、IP/UA 拦截、WebSocket、上游 TLS。
+### 网关增强（分支 `feat/gateway-notify`）
+- 配置同步改为 LISTEN/NOTIFY：订阅 `websites_updater` / `certificates_updater`；
+  迁移 0002 增加配置表 DELETE 通知；监听连接（重）连时用 `(COUNT(*), MAX(updated_at))` 水位对比，
+  只有变化才全量同步；**移除 10s 全量轮询**。
+- 代理请求头下沉到 `websites.config.headers`（set/remove，占位符 `$remote_addr` / `$scheme` / `$host`）；
+  未配置时使用默认四个头，逐跳头始终剔除。
+- `X-WebGateway-Node` 改为 `<country-city>-<fnv1a64(location+machine_id) 16hex>`。
+- schema version 2（beta 库已由主控应用）；shared 迁移测试与网关单测更新。
+- E2E：NOTIFY 增/删 1s 内生效、站点 headers 回显验证、节点哈希；测试数据已清理。
+- WebSocket / gRPC / HTTP3 / 特殊 RFC 列为下一阶段（gateway.md 有拆分说明）。
