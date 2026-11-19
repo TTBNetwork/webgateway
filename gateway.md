@@ -1,7 +1,7 @@
 # WebGateway v2 网关（数据面）
 
 > 网关只读取数据库、不执行任何 DDL；主控初始化完成之前网关会等待。
-> 访问日志/统计、缓存、IP-UA 拦截、WebSocket/HTTP3 尚未实现，见文末。
+> 访问统计聚合、缓存、IP-UA 拦截、WebSocket/HTTP3 尚未实现，见文末。
 
 ## 1. 启动与生命周期
 
@@ -127,6 +127,17 @@ ports = [80, 443]
 - `X-WebGateway-Node` 格式：`<location>-<16 hex>`，例如 `cn-shanghai-18411588dcb04048`。
   `location` = country-city 的 ASCII 小写形式；hash = FNV-1a64(`location + machine_id`)。
 
+### 5.1 访问日志
+
+- 每个请求写 `access_request_logs` + `access_response_logs`；请求/响应字节数 > 0 时再写
+  `access_request_size_logs` / `access_response_size_logs`（按秒，`ON CONFLICT` 累加）。
+- 后台 writer 每 500ms（或满 256 条）批量写一个事务；所有时间取 PostgreSQL `now()`，与主控时钟一致。
+- 字段：Host、method、path、headers（JSON 对象）、HTTP 版本、客户端 IP（`get_request_ip` 解析后的）、
+  `website_id`、status、响应字节（Content-Length）。
+- 网关自己生成的 404/502/504 也会记录（body_length 为固定错误文本长度）。
+- 限制：正文长度取 Content-Length，chunked/未知请求为 0、响应为 NULL；writer 关闭时直接 abort，
+  最后一批可能丢；`access_stats_*` 的秒/分/日聚合与保留期尚未实现。
+
 ## 6. TLS
 
 - 证书来自 `certificates`（`fullchain` + `private_key` PEM），过期证书不加载。
@@ -141,12 +152,13 @@ ports = [80, 443]
 - 节点 header：`cn-shanghai-18411588dcb04048`。
 - PROXY protocol：无头 / v1 / v2 三种连接分别解析出 127.0.0.1 / 198.51.100.7 / 203.0.113.9，并写入上游头。
 - 路由：POST `/api/x?version=v2` + curl UA → upstream-one；version/method/UA 任一不匹配 → upstream-two；`/web` → upstream-two。
+- 访问日志：GET/POST/404 分别产生 request/response 行；POST 5 字节、响应 12/9 字节，size 表按秒记录。
 - HTTP 200、HTTPS HTTP/2 200、未知 Host 404、心跳更新、SIGTERM offline。
-- 网关单测 23 个；shared 迁移/单测、fmt、clippy 全通过。
+- 网关单测 26 个；shared 迁移/单测、fmt、clippy 全通过。
 
 ## 8. 尚未实现（下一步）
 
-- 访问日志写入（四张周分区表）、秒/分/日聚合与保留期。
+- 访问统计聚合（`access_stats_second/minute/daily`）与保留期清理。
 - 网关缓存（主控下发：大小、文件类型、ETag、TTL 等，细节待定）。
 - IP / User-Agent 拦截（优先级低）。
 - 上游传输扩展：

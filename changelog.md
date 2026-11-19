@@ -67,3 +67,9 @@
   不套 60s 超时。
 - E2E：POST `/api/x?version=v2` + curl UA → upstream-one；version/method/UA 不匹配或 `/web` → upstream-two。
 - 单测 23 个；文档更新。WebSocket/HTTP3/特殊 RFC、访问日志/缓存/IP-UA 拦截仍待做。
+### 网关访问日志（分支 `feat/gateway-access-logs`）
+- 新增 `gateway/src/access.rs`：请求/响应/秒级 size 四张表写入；500ms 或 256 条批量事务；时间取 DB `now()`。
+- proxy 覆盖 200/404/502/504 路径，记录 headers JSON、客户端 IP、website_id、status、Content-Length。
+- E2E：GET/POST/404 产生 request/response 行；POST 5 字节、响应 12/9 字节，size 表按秒写入。
+- 限制：chunked 长度为 0/NULL；writer 退出时最后一批可能丢；`access_stats_*` 聚合与保留期未做。
+- 网关单测 26 个；文档更新。
