@@ -92,3 +92,10 @@
 - 原始访问日志保留 7 天，主控每小时清理；聚合秒表保留 1 小时、分钟表保留 1 天、日表长期。
 - E2E：最近日志秒级 30/150 字节；旧秒归并分钟 70/700；旧分归并日 90/900。
 - 说明：`total_ips` 为每秒去重后求和；`backend_error_requests` 以 502/504 计。
+### 网关缓存（分支 `feat/gateway-cache`）
+- 站点级 `websites.config.cache`：`enabled` / `ttl` / `content_types` / `max_entry_size`。
+- 64 MiB 内存 LRU；仅缓存 GET + 200 + 无 Set-Cookie/Vary/no-store|private|no-cache 的响应；
+  请求带 Authorization/Cookie 时跳过。
+- 命中 `X-WebGateway-Cache: HIT` + `Age`；未命中 `MISS`；ETag/If-None-Match → 304。
+- 配置同步（NOTIFY）时清空缓存；E2E：MISS count=1 → HIT count=1 → 304 → 配置更新后 MISS count=2。
+- 网关单测 32 个；限制：无持久化、HEAD/POST 不缓存、不支持 stale-while-revalidate/Vary。

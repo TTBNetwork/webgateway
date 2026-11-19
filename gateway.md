@@ -1,7 +1,7 @@
 # WebGateway v2 网关（数据面）
 
 > 网关只读取数据库、不执行任何 DDL；主控初始化完成之前网关会等待。
-> 缓存、IP-UA 拦截尚未实现，见文末。
+> IP-UA 拦截尚未实现，见文末。
 
 ## 1. 启动与生命周期
 
@@ -162,6 +162,31 @@ http3_ports = [443]
 - 限制：无流式请求/响应（大 body 占内存）；同一 QUIC 连接内请求串行处理；
   WebSocket / gRPC over h3 未实现；未调 0-RTT / 连接迁移。
 
+### 5.4 缓存
+
+站点通过 `websites.config.cache` 开启：
+
+```json
+{
+  "cache": {
+    "enabled": true,
+    "ttl": 60,
+    "content_types": ["text/css", "image/"],
+    "max_entry_size": 1048576
+  }
+}
+```
+
+- 仅缓存 GET + 200 + 无 `Set-Cookie` / `Vary` / `Cache-Control: no-store|private|no-cache` 的响应；
+  请求带 `Authorization` 或 `Cookie` 时跳过缓存。
+- `content_types` 为空表示所有类型；匹配忽略大小写，`image/` 这类以 `/` 结尾的按前缀匹配。
+- TTL 取站点 `ttl` 与上游 `s-maxage` / `max-age` 的较小值。
+- 全局内存上限 64 MiB，LRU 淘汰；单条上限 `max_entry_size`；重启后缓存清空。
+- 命中：`X-WebGateway-Cache: HIT` + `Age`；未命中：`MISS`；`If-None-Match` 命中返回 304；
+  上游无 ETag 时生成弱 ETag。
+- 配置同步（NOTIFY）时清空缓存。
+- 限制：不缓存 HEAD/POST、不支持 `stale-while-revalidate`、不区分 Vary 维度、无持久化/多级缓存。
+
 ## 6. TLS
 
 - 证书来自 `certificates`（`fullchain` + `private_key` PEM），过期证书不加载。
@@ -182,12 +207,13 @@ http3_ports = [443]
 - CONNECT：`CONNECT localhost:9500` 返回 200，`ping-through-connect` 原样回显。
 - HTTP/3：aioquic 客户端 GET `/h3` → 200，body `http3-upstream-ok`；访问日志 `HTTP/3.0`。
 - 统计：3 条合成日志 → 秒级 30/150 字节；旧秒归并分钟 70/700；旧分归并日 90/900。
+- 缓存：MISS count=1 → HIT count=1 → 304 → 配置更新后 MISS count=2。
 - HTTP 200、HTTPS HTTP/2 200、未知 Host 404、心跳更新、SIGTERM offline。
-- 网关单测 28 个；shared 迁移/单测、fmt、clippy 全通过。
+- 网关单测 32 个；shared 迁移/单测、fmt、clippy 全通过。
 
 ## 8. 尚未实现（下一步）
 
-- 网关缓存（主控下发：大小、文件类型、ETag、TTL 等，细节待定）。
+- 缓存增强：持久化/多级缓存、stale-while-revalidate、Vary 维度、命中率指标。
 - IP / User-Agent 拦截（优先级低）。
 - 上游传输扩展：
   - HTTP/3 流式请求/响应、同连接并发多请求、0-RTT / 连接迁移调优；
