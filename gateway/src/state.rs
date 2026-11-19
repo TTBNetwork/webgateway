@@ -14,9 +14,11 @@ use hyper::body::Incoming;
 use hyper_util::client::legacy::Client;
 use hyper_util::client::legacy::connect::HttpConnector;
 use rustls::sign::CertifiedKey;
+use tokio::sync::mpsc;
 use tokio_rustls::TlsAcceptor;
 use url::Url;
 
+use crate::access::AccessEvent;
 use crate::node::NodeInfo;
 
 pub type UpstreamClient = Client<HttpConnector, Incoming>;
@@ -28,11 +30,16 @@ pub struct AppState {
     pub client: UpstreamClient,
     /// HTTP/2-only client used for gRPC backends (h2c).
     pub grpc_client: UpstreamClient,
+    pub logs: mpsc::Sender<AccessEvent>,
     pub node: NodeInfo,
 }
 
 impl AppState {
-    pub fn new(node: NodeInfo, certs: Arc<RwLock<Arc<CertStore>>>) -> anyhow::Result<Self> {
+    pub fn new(
+        node: NodeInfo,
+        certs: Arc<RwLock<Arc<CertStore>>>,
+        logs: mpsc::Sender<AccessEvent>,
+    ) -> anyhow::Result<Self> {
         let tls_acceptor = crate::tls::acceptor(certs.clone())?;
         let client =
             Client::builder(hyper_util::rt::TokioExecutor::new()).build(HttpConnector::new());
@@ -47,6 +54,7 @@ impl AppState {
             tls_acceptor,
             client,
             grpc_client,
+            logs,
             node,
         })
     }

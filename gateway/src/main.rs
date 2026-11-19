@@ -3,6 +3,7 @@
 //! The gateway waits for the master to initialize the database schema, marks
 //! itself online, then serves HTTP/HTTPS traffic from the websites it loads.
 
+mod access;
 mod config;
 mod listeners;
 mod node;
@@ -66,7 +67,8 @@ async fn run() -> anyhow::Result<()> {
         Vec::new(),
         default_cert,
     ))));
-    let state = Arc::new(AppState::new(node.clone(), certs)?);
+    let (log_sender, log_writer) = access::spawn(database.clone());
+    let state = Arc::new(AppState::new(node.clone(), certs, log_sender)?);
 
     let bind: IpAddr = config
         .server
@@ -132,6 +134,7 @@ async fn run() -> anyhow::Result<()> {
     notification_task.abort();
     heartbeat.abort();
     listeners.abort_all();
+    log_writer.abort();
     node.mark_offline(&database).await?;
     database.pool().close().await;
 

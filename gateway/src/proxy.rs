@@ -44,6 +44,18 @@ pub async fn handle(
         .and_then(|value| value.to_str().ok())
         .map(str::to_string);
     let grpc = is_grpc(request.headers());
+    let request_version = request.version();
+    let mut request_log = crate::access::RequestLog {
+        id: crate::access::next_id(),
+        host: raw_host.clone(),
+        method: method_label.clone(),
+        path: path.clone(),
+        headers: crate::access::headers_json(request.headers()),
+        http_version: crate::access::version_label(request_version),
+        remote_addr: peer.ip().to_string(),
+        body_length: crate::access::content_length(request.headers()),
+        website_id: None,
+    };
 
     let Some(site) = state
         .routing
@@ -51,12 +63,22 @@ pub async fn handle(
         .expect("routing lock poisoned")
         .lookup(&raw_host)
     else {
+        log_event(
+            &state,
+            &request_log,
+            StatusCode::NOT_FOUND,
+            &HeaderMap::new(),
+            Some(9),
+            request_version,
+        );
         return text_response(StatusCode::NOT_FOUND, "Not Found", &state);
     };
 
     let client_ip = site
         .client_ip
         .resolve(peer, proxy_source, request.headers());
+    request_log.remote_addr = client_ip.to_string();
+    request_log.website_id = Some(site.id.clone());
 
     let match_context = crate::state::MatchContext {
         path: &path,
@@ -65,6 +87,14 @@ pub async fn handle(
         user_agent: user_agent.as_deref(),
     };
     let Some(backend) = site.next_backend(&match_context) else {
+        log_event(
+            &state,
+            &request_log,
+            StatusCode::BAD_GATEWAY,
+            &HeaderMap::new(),
+            Some(11),
+            request_version,
+        );
         return text_response(StatusCode::BAD_GATEWAY, "Bad Gateway", &state);
     };
 
@@ -72,6 +102,14 @@ pub async fn handle(
         Ok(uri) => uri,
         Err(error) => {
             event!(Level::ERROR, %error, "failed to build the upstream uri");
+            log_event(
+                &state,
+                &request_log,
+                StatusCode::BAD_GATEWAY,
+                &HeaderMap::new(),
+                Some(11),
+                request_version,
+            );
             return text_response(StatusCode::BAD_GATEWAY, "Bad Gateway", &state);
         }
     };
@@ -108,6 +146,14 @@ pub async fn handle(
         Ok(request) => request,
         Err(error) => {
             event!(Level::ERROR, %error, "failed to build the upstream request");
+            log_event(
+                &state,
+                &request_log,
+                StatusCode::BAD_GATEWAY,
+                &HeaderMap::new(),
+                Some(11),
+                request_version,
+            );
             return text_response(StatusCode::BAD_GATEWAY, "Bad Gateway", &state);
         }
     };
@@ -119,6 +165,14 @@ pub async fn handle(
             Ok(response) => response,
             Err(error) => {
                 event!(Level::WARN, %error, "gRPC upstream request failed");
+                log_event(
+                    &state,
+                    &request_log,
+                    StatusCode::BAD_GATEWAY,
+                    &HeaderMap::new(),
+                    Some(11),
+                    request_version,
+                );
                 return text_response(StatusCode::BAD_GATEWAY, "Bad Gateway", &state);
             }
         }
@@ -132,10 +186,26 @@ pub async fn handle(
             Ok(Ok(response)) => response,
             Ok(Err(error)) => {
                 event!(Level::WARN, %error, "upstream request failed");
+                log_event(
+                    &state,
+                    &request_log,
+                    StatusCode::BAD_GATEWAY,
+                    &HeaderMap::new(),
+                    Some(11),
+                    request_version,
+                );
                 return text_response(StatusCode::BAD_GATEWAY, "Bad Gateway", &state);
             }
             Err(_) => {
                 event!(Level::WARN, "upstream request timed out");
+                log_event(
+                    &state,
+                    &request_log,
+                    StatusCode::GATEWAY_TIMEOUT,
+                    &HeaderMap::new(),
+                    Some(15),
+                    request_version,
+                );
                 return text_response(StatusCode::GATEWAY_TIMEOUT, "Gateway Timeout", &state);
             }
         }
@@ -143,6 +213,18 @@ pub async fn handle(
 
     let status = upstream_response.status();
     let version = upstream_response.version();
+    let response_length = upstream_response
+        .headers()
+        .get(header::CONTENT_LENGTH)
+        .map(|_| crate::access::content_length(upstream_response.headers()));
+    log_event(
+        &state,
+        &request_log,
+        status,
+        upstream_response.headers(),
+        response_length,
+        version,
+    );
 
     let mut headers = upstream_response.headers().clone();
     remove_hop_by_hop(&mut headers);
@@ -161,6 +243,33 @@ pub async fn handle(
     *response.version_mut() = version;
     *response.headers_mut() = headers;
     response
+}
+
+fn log_event(
+    state: &AppState,
+    request: &crate::access::RequestLog,
+    status: StatusCode,
+    headers: &HeaderMap,
+    body_length: Option<u64>,
+    version: http::Version,
+) {
+    let response = crate::access::ResponseLog {
+        id: request.id.clone(),
+        status: status.as_u16(),
+        headers: crate::access::headers_json(headers),
+        http_version: crate::access::version_label(version),
+        body_length,
+        website_id: request.website_id.clone(),
+    };
+
+    let event = crate::access::AccessEvent {
+        request: request.clone(),
+        response,
+    };
+
+    if let Err(error) = state.logs.try_send(event) {
+        tracing::debug!(%error, "dropping access log event");
+    }
 }
 
 fn is_grpc(headers: &HeaderMap) -> bool {
