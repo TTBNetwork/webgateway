@@ -131,6 +131,10 @@ pub struct Backend {
     /// Legacy prefix match. Kept for compatibility with existing rows.
     pub match_path: Option<String>,
     pub rules: MatchRules,
+    /// Relative share inside the active priority group (minimum 1).
+    pub weight: u32,
+    /// Lower values are preferred; higher values form standby groups.
+    pub priority: u32,
 }
 
 /// Per-backend routing rules; all configured conditions must match.
@@ -446,8 +450,36 @@ impl Site {
             return None;
         }
 
-        let index = self.selector.fetch_add(1, Ordering::Relaxed) % candidates.len();
-        Some(candidates[index])
+        // Prefer the lowest priority group (primary); higher values are standby.
+        let priority = candidates
+            .iter()
+            .map(|backend| backend.priority)
+            .min()
+            .unwrap_or(0);
+        let primary: Vec<&Backend> = candidates
+            .into_iter()
+            .filter(|backend| backend.priority == priority)
+            .collect();
+        let total_weight: u64 = primary
+            .iter()
+            .map(|backend| u64::from(backend.weight.max(1)))
+            .sum();
+        if total_weight == 0 {
+            return primary.first().copied();
+        }
+
+        let mut index = self.selector.fetch_add(1, Ordering::Relaxed) as u64 % total_weight;
+        let mut selected = primary[0];
+        for backend in &primary {
+            let weight = u64::from(backend.weight.max(1));
+            if index < weight {
+                selected = backend;
+                break;
+            }
+            index -= weight;
+        }
+
+        Some(selected)
     }
 }
 
@@ -607,6 +639,8 @@ mod tests {
             url: Url::parse(url).unwrap(),
             match_path: match_path.map(str::to_string),
             rules: MatchRules::default(),
+            weight: 1,
+            priority: 0,
         }
     }
 
@@ -711,6 +745,36 @@ mod tests {
     }
 
     #[test]
+    fn weights_and_priority_select_backends() {
+        let backend = |port: u16, weight: u32, priority: u32| Backend {
+            url: Url::parse(&format!("http://127.0.0.1:{port}")).unwrap(),
+            match_path: None,
+            rules: MatchRules::default(),
+            weight,
+            priority,
+        };
+
+        let site = site(
+            &["example.com"],
+            vec![
+                backend(9001, 3, 0),
+                backend(9002, 1, 0),
+                backend(9003, 1, 1),
+            ],
+        );
+
+        let mut counts = HashMap::new();
+        for _ in 0..40 {
+            let selected = site.next_backend(&context("/")).unwrap();
+            *counts.entry(selected.url.port()).or_insert(0) += 1;
+        }
+
+        assert_eq!(counts.get(&Some(9001)), Some(&30));
+        assert_eq!(counts.get(&Some(9002)), Some(&10));
+        assert!(!counts.contains_key(&Some(9003)));
+    }
+
+    #[test]
     fn glob_matcher_supports_wildcards() {
         assert!(glob_match("/api/*", "/api/v1/users"));
         assert!(glob_match("*mobile*", "mozilla mobile safari"));
@@ -733,6 +797,8 @@ mod tests {
                     url: Url::parse("http://127.0.0.1:9001").unwrap(),
                     match_path: None,
                     rules: api_rules,
+                    weight: 1,
+                    priority: 0,
                 },
                 backend("http://127.0.0.1:9002", None),
             ],

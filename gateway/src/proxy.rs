@@ -813,6 +813,8 @@ mod tests {
             url: url::Url::parse(url).unwrap(),
             match_path: None,
             rules: crate::state::MatchRules::default(),
+            weight: 1,
+            priority: 0,
         }
     }
 

@@ -32,6 +32,14 @@ struct BackendRow {
     match_path: Option<String>,
     #[serde(default, rename = "match")]
     rules: MatchRules,
+    #[serde(default = "default_weight")]
+    weight: u32,
+    #[serde(default)]
+    priority: u32,
+}
+
+fn default_weight() -> u32 {
+    1
 }
 
 #[derive(Debug, serde::Deserialize, Default)]
@@ -146,6 +154,8 @@ pub async fn sync_once(
                         url,
                         match_path: spec.match_path,
                         rules: spec.rules,
+                        weight: spec.weight.max(1),
+                        priority: spec.priority,
                     });
                 }
                 Ok(url) => {
