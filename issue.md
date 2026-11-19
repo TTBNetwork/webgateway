@@ -60,7 +60,7 @@
 
 | ID | Feature | 状态 | 说明 |
 |---|---|---|---|
-| F-33 | 只读 API | ✅ | /api/summary、websites、certificates、gateways、logs |
+| F-33 | 面板 API | ✅ | /api/summary、websites、certificates、gateways、logs；证书已有上传/签发/删除写接口 |
 | F-34 | API 鉴权 | ⚠️ | 用户名 + TOTP → 每用户 JWT；DASHBOARD_API_TOKEN 作为服务令牌；无 RBAC 细分/撤销 |
 | F-35 | Vue 3 面板 | ✅ | 登录、概览、站点、证书、网关、日志、设置 |
 | F-36 | 视觉 / 交互 | ✅ | 深/浅色、中/英、响应式侧栏、统计卡片、SVG 流量图 |
@@ -71,9 +71,17 @@
 
 | ID | Feature | 状态 | 说明 |
 |---|---|---|---|
-| F-39 | 网关单测 | ✅ | 33 个；fmt/clippy 全通过 |
-| F-40 | shared 测试 | ✅ | 10 单测 + 2 集成（临时库） |
-| F-41 | 本地 E2E | ✅ | NOTIFY、headers、PROXY、路由、日志、统计、缓存、TLS、WS、CONNECT、h3、权重、TOTP/JWT；Nezha gRPC 与 MCSManager WS 真实软件联调 |
+| F-39 | 网关单测 | ✅ | 34 个；fmt/clippy 全通过 |
+| F-40 | shared 测试 | ✅ | 12 单测 + 3 集成（临时库，含 stats 回填/分区回收） |
+| F-41 | 本地 E2E | ✅ | NOTIFY、headers、PROXY、路由、日志、统计、缓存、TLS、WS、CONNECT、h3、权重、TOTP/JWT；Nezha gRPC 与 MCSManager WS 联调；证书上传与 Let's Encrypt 真实签发 |
+
+### 1.6 证书管理
+
+| ID | Feature | 状态 | 说明 |
+|---|---|---|---|
+| F-42 | 证书手动上传 | ✅ | POST /api/certificates；SAN/私钥校验、到期时间解析；入库后网关 NOTIFY 加载 |
+| F-43 | ACME 自动签发/续期 | ✅ | ZeroSSL（EAB 优先）→ Let's Encrypt；DNS-01 腾讯云 DNSPod；账户 key 持久化、10 分钟租约、到期前 30 天续期；实测 LE 签发成功 |
+| F-44 | 证书面板 | ✅ | 自动/手动添加、重新签发、删除、状态/错误展示 |
 
 ---
 
@@ -89,7 +97,8 @@
 | P-06 | 访问日志 | body_length 取 Content-Length；chunked 请求 0、响应 NULL；WS/CONNECT 0；headers 重复键被覆盖；writer 退出丢最后一批 |
 | P-07 | 统计 | total_ips 跨秒重复；sizes 依赖日志 Content-Length；保留期（7 天）仍硬编码；整周过期分区已 DROP，边界分区仍逐行 DELETE |
 | P-08 | 上游 TLS | 只信 webpki + ca_file，不读系统 native roots；无 mTLS/SNI 覆盖 |
-| P-09 | 面板 | 只读；TOTP/JWT 登录，但无 RBAC 细分/刷新/撤销；JWT 存 localStorage；无服务端分页；无静态托管；无前端测试 |
+| P-09 | 面板 | 站点/网关/用户仍只读；证书可上传/签发/删除；TOTP/JWT 登录但无 RBAC 细分/刷新/撤销；JWT 存 localStorage；无服务端分页；无静态托管；无前端测试 |
+| P-13 | 证书 | 仅腾讯云 DNS-01；一张证书只能一个 DNS zone；ZeroSSL 必须配置 EAB；通配符未实测；ACME account key 明文入库；证书接口未按角色细分 |
 | P-10 | 负载均衡 | priority 为静态备用组；无健康检查/失败自动切换 |
 | P-11 | 管理面 | 无 CRUD、ACME/DNS、审计；有登录但无用户管理/RBAC 细分 |
 | P-12 | 可观测性 | 无 /metrics、无 tracing 导出；面板仅有基础统计 |
@@ -100,9 +109,8 @@
 
 ### 3.1 管理面 / 安全
 
-- U-01 站点/证书/网关/用户 CRUD API（当前只读）
+- U-01 站点/网关/用户 CRUD API（证书上传/签发/删除已完成）
 - U-02 用户管理、RBAC、JWT 刷新/撤销、API Key 管理
-- U-03 ACME 自动签发/续期、DNS provider 集成
 - U-04 面板静态托管 / SPA fallback / nginx 配置
 - U-05 审计日志、操作记录、配置回滚
 - U-06 IP / User-Agent 拦截（按用户要求暂缓）
@@ -132,7 +140,7 @@
 
 ### 3.4 前端
 
-- U-25 站点/证书 CRUD 表单与校验
+- U-25 站点 CRUD 表单与校验（证书表单已完成）
 - U-26 服务端分页、排序、高级筛选
 - U-27 用户/角色管理页面
 - U-28 图表时间范围选择、导出
@@ -302,16 +310,17 @@
 
 ## 5. 当前状态
 
-- 最新分支：fix/gateway-websocket-tls（叠加在 feat/stats-maintenance 之后）
-- 测试：网关 34、dashboard 2、shared 11 + 3 集成（含 stats 回填/分区回收）；前端 format/lint/build 通过
-- 数据库：schema v3；2026-11-19 联调与统计验证的临时数据已全部清理（websites/gateways/users/logs/stats = 0）
+- 最新分支：feat/certificates（叠加在 fix/gateway-websocket-tls 之后）
+- 测试：网关 34、dashboard 5、shared 12 + 3 集成（含 stats 回填/分区回收）；前端 format/lint/build 通过
+- 数据库：schema v4；2026-11-19 联调/统计/证书验证的临时数据已清理（websites/gateways/users/logs/stats = 0；测试证书已删除）
+- 证书：手动上传 + ACME（Let's Encrypt 实测签发；ZeroSSL 需 EAB）→ 网关 SNI 加载验证通过，见 `certificates.md`
 - 实时协议：Nezha gRPC（h2c/TLS/双向流）与 MCSManager WS（101/鉴权/长连接）已用真实软件验证，见 `e2e-realtime.md`
 - 面板：TOTP + JWT 登录；默认缓存 16 MiB（可配）；Vite 代理 /api → 127.0.0.1:3000
 
 ## 6. 建议优先级
 
 1. ~~B-01 / B-02：分区续建 + 统计补算（P0）~~ ✅
-2. 面板 CRUD + 用户管理/RBAC/JWT 撤销（U-01/U-02）
+2. 面板 CRUD + 用户管理/RBAC/JWT 撤销（U-01/U-02）；证书管理已完成，剩余站点/网关/用户 CRUD
 3. ~~B-03~~ ✅ / B-04 / B-05 / B-06：h3 限制、优雅停机、日志可靠性
 4. U-11/U-13：h3 流式/Alt-Svc、h2 extended CONNECT
 5. U-17/U-19/U-23：健康检查、metrics、缓存持久化

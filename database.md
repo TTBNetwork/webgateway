@@ -269,10 +269,14 @@ FROM users;
 | `dns_provider_id` | `TEXT` | `REFERENCES dns_providers(id) ON DELETE SET NULL` | 自动申请使用 |
 | `email` | `TEXT` | | ACME 邮箱 |
 | `expires_at` | `TIMESTAMPTZ` | | 供续签扫描 |
-| `signing_started_at` | `TIMESTAMPTZ` | | 跨进程签发认领标记 |
+| `signing_started_at` | `TIMESTAMPTZ` | | 跨进程签发认领标记（10 分钟租约） |
+| `auto_renew` | `BOOLEAN` | NOT NULL `DEFAULT FALSE` | 自动签发/续期（迁移 0004） |
+| `dns_zone` | `TEXT` | | DNS-01 父区域（迁移 0004） |
+| `last_error` | `TEXT` | | 最近一次签发失败原因（迁移 0004） |
 | `created_at` / `updated_at` | `TIMESTAMPTZ` | NOT NULL `DEFAULT now()` | |
 
-- 索引：`(expires_at)`（续签扫描）、`(dns_provider_id)`、`(created_at DESC)`。
+- 索引：`(expires_at)`（续签扫描）、`(dns_provider_id)`、`(created_at DESC)`、
+  partial `(expires_at NULLS FIRST) WHERE auto_renew`（迁移 0004）。
 - 触发器：`certificates_updated_at`、`certificates_notify`。
 
 #### websites
@@ -542,12 +546,15 @@ $fn$;
 - 0002 迁移：`wg_notify_delete()` + 四张配置表的 `AFTER DELETE` 触发器 + `SELECT wg_mark_schema_version(2);`。
 - 0003 迁移：`stats_state` 单行水位表 + `updated_at` 触发器、`wg_drop_expired_weekly_partitions()`、
   `wg_ensure_upcoming_weeks(3)` + `SELECT wg_mark_schema_version(3);`。
+- 0004 迁移：`certificates.auto_renew` / `dns_zone` / `last_error` + 续期 partial index
+  + `SELECT wg_mark_schema_version(4);`（证书签发/上传见 `certificates.md`）。
 - `verify_schema()`（主控迁移后、网关就绪后各跑一次，纯只读）：
   - `schema_state.version >= 期望版本`；
   - 必需表存在：`schema_state`、`configurations`、`users`、`users_client_secrets`、`web_log`、
     `dns_providers`、`certificates`、`websites`、四张访问日志表、`access_stats_daily`、`stats_state`；
   - 必需扩展已安装：`SELECT extname FROM pg_extension WHERE extname IN ('uint128','btree_gin')` 返回 2 行；
-  - 关键列存在：`users.role`、`certificates.signing_started_at`、`access_request_logs.remote_addr`。
+  - 关键列存在：`users.role`、`certificates.signing_started_at`、`certificates.auto_renew`、
+    `certificates.dns_zone`、`certificates.last_error`、`access_request_logs.remote_addr`。
 
 ## 7. 配置项
 
@@ -636,7 +643,7 @@ pub async fn wait_for_master_schema(cfg: &DatabaseConfig) -> anyhow::Result<Data
 - **集成测试（设置 `DATABASE_URL` 才跑，否则自动跳过）**：
   1. 连接服务器，创建临时数据库 `webgateway_it_<随机>`（用完 `DROP DATABASE ... WITH (FORCE)`，beta 库不受影响）；
   2. 未初始化时网关等待：`wait_timeout_secs=2` 以 `timed out` 失败；
-  3. 主控 `initialize_master`：`schema_state.version` 等于当前迁移最大版本（当前 3），
+  3. 主控 `initialize_master`：`schema_state.version` 等于当前迁移最大版本（当前 4），
      扩展 `uint128`/`btree_gin` 已安装，`gateways` 表存在，四张日志表的周分区已预建；
   4. 再次执行 `initialize_master`：幂等（sqlx 跳过已应用迁移）；
   5. 网关等待：立即成功并通过 `verify_schema`；

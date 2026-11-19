@@ -179,3 +179,33 @@
   - wss + 后端 `/mc` base path：客户端 `/socket.io/...` 映射到上游 `/mc/socket.io/...`，PASS。
 - 注意：rustls 拒绝 `CA:TRUE` 自签证书作为服务端 leaf（`CaUsedAsEndEntity`），测试证书需由 CA 签发。
 - 文档：`gateway.md` 3/5.2/7/8、`e2e-realtime.md`、`issue.md`（B-03 已修复，P-03/U-14 更新）。
+
+### 主控证书管理（分支 `feat/certificates`）
+- 迁移 0004 `certificate_issuance.sql`：`certificates.auto_renew` / `dns_zone` / `last_error`，
+  续期 partial index；schema version → **4**。
+- 新增 `dashboard/backend/src/certificate.rs`：
+  - 手动上传：解析 PEM 证书（SAN、notAfter）与私钥，校验 hostname/SAN 覆盖后入库；
+  - ACME：每 60s 调度，`signing_started_at` 10 分钟租约 + `FOR UPDATE SKIP LOCKED`；
+    到期前 30 天自动续期；ZeroSSL（配置 EAB 时优先）→ Let's Encrypt；DNS-01 腾讯云 DNSPod；
+    ACME account key 按 CA 持久化到 `configurations`；失败写 `last_error`，约 10 分钟后重试；
+  - API：`POST /api/certificates`（上传）、`POST /api/certificates/issue`、
+    `POST /api/certificates/{id}/issue`、`DELETE /api/certificates/{id}`、
+    `GET/POST/DELETE /api/dns-providers`（不回显密钥）。
+- 面板：证书页新增自动签发 / 手动上传表单、重新签发、删除、pending/error 展示；i18n 中英。
+- 凭据：`scripts/source-dnsprovider.sh` 解析 `.secrets/dnsprovider` 的 `NAME = value`
+  （空格/引号/export 都支持），`scripts/run-dashboard.sh` 直接启动主控；`.secrets/` 已加入
+  .gitignore，值从不打印。支持 `TENCENT_KEY/TENCENT_SECRET` 等别名；ZeroSSL EAB、ACME_EMAIL、
+  HTTPS_PROXY、ACME_DNS_PROPAGATION_SECS 均可通过环境变量配置。
+- 新增 `vendor/acmex`（0.8.0，MIT OR Apache-2.0），修复上游在真实 CA 上不可用的问题：
+  去掉 FIPS feature、JWS JSON 序列化、ES256/EC P-256 账户 key、ECDSA DER→raw、
+  newAccount 响应解析、POST-as-GET 空 payload、CSR 空 subject、EAB、DNS-01 按 identifier
+  生成 TXT、传播等待与失败清理。
+- 实测（beta 库，测试域名 `cert-test2.atxa.top`）：
+  - 手动上传证书 → DB → 网关 SNI 返回上传的 CN/SAN；
+  - Let's Encrypt DNS-01：账户复用、TXT 创建/删除、订单 ready→valid、签发 90 天证书
+    （issuer `C=US, O=Let's Encrypt, CN=YE1`）；网关通过 NOTIFY 加载并由
+    `https://cert-test2.atxa.top:18443` 返回 200；
+  - ZeroSSL 未配置 EAB，按设计跳过并回退 LE；
+  - 面板 format/lint/type-check/build 通过；dashboard 5 单测、shared 12 + 3 集成。
+- 文档：新增 `certificates.md`（API、凭据、流程、vendor 补丁、限制）；`database.md` 更新 schema v4；
+  `issue.md` 新增 F-42/F-43/F-44、P-13，更新 U-01/U-03/U-25/P-09。
