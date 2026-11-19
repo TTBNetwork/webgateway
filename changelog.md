@@ -79,3 +79,10 @@
 - CONNECT：authority host 必须命中已配置站点，否则 403；200 后原始 TCP 隧道（非 TLS MITM）。
 - 访问日志记录 101/200；E2E WS echo（hello-websocket）与 CONNECT（localhost:9500）通过。
 - 网关单测 28 个；未做 HTTP/3、HTTP/2 extended CONNECT、上游 TLS。
+### 网关 HTTP/3（分支 `feat/gateway-http3`）
+- 引入 quinn/h3/h3-quinn；`[server].http3_ports` / `GATEWAY_HTTP3_PORTS` 开启 UDP 监听；
+  TLS 1.3 + ALPN `h3`，复用 SNI 证书存储（含默认自签证书）。
+- 请求/响应完整缓冲后经 buffered HTTP/1.1 client 转发上游；访问日志记录 `HTTP/3.0`。
+- E2E：aioquic 客户端 GET `/h3` → 200 `http3-upstream-ok`。
+- 限制：无流式、单连接串行、WebSocket/gRPC over h3 未做、未调 0-RTT/连接迁移。
+- 网关单测 28 个。

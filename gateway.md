@@ -1,7 +1,7 @@
 # WebGateway v2 网关（数据面）
 
 > 网关只读取数据库、不执行任何 DDL；主控初始化完成之前网关会等待。
-> 访问统计聚合、缓存、IP-UA 拦截、HTTP/3 尚未实现，见文末。
+> 访问统计聚合、缓存、IP-UA 拦截尚未实现，见文末。
 
 ## 1. 启动与生命周期
 
@@ -36,6 +36,8 @@ city = "Shanghai"
 [server]
 bind = "0.0.0.0"
 ports = [80, 443]
+# UDP；为空不启动 HTTP/3
+http3_ports = [443]
 ````
 
 | 环境变量 | 覆盖项 |
@@ -43,7 +45,8 @@ ports = [80, 443]
 | `DATABASE_URL` | `database.url` |
 | `DATABASE_MAX_CONNECTIONS` / `DATABASE_CONNECT_TIMEOUT` / `DATABASE_WAIT_TIMEOUT` | 同名数据库配置 |
 | `GATEWAY_NODE_NAME` / `GATEWAY_NODE_COUNTRY` / `GATEWAY_NODE_CITY` / `GATEWAY_NODE_ADDRESS` | 节点信息 |
-| `GATEWAY_PORTS` | 逗号分隔的监听端口 |
+| `GATEWAY_PORTS` | 逗号分隔的 TCP 监听端口 |
+| `GATEWAY_HTTP3_PORTS` | 逗号分隔的 UDP 端口（HTTP/3） |
 | `GATEWAY_BIND` | 监听地址 |
 
 ## 3. 路由
@@ -150,11 +153,21 @@ ports = [80, 443]
 - 限制：HTTP/2 extended CONNECT / WebSocket over h2 未实现；升级连接不计字节数（body_length 0）；
   上游仍只支持明文 `http://`。
 
+### 5.3 HTTP/3（QUIC）
+
+- 需要显式开启：`[server].http3_ports` 或 `GATEWAY_HTTP3_PORTS`（UDP）；为空不启动。
+- QUIC 使用 TLS 1.3 + ALPN `h3`，证书复用 TLS 的 SNI 存储（含默认自签证书）。
+- 请求体完整缓冲后，通过内部 HTTP/1.1 buffered client 转发上游；响应体也完整缓冲后发送。
+- 访问日志记录 `HTTP/3.0`；`get_request_ip` 的 raw/XFF 模式可用，PROXY protocol 不适用。
+- 限制：无流式请求/响应（大 body 占内存）；同一 QUIC 连接内请求串行处理；
+  WebSocket / gRPC over h3 未实现；未调 0-RTT / 连接迁移。
+
 ## 6. TLS
 
 - 证书来自 `certificates`（`fullchain` + `private_key` PEM），过期证书不加载。
 - SNI 精确 → 通配符 → 默认自签证书（rcgen，CN localhost）。
 - ALPN：`h2`、`http/1.1`；E2E 实测 HTTPS 协商到 HTTP/2。
+- HTTP/3 使用同一证书存储，ALPN `h3`、TLS 1.3（QUIC）。
 
 ## 7. 已验证（beta 库）
 
@@ -167,6 +180,7 @@ ports = [80, 443]
 - 访问日志：GET/POST/404 分别产生 request/response 行；POST 5 字节、响应 12/9 字节，size 表按秒记录。
 - WebSocket：Python WS echo 经网关回显 `hello-websocket`（101）。
 - CONNECT：`CONNECT localhost:9500` 返回 200，`ping-through-connect` 原样回显。
+- HTTP/3：aioquic 客户端 GET `/h3` → 200，body `http3-upstream-ok`；访问日志 `HTTP/3.0`。
 - HTTP 200、HTTPS HTTP/2 200、未知 Host 404、心跳更新、SIGTERM offline。
 - 网关单测 28 个；shared 迁移/单测、fmt、clippy 全通过。
 
@@ -176,7 +190,7 @@ ports = [80, 443]
 - 网关缓存（主控下发：大小、文件类型、ETag、TTL 等，细节待定）。
 - IP / User-Agent 拦截（优先级低）。
 - 上游传输扩展：
-  - **HTTP/3**：QUIC（quinn）+ h3 + UDP 监听 + ALPN `h3`；需要把代理核心从 hyper 请求类型解耦；
+  - HTTP/3 流式请求/响应、同连接并发多请求、0-RTT / 连接迁移调优；
   - HTTP/2 extended CONNECT / WebSocket over h2；
   - 其余特殊 RFC 按需补充。
 - 更复杂的路由（header / 正则）、上游 TLS、后端权重/主备。
@@ -185,5 +199,5 @@ ports = [80, 443]
 
 ````bash
 # 配置：复制 config.example.toml 为 config.toml，或用环境变量
-DATABASE_URL='postgres://...' GATEWAY_PORTS=8080,8443 cargo run -p gateway
+DATABASE_URL='postgres://...' GATEWAY_PORTS=8080,8443 GATEWAY_HTTP3_PORTS=8443 cargo run -p gateway
 ````
