@@ -112,3 +112,11 @@
 - HTTP/3 每个请求独立 spawn，同一 QUIC 连接可并发处理多个流（body 仍缓冲）。
 - E2E：40 次请求按 3:1 分到 30/10，备用组 0；HTTP/3 同连接 5 个请求全部 200、按权重 4/1。
 - 网关单测 33 个；文档更新。
+### 控制面板 v1（分支 `feat/dashboard-panel`）
+- 主控新增只读 API：`/api/summary`、`/api/websites`、`/api/certificates`、`/api/gateways`、`/api/logs`；
+  设置 `DASHBOARD_API_TOKEN` 后要求 Bearer 令牌。
+- Vue 3 + TypeScript 面板：登录、概览（统计卡片 + 24h 流量图）、站点、证书、网关、访问日志、设置。
+- 深/浅色、中/英、响应式侧边栏；登录令牌存 localStorage。
+- 无新增前端运行时依赖：自写 history router + 原生 fetch，`package.json` / `pnpm-lock.yaml` 未改。
+- 验证：Vite 代理 401/200、真实数据、`pnpm format:check` / `lint:check` / `build` 通过；后端 fmt/clippy/test 通过。
+- 当前面板只读；CRUD、用户体系、ACME、静态托管后续。
