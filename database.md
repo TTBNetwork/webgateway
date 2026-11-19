@@ -204,6 +204,7 @@ loop:
 | `jwt_secret` | `TEXT` | NOT NULL | 每用户独立 JWT secret |
 | `role` | `TEXT` | NOT NULL `DEFAULT 'view'`, `CHECK (role IN ('admin','user','view'))` | 权限角色 |
 | `token_version` | `INTEGER` | NOT NULL `DEFAULT 0` | JWT 撤销计数（迁移 0005） |
+| `last_totp_step` | `BIGINT` | | 已使用的最高 TOTP step，防重放（迁移 0006） |
 | `last_login` | `TIMESTAMPTZ` | | |
 | `last_ip` | `TEXT` | | |
 | `addresses` | `TEXT[]` | NOT NULL `DEFAULT '{}'` | |
@@ -550,12 +551,14 @@ $fn$;
 - 0004 迁移：`certificates.auto_renew` / `dns_zone` / `last_error` + 续期 partial index
   + `SELECT wg_mark_schema_version(4);`（证书签发/上传见 `certificates.md`）。
 - 0005 迁移：`users.token_version`（JWT 撤销计数）+ `SELECT wg_mark_schema_version(5);`。
+- 0006 迁移：`users.last_totp_step`（TOTP step 防重放）+ `SELECT wg_mark_schema_version(6);`。
 - `verify_schema()`（主控迁移后、网关就绪后各跑一次，纯只读）：
   - `schema_state.version >= 期望版本`；
   - 必需表存在：`schema_state`、`configurations`、`users`、`users_client_secrets`、`web_log`、
     `dns_providers`、`certificates`、`websites`、四张访问日志表、`access_stats_daily`、`stats_state`；
   - 必需扩展已安装：`SELECT extname FROM pg_extension WHERE extname IN ('uint128','btree_gin')` 返回 2 行；
-  - 关键列存在：`users.role`、`users.token_version`、`certificates.signing_started_at`、`certificates.auto_renew`、
+  - 关键列存在：`users.role`、`users.token_version`、`users.last_totp_step`、
+    `certificates.signing_started_at`、`certificates.auto_renew`、
     `certificates.dns_zone`、`certificates.last_error`、`access_request_logs.remote_addr`。
 
 ## 7. 配置项
@@ -645,7 +648,7 @@ pub async fn wait_for_master_schema(cfg: &DatabaseConfig) -> anyhow::Result<Data
 - **集成测试（设置 `DATABASE_URL` 才跑，否则自动跳过）**：
   1. 连接服务器，创建临时数据库 `webgateway_it_<随机>`（用完 `DROP DATABASE ... WITH (FORCE)`，beta 库不受影响）；
   2. 未初始化时网关等待：`wait_timeout_secs=2` 以 `timed out` 失败；
-  3. 主控 `initialize_master`：`schema_state.version` 等于当前迁移最大版本（当前 5），
+  3. 主控 `initialize_master`：`schema_state.version` 等于当前迁移最大版本（当前 6），
      扩展 `uint128`/`btree_gin` 已安装，`gateways` 表存在，四张日志表的周分区已预建；
   4. 再次执行 `initialize_master`：幂等（sqlx 跳过已应用迁移）；
   5. 网关等待：立即成功并通过 `verify_schema`；

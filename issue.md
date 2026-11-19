@@ -71,9 +71,9 @@
 
 | ID | Feature | 状态 | 说明 |
 |---|---|---|---|
-| F-39 | 网关单测 | ✅ | 34 个；fmt/clippy 全通过 |
-| F-40 | shared 测试 | ✅ | 13 单测 + 3 集成（临时库，含 stats 回填/分区回收、schema v5） |
-| F-41 | 本地 E2E | ✅ | NOTIFY、headers、PROXY、路由、日志、统计、缓存、TLS、WS、CONNECT、h3、权重、TOTP/JWT；Nezha gRPC 与 MCSManager WS 联调；证书上传与 Let's Encrypt 真实签发 |
+| F-39 | 网关单测 | ✅ | 36 个；fmt/clippy 全通过 |
+| F-40 | shared 测试 | ✅ | 14 单测 + 3 集成（临时库，含 stats 回填/分区回收、schema v6） |
+| F-41 | 本地 E2E | ✅ | NOTIFY、headers、PROXY、路由、日志、统计、缓存、TLS、WS、CONNECT、h3、权重、TOTP/JWT；Nezha gRPC 与 MCSManager WS 联调；证书上传与 Let's Encrypt 真实签发；优雅停机 drain + TOTP 重放/限速 |
 
 ### 1.6 证书管理
 
@@ -84,6 +84,8 @@
 | F-44 | 证书面板 | ✅ | 自动/手动添加、重新签发、删除、状态/错误展示 |
 | F-45 | 站点/网关 CRUD | ✅ | 站点创建/更新/删除（JSON 后端与配置校验）；网关名称/位置更新与删除 |
 | F-46 | 用户管理 / RBAC / 撤销 | ✅ | 用户列表/创建/角色/删除/TOTP 重置/会话撤销；token_version JWT 撤销；admin/user/view 路由级 RBAC；面板用户页 |
+| F-47 | TOTP 防重放 / 登录限速 | ✅ | users.last_totp_step 单调 step；用户/IP 失败计数，5 次/5 分钟锁 5 分钟；429 + retry_after |
+| F-48 | 优雅停机 / 日志可靠性 | ✅ | SIGTERM 停止 accept → 10s drain in-flight（HTTP/TCP）→ flush access log → offline；批量写失败重试 3 次 + 丢弃计数 |
 
 ---
 
@@ -96,7 +98,7 @@
 | P-03 | WebSocket | 升级连接字节数记 0；无 mTLS / SNI 覆盖；wss 与后端 base path 已支持（2026-11-19） |
 | P-04 | CONNECT | 仅 h1；400/403 不写日志；已配置 host 的任意端口可隧道；无鉴权 |
 | P-05 | 缓存 | 仅 h1/h2；配置同步清空全部；无持久化/Vary/HEAD/stale-while-revalidate/single-flight/命中率；max_entry_size 在完整收集后判断 |
-| P-06 | 访问日志 | body_length 取 Content-Length；chunked 请求 0、响应 NULL；WS/CONNECT 0；headers 重复键被覆盖；writer 退出丢最后一批 |
+| P-06 | 访问日志 | body_length 取 Content-Length；chunked 请求 0、响应 NULL；WS/CONNECT 0；headers 重复键被覆盖；已修复 writer 退出 flush |
 | P-07 | 统计 | total_ips 跨秒重复；sizes 依赖日志 Content-Length；保留期（7 天）仍硬编码；整周过期分区已 DROP，边界分区仍逐行 DELETE |
 | P-08 | 上游 TLS | 只信 webpki + ca_file，不读系统 native roots；无 mTLS/SNI 覆盖 |
 | P-09 | 面板 | 站点/证书/用户已可写；网关只读列表+API 删除；JWT 存 localStorage；无 refresh token/每用户 API key；无服务端分页；无静态托管；无前端测试 |
@@ -131,11 +133,10 @@
 ### 3.3 可靠性 / 可观测性
 
 - U-17 健康检查、失败自动切换、熔断
-- U-18 优雅停机 / 连接 drain（当前直接 abort）
 - U-19 Prometheus /metrics、tracing 导出、告警
 - U-20 配置热加载（证书/CA 目前需重启或 NOTIFY）
 - U-21 统计保留期配置化（分区自动创建/删除已实现）
-- U-22 访问日志重试/落盘/丢弃指标
+- U-22 访问日志落盘/导出指标（已实现重试 3 次 + 丢弃计数，未落盘/未暴露 /metrics）
 - U-23 缓存持久化、多级缓存、single-flight、命中率
 - U-24 OpenAPI / API 文档
 
@@ -195,16 +196,17 @@
 - 建议：h3 接缓存或明确文档；加 max_request_body/max_response_body；流式化。
 - 位置：gateway/src/http3.rs、gateway/src/proxy.rs（handle_buffered）
 
-#### B-05 停机丢日志 / 丢在途请求
-- 症状：SIGTERM 时 listeners.abort_all、log_writer.abort、h3 task abort，无 drain。
-- 影响：最后一批访问日志、在途代理请求丢失。
-- 建议：停止接受新连接 → 等待 in-flight → flush 日志 → 退出。
-- 位置：gateway/src/main.rs
+#### B-05 停机丢日志 / 丢在途请求（已修复，2026-11-19）
+- 修复：SIGTERM 后停止 accept → 用 Inflight 计数等待在途 HTTP/TCP 请求（上限 10s）→
+  access writer 显式 shutdown 并 flush → 标记 offline → 关闭连接池。
+- 实测：慢请求（3s）在内置 SIGTERM 后仍返回 200，访问日志入库，gateway 正常 exit 0 并 offline。
+- 限制：HTTP/3 accept loop 仍直接 abort，QUIC 在途请求未做 drain。
+- 位置：gateway/src/listeners.rs、gateway/src/access.rs、gateway/src/main.rs
 
-#### B-06 日志通道满/批量失败丢数据
-- 症状：try_send 满时 debug 丢弃；写库失败整批丢。
-- 影响：高峰/DB 抖动时日志缺失，且无指标。
-- 建议：重试/落盘/丢弃计数；至少暴露指标与告警。
+#### B-06 日志通道满/批量失败丢数据（部分修复，2026-11-19）
+- 已修复：写库失败重试 3 次（200/400ms 退避）；仍失败则记录 dropped/failed 计数并 WARN；
+  channel full 每 100 条 WARN；优雅停机时 drain + flush。
+- 仍未做：落盘 spill、Prometheus /metrics、告警；重启前最后一批仍可能丢失。
 - 位置：gateway/src/proxy.rs（log_event）、gateway/src/access.rs
 
 #### B-07 CONNECT 400/403 不记日志 + 端口开放
@@ -257,10 +259,11 @@
 - 静态服务令牌仍可用于 API；服务令牌比较为非恒定时间。
 - 建议：HttpOnly Cookie 或短时 token、加 CSP、恒定时间比较。
 
-#### B-29 TOTP 无重放保护/速率限制
-- totp-rs 明确要求调用方保证同一 step 只使用一次；当前未记录已用 step，30s 内可重放。
-- 失败仅延迟 500ms，无按用户/IP 的速率限制或锁定。
-- 建议：记录 last_totp_step、失败计数/锁定。
+#### B-29 TOTP 无重放保护/速率限制（已修复，2026-11-19）
+- 修复：users.last_totp_step（迁移 0006）；登录用条件 UPDATE 保证同一 step 只接受一次，重放返回 401。
+- 限速：进程内按 user+IP 计数，5 次失败/5 分钟锁 5 分钟，登录返回 429 + retry_after_secs。
+- 实测：同 code 第二次 401；连续失败后即使 code 正确也 429。
+- 限制：限速计数在进程内，多主控实例不共享；TOTP skew 内仍按 step 单调。
 
 #### B-30 JWT 无撤销、RBAC 不细化（已修复，2026-11-19）
 - 修复：users.token_version（迁移 0005）+ JWT claims 版本校验；logout/管理员 revoke/角色变更/重置 TOTP 都会 bump 版本，旧 JWT 立即 401。
@@ -308,9 +311,9 @@
 
 ## 5. 当前状态
 
-- 最新分支：feat/dashboard-rbac（叠加在 feat/certificates 之后）
-- 测试：网关 34、dashboard 8、shared 13 + 3 集成（含 stats 回填/分区回收）；前端 format/lint/type-check/build 通过
-- 数据库：schema v5；2026-11-19 联调/统计/证书/CRUD 验证的临时数据已清理（websites/gateways/users/logs/stats = 0；测试证书已删除）
+- 最新分支：feat/reliability-hardening（叠加在 feat/dashboard-rbac 之后）
+- 测试：网关 36、dashboard 10、shared 14 + 3 集成（含 stats 回填/分区回收）；前端 format/lint/type-check/build 通过
+- 数据库：schema v6；2026-11-19 联调/统计/证书/CRUD/可靠性验证的临时数据已清理（websites/gateways/users/logs/stats = 0；测试证书已删除）
 - 管理面：站点/网关/用户 CRUD + admin/user/view RBAC + token_version 撤销；面板站点/用户编辑页完成
 - 证书：手动上传 + ACME（Let's Encrypt 实测签发；ZeroSSL 需 EAB）→ 网关 SNI 加载验证通过，见 `certificates.md`
 - 实时协议：Nezha gRPC（h2c/TLS/双向流）与 MCSManager WS（101/鉴权/长连接）已用真实软件验证，见 `e2e-realtime.md`
@@ -320,7 +323,7 @@
 
 1. ~~B-01 / B-02：分区续建 + 统计补算（P0）~~ ✅
 2. ~~面板 CRUD + 用户管理/RBAC/JWT 撤销（U-01/U-02）~~ ✅（剩 refresh token/API key/服务令牌轮换）
-3. ~~B-03~~ ✅ / B-04 / B-05 / B-06：h3 限制、优雅停机、日志可靠性
+3. ~~B-03~~ ✅ / ~~B-05~~ ✅ / ~~B-06~~ ✅ / B-04：h3 限制（仍缺 body 上限/缓存）
 4. U-11/U-13：h3 流式/Alt-Svc、h2 extended CONNECT
 5. U-17/U-19/U-23：健康检查、metrics、缓存持久化
 6. B-21：合并分支、清理 PR 栈

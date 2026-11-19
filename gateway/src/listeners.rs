@@ -4,7 +4,10 @@ use std::{
     collections::{BTreeSet, HashMap},
     convert::Infallible,
     net::{IpAddr, SocketAddr},
-    sync::Arc,
+    sync::{
+        Arc,
+        atomic::{AtomicUsize, Ordering},
+    },
     time::Duration,
 };
 
@@ -13,6 +16,7 @@ use hyper::service::service_fn;
 use hyper_util::rt::{TokioExecutor, TokioIo};
 use tokio::{
     net::{TcpListener, TcpStream},
+    sync::watch,
     task::JoinHandle,
 };
 use tracing::{Level, event};
@@ -21,16 +25,59 @@ use crate::proxy;
 use crate::proxy_protocol;
 use crate::state::AppState;
 
+/// Tracks connections currently being served so shutdown can drain them.
+#[derive(Clone, Default)]
+struct Inflight {
+    count: Arc<AtomicUsize>,
+}
+
+struct InflightGuard {
+    inflight: Inflight,
+}
+
+impl Inflight {
+    fn enter(&self) -> InflightGuard {
+        self.count.fetch_add(1, Ordering::SeqCst);
+        InflightGuard {
+            inflight: self.clone(),
+        }
+    }
+
+    async fn wait_idle(&self, limit: Duration) -> bool {
+        let deadline = tokio::time::Instant::now() + limit;
+        loop {
+            if self.count.load(Ordering::SeqCst) == 0 {
+                return true;
+            }
+            if tokio::time::Instant::now() >= deadline {
+                return false;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    }
+}
+
+impl Drop for InflightGuard {
+    fn drop(&mut self) {
+        self.inflight.count.fetch_sub(1, Ordering::SeqCst);
+    }
+}
+
 pub struct Listeners {
     bind: IpAddr,
     tasks: HashMap<u16, JoinHandle<()>>,
+    shutdown: watch::Sender<bool>,
+    inflight: Inflight,
 }
 
 impl Listeners {
     pub fn new(bind: IpAddr) -> Self {
+        let (shutdown, _) = watch::channel(false);
         Self {
             bind,
             tasks: HashMap::new(),
+            shutdown,
+            inflight: Inflight::default(),
         }
     }
 
@@ -53,8 +100,10 @@ impl Listeners {
             let state = state.clone();
             let bind = self.bind;
             let port = *port;
+            let shutdown = self.shutdown.subscribe();
+            let inflight = self.inflight.clone();
             let handle = tokio::spawn(async move {
-                if let Err(error) = serve_port(bind, port, state).await {
+                if let Err(error) = serve_port(bind, port, state, shutdown, inflight).await {
                     event!(Level::ERROR, port, %error, "listener stopped");
                 }
             });
@@ -75,31 +124,49 @@ impl Listeners {
         }
     }
 
-    pub fn abort_all(&mut self) {
+    /// Stop accepting new connections, wait for in-flight requests, and report
+    /// whether the drain finished within the limit.
+    pub async fn shutdown(&mut self, drain_limit: Duration) -> bool {
+        let _ = self.shutdown.send(true);
         for (_, handle) in self.tasks.drain() {
-            handle.abort();
+            let _ = handle.await;
         }
+        self.inflight.wait_idle(drain_limit).await
     }
 }
 
-async fn serve_port(bind: IpAddr, port: u16, state: Arc<AppState>) -> anyhow::Result<()> {
+async fn serve_port(
+    bind: IpAddr,
+    port: u16,
+    state: Arc<AppState>,
+    mut shutdown: watch::Receiver<bool>,
+    inflight: Inflight,
+) -> anyhow::Result<()> {
     let listener = TcpListener::bind(SocketAddr::new(bind, port))
         .await
         .with_context(|| format!("failed to bind port {port}"))?;
     event!(Level::INFO, port, "gateway listener started");
 
     loop {
-        let (stream, peer) = match listener.accept().await {
-            Ok(connection) => connection,
-            Err(error) => {
-                event!(Level::WARN, port, %error, "accept failed");
-                tokio::time::sleep(Duration::from_millis(100)).await;
-                continue;
+        let (stream, peer) = tokio::select! {
+            _ = shutdown.changed() => {
+                event!(Level::INFO, port, "listener stopped accepting connections");
+                return Ok(());
+            }
+            accepted = listener.accept() => match accepted {
+                Ok(connection) => connection,
+                Err(error) => {
+                    event!(Level::WARN, port, %error, "accept failed");
+                    tokio::time::sleep(Duration::from_millis(100)).await;
+                    continue;
+                }
             }
         };
 
         let state = state.clone();
+        let guard = inflight.enter();
         tokio::spawn(async move {
+            let _guard = guard;
             if let Err(error) = handle_connection(state, stream, peer).await {
                 event!(Level::DEBUG, %peer, %error, "connection closed with an error");
             }
@@ -161,4 +228,24 @@ where
         .map_err(|error| anyhow::anyhow!("HTTP connection failed: {error}"))?;
 
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn inflight_wait_tracks_open_connections() {
+        let inflight = Inflight::default();
+        let guard = inflight.enter();
+        assert!(
+            !inflight.wait_idle(Duration::from_millis(30)).await,
+            "a live connection must prevent the drain from completing"
+        );
+        drop(guard);
+        assert!(
+            inflight.wait_idle(Duration::from_secs(1)).await,
+            "the drain must complete after the last connection closes"
+        );
+    }
 }

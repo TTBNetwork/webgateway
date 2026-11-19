@@ -714,6 +714,7 @@ pub(crate) fn log_event(
     };
 
     if let Err(error) = state.logs.try_send(event) {
+        crate::access::record_dropped();
         tracing::debug!(%error, "dropping access log event");
     }
 }

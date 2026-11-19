@@ -151,13 +151,22 @@ async fn run() -> anyhow::Result<()> {
         }
     }
 
+    // Stop accepting new connections, give in-flight HTTP requests a chance to
+    // finish, then flush access logs before marking the node offline. HTTP/3
+    // accept loops are aborted (QUIC request drain is not tracked yet).
     notification_task.abort();
-    heartbeat.abort();
-    listeners.abort_all();
+    let drained = listeners.shutdown(Duration::from_secs(10)).await;
+    if !drained {
+        event!(
+            Level::WARN,
+            "timed out draining in-flight connections; continuing shutdown"
+        );
+    }
     for task in &http3_tasks {
         task.abort();
     }
-    log_writer.abort();
+    log_writer.shutdown().await;
+    heartbeat.abort();
     node.mark_offline(&database).await?;
     database.pool().close().await;
 

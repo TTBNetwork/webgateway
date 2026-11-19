@@ -226,3 +226,24 @@
 - 验证（beta 库）：服务令牌创建站点/用户；view JWT 读 200、写 403；revoke/logout 后旧 JWT 401；
   角色更新 bump token_version；禁止删除最后一个 admin；站点创建/更新/删除成功（ports 正确写入）。
 - 文档：`database.md` schema v5、`issue.md` F-33/F-34/F-45/F-46、B-30 已修复、P-09/U-01/U-02 更新。
+
+### 认证与可靠性加固（分支 `feat/reliability-hardening`）
+- 迁移 0006 `totp_replay.sql`：`users.last_totp_step BIGINT`；schema version → **6**。
+- TOTP 防重放：登录时取匹配 step，条件 UPDATE 保证同一 step 只接受一次；重放返回 401。
+- 登录限速：进程内按 user+IP 计数，5 次失败/5 分钟锁 5 分钟；登录返回 429 + `retry_after_secs`。
+- 访问日志可靠性：
+  - 写库失败重试 3 次（200/400ms 退避）；仍失败记录 dropped/failed 计数并 WARN；
+  - channel full 每 100 条 WARN；
+  - `AccessWriter` 新增显式 shutdown：drain 队列 + flush 后再退出。
+- 优雅停机：
+  - `Listeners` 增加 watch shutdown + in-flight 计数；SIGTERM 后停止 accept，
+    最多等待 10s 让 HTTP/TCP 在途请求完成；
+  - 顺序：停止 accept → drain → abort h3 accept → flush access log → offline → 关闭连接池。
+- 实测：
+  - 同一个 TOTP code 第二次登录 401；连续失败后正确 code 也返回 429；
+  - 慢请求（3s）在内置 SIGTERM 后仍返回 200，访问日志写入数据库，gateway exit 0 且 gateways 标记 offline；
+  - 日志显示 `access log writer stopped count=1`，无丢失。
+- 限制：HTTP/3 在途请求未做 drain（accept loop abort）；日志无落盘 spill/metrics 端点；
+  登录限速为单实例内存计数。
+- 测试：gateway 36、dashboard 10、shared 14 + 3 集成；clippy/fmt 通过。
+- 文档：`database.md` schema v6、`issue.md` B-05/B-06/B-29 更新、F-47/F-48 新增。

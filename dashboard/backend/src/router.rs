@@ -170,17 +170,24 @@ async fn login(
     .await
     .map_err(internal)?
     {
-        Some(success) => Ok(Json(json!({
+        auth::LoginOutcome::Success(success) => Ok(Json(json!({
             "token": success.token,
             "user": success.user,
         }))),
-        None => {
+        auth::LoginOutcome::Invalid => {
             tokio::time::sleep(Duration::from_millis(500)).await;
             Err((
                 StatusCode::UNAUTHORIZED,
                 Json(json!({ "error": "invalid username or code" })),
             ))
         }
+        auth::LoginOutcome::Throttled { retry_after_secs } => Err((
+            StatusCode::TOO_MANY_REQUESTS,
+            Json(json!({
+                "error": "too many login attempts",
+                "retry_after_secs": retry_after_secs,
+            })),
+        )),
     }
 }
 

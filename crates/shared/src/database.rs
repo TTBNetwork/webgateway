@@ -61,6 +61,7 @@ const REQUIRED_TABLES: &[&str] = &[
 const REQUIRED_COLUMNS: &[(&str, &str)] = &[
     ("users", "role"),
     ("users", "token_version"),
+    ("users", "last_totp_step"),
     ("certificates", "signing_started_at"),
     ("certificates", "auto_renew"),
     ("certificates", "dns_zone"),
@@ -493,10 +494,11 @@ mod tests {
     const MIGRATION_SQL_3: &str = include_str!("../migrations/0003_stats_maintenance.sql");
     const MIGRATION_SQL_4: &str = include_str!("../migrations/0004_certificate_issuance.sql");
     const MIGRATION_SQL_5: &str = include_str!("../migrations/0005_user_token_version.sql");
+    const MIGRATION_SQL_6: &str = include_str!("../migrations/0006_totp_replay.sql");
 
     #[test]
     fn schema_version_is_positive() {
-        assert!(schema_version() >= 5);
+        assert!(schema_version() >= 6);
     }
 
     #[test]
@@ -534,6 +536,17 @@ mod tests {
                 .trim_end()
                 .ends_with("SELECT wg_mark_schema_version(5);")
         );
+        assert!(
+            MIGRATION_SQL_6
+                .trim_end()
+                .ends_with("SELECT wg_mark_schema_version(6);")
+        );
+    }
+
+    #[test]
+    fn totp_replay_migration_is_ready() {
+        assert!(MIGRATION_SQL_6.contains("ADD COLUMN last_totp_step"));
+        assert!(MIGRATION_SQL_6.contains("BIGINT"));
     }
 
     #[test]

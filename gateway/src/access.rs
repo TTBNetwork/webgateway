@@ -13,8 +13,16 @@ use std::{
 
 use anyhow::Context;
 use http::HeaderMap;
-use tokio::{sync::mpsc, task::JoinHandle};
+use tokio::{
+    sync::{mpsc, watch},
+    task::JoinHandle,
+};
 use tracing::{Level, event};
+
+/// Events dropped because the channel was full or the database rejected a batch.
+static DROPPED_EVENTS: AtomicU64 = AtomicU64::new(0);
+/// Batches that exhausted their retries.
+static FAILED_BATCHES: AtomicU64 = AtomicU64::new(0);
 
 use shared::database::Database;
 
@@ -47,20 +55,72 @@ pub struct AccessEvent {
     pub response: ResponseLog,
 }
 
-/// Start the background writer. Dropping every sender stops the task once the
-/// buffered batch has been flushed.
-pub fn spawn(database: Database) -> (mpsc::Sender<AccessEvent>, JoinHandle<()>) {
-    let (sender, receiver) = mpsc::channel(4096);
-    let handle = tokio::spawn(write_loop(database, receiver));
-    (sender, handle)
+/// Handle used to flush the writer during graceful shutdown.
+pub struct AccessWriter {
+    shutdown: watch::Sender<bool>,
+    handle: JoinHandle<()>,
 }
 
-async fn write_loop(database: Database, mut receiver: mpsc::Receiver<AccessEvent>) {
+impl AccessWriter {
+    /// Ask the writer to drain queued events, flush, and exit.
+    pub async fn shutdown(self) {
+        let _ = self.shutdown.send(true);
+        if let Err(error) = self.handle.await {
+            event!(Level::WARN, %error, "access log writer stopped with an error");
+        }
+    }
+}
+
+/// Start the background writer. Shutdown is explicit so the last batch is
+/// flushed before the process exits.
+pub fn spawn(database: Database) -> (mpsc::Sender<AccessEvent>, AccessWriter) {
+    let (sender, receiver) = mpsc::channel(4096);
+    let (shutdown, receiver_shutdown) = watch::channel(false);
+    let handle = tokio::spawn(write_loop(database, receiver, receiver_shutdown));
+    (sender, AccessWriter { shutdown, handle })
+}
+
+/// Record a dropped event (channel full). Logs a warning every 100 drops.
+pub fn record_dropped() {
+    let total = DROPPED_EVENTS.fetch_add(1, Ordering::Relaxed) + 1;
+    if total.is_multiple_of(100) {
+        event!(
+            Level::WARN,
+            dropped = total,
+            "access log channel is full; events are being dropped"
+        );
+    }
+}
+
+/// Counters for tests/logging.
+#[cfg(test)]
+fn metrics() -> (u64, u64) {
+    (
+        DROPPED_EVENTS.load(Ordering::Relaxed),
+        FAILED_BATCHES.load(Ordering::Relaxed),
+    )
+}
+
+async fn write_loop(
+    database: Database,
+    mut receiver: mpsc::Receiver<AccessEvent>,
+    mut shutdown: watch::Receiver<bool>,
+) {
     let mut interval = tokio::time::interval(Duration::from_millis(500));
     let mut buffer = Vec::with_capacity(256);
 
     loop {
         tokio::select! {
+            _ = shutdown.changed() => {
+                // Drain anything already queued and flush before leaving.
+                while let Ok(event) = receiver.try_recv() {
+                    buffer.push(event);
+                }
+                let count = buffer.len();
+                flush(&database, &mut buffer).await;
+                event!(Level::INFO, count, "access log writer stopped");
+                return;
+            }
             maybe = receiver.recv() => {
                 match maybe {
                     Some(event) => {
@@ -88,9 +148,36 @@ async fn flush(database: &Database, buffer: &mut Vec<AccessEvent>) {
     }
 
     let events = std::mem::take(buffer);
-    if let Err(error) = write_batch(database, &events).await {
-        event!(Level::WARN, %error, count = events.len(), "failed to write access logs");
+    let count = events.len();
+    let mut last_error = None;
+
+    // The database is the only sink; retry transient failures before giving up
+    // so a short outage does not lose the batch outright.
+    for attempt in 0..3 {
+        match write_batch(database, &events).await {
+            Ok(()) => return,
+            Err(error) => {
+                last_error = Some(error);
+                if attempt < 2 {
+                    tokio::time::sleep(Duration::from_millis(200 * (1 << attempt))).await;
+                }
+            }
+        }
     }
+
+    let failures = FAILED_BATCHES.fetch_add(1, Ordering::Relaxed) + 1;
+    let dropped = DROPPED_EVENTS.fetch_add(count as u64, Ordering::Relaxed) + count as u64;
+    let error = last_error
+        .map(|error| format!("{error:#}"))
+        .unwrap_or_else(|| "unknown error".to_string());
+    event!(
+        Level::WARN,
+        %error,
+        count,
+        failed_batches = failures,
+        dropped,
+        "access log batch failed after retries; events dropped"
+    );
 }
 
 async fn write_batch(database: &Database, events: &[AccessEvent]) -> anyhow::Result<()> {
@@ -324,6 +411,14 @@ pub fn version_label(version: http::Version) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn dropped_events_are_counted() {
+        let (before, _) = metrics();
+        record_dropped();
+        let (after, _) = metrics();
+        assert!(after > before);
+    }
 
     #[test]
     fn ids_are_24_hex_and_unique() {

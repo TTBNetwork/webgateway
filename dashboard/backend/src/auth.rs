@@ -1,8 +1,10 @@
 //! Dashboard authentication: TOTP login and per-user JWT.
 
 use std::{
+    collections::HashMap,
     env,
-    time::{SystemTime, UNIX_EPOCH},
+    sync::{LazyLock, Mutex},
+    time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 
 use anyhow::{Context, bail};
@@ -63,6 +65,14 @@ pub fn can_write_certificates(user: &User) -> bool {
 pub struct LoginSuccess {
     pub token: String,
     pub user: User,
+}
+
+/// Result of a login attempt. Unknown users, bad codes and replayed codes all
+/// map to Invalid so the API does not disclose which check failed.
+pub enum LoginOutcome {
+    Success(LoginSuccess),
+    Invalid,
+    Throttled { retry_after_secs: u64 },
 }
 
 /// Create a default admin on an empty users table. The TOTP secret is printed
@@ -146,14 +156,18 @@ pub async fn authenticate(database: &Database, token: &str) -> Option<User> {
     })
 }
 
-/// Validate username + TOTP. Returns None for both "unknown user" and "bad code"
-/// so the API does not disclose which one failed.
+/// Validate username + TOTP with replay protection and per-user/IP throttling.
 pub async fn login(
     database: &Database,
     username: &str,
     code: &str,
     last_ip: Option<String>,
-) -> anyhow::Result<Option<LoginSuccess>> {
+) -> anyhow::Result<LoginOutcome> {
+    let keys = login_keys(username, last_ip.as_deref());
+    if let Some(retry_after_secs) = LOGIN_LIMITER.locked_for(&keys) {
+        return Ok(LoginOutcome::Throttled { retry_after_secs });
+    }
+
     let row = sqlx::query(
         "SELECT id, username, role, totp_secret, jwt_secret, token_version
            FROM users
@@ -165,7 +179,8 @@ pub async fn login(
     .context("failed to load user")?;
 
     let Some(row) = row else {
-        return Ok(None);
+        LOGIN_LIMITER.record_failure(&keys);
+        return Ok(LoginOutcome::Invalid);
     };
 
     let id: String = row.try_get("id")?;
@@ -178,18 +193,42 @@ pub async fn login(
             .unwrap_or_default();
     secrets.extend(extra);
 
-    if !secrets.iter().any(|secret| verify_totp(secret, code)) {
-        return Ok(None);
-    }
+    let matched_step = secrets
+        .iter()
+        .filter_map(|secret| verify_totp_step(secret, code))
+        .max();
+    let Some(step) = matched_step else {
+        LOGIN_LIMITER.record_failure(&keys);
+        return Ok(LoginOutcome::Invalid);
+    };
 
-    sqlx::query(
-        "UPDATE users SET last_login = now(), last_ip = COALESCE($2, last_ip) WHERE id = $1",
+    // RFC 6238: a step is accepted at most once. The conditional UPDATE makes
+    // the check atomic under concurrent login attempts.
+    let updated = sqlx::query(
+        "UPDATE users
+            SET last_totp_step = $3,
+                last_login = now(),
+                last_ip = COALESCE($2, last_ip)
+          WHERE id = $1
+            AND (last_totp_step IS NULL OR last_totp_step < $3)",
     )
     .bind(&id)
-    .bind(last_ip)
+    .bind(&last_ip)
+    .bind(step as i64)
     .execute(database.pool())
     .await
-    .context("failed to update last_login")?;
+    .context("failed to update login state")?;
+    if updated.rows_affected() == 0 {
+        LOGIN_LIMITER.record_failure(&keys);
+        event!(
+            Level::WARN,
+            user = %username,
+            step,
+            "rejected a replayed TOTP step"
+        );
+        return Ok(LoginOutcome::Invalid);
+    }
+    LOGIN_LIMITER.clear(&keys);
 
     let now = SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -217,7 +256,7 @@ pub async fn login(
     let token = encode(&Header::default(), &claims, &key).context("failed to sign the JWT")?;
 
     event!(Level::INFO, user = %username, "dashboard login succeeded");
-    Ok(Some(LoginSuccess {
+    Ok(LoginOutcome::Success(LoginSuccess {
         token,
         user: User { id, username, role },
     }))
@@ -231,10 +270,9 @@ fn unverified_claims(token: &str) -> Option<Claims> {
     serde_json::from_slice(&bytes).ok()
 }
 
-fn verify_totp(secret: &str, code: &str) -> bool {
-    build_totp(secret)
-        .and_then(|totp| totp.check_current(code.trim()))
-        .is_some()
+fn verify_totp_step(secret: &str, code: &str) -> Option<u64> {
+    let now = SystemTime::now().duration_since(UNIX_EPOCH).ok()?.as_secs();
+    build_totp(secret).and_then(|totp| totp.check(code.trim(), now))
 }
 
 fn build_totp(secret: &str) -> Option<Totp> {
@@ -420,6 +458,115 @@ pub async fn count_admins(database: &Database) -> anyhow::Result<i64> {
         .context("failed to count admins")
 }
 
+const LOGIN_MAX_FAILURES: u32 = 5;
+const LOGIN_WINDOW: Duration = Duration::from_secs(300);
+const LOGIN_LOCK: Duration = Duration::from_secs(300);
+const LOGIN_MAX_ENTRIES: usize = 4096;
+
+#[derive(Debug, Clone, Copy)]
+struct LimiterPolicy {
+    max_failures: u32,
+    window: Duration,
+    lock: Duration,
+}
+
+impl Default for LimiterPolicy {
+    fn default() -> Self {
+        Self {
+            max_failures: LOGIN_MAX_FAILURES,
+            window: LOGIN_WINDOW,
+            lock: LOGIN_LOCK,
+        }
+    }
+}
+
+struct Attempt {
+    failures: u32,
+    window_started: Instant,
+    locked_until: Option<Instant>,
+}
+
+struct LoginLimiter {
+    policy: LimiterPolicy,
+    entries: Mutex<HashMap<String, Attempt>>,
+}
+
+impl LoginLimiter {
+    fn new(policy: LimiterPolicy) -> Self {
+        Self {
+            policy,
+            entries: Mutex::new(HashMap::new()),
+        }
+    }
+
+    fn locked_for(&self, keys: &[String]) -> Option<u64> {
+        let now = Instant::now();
+        let entries = self
+            .entries
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        keys.iter()
+            .filter_map(|key| entries.get(key))
+            .filter_map(|attempt| attempt.locked_until)
+            .filter(|until| *until > now)
+            .map(|until| until.duration_since(now).as_secs().max(1))
+            .max()
+    }
+
+    fn record_failure(&self, keys: &[String]) {
+        let now = Instant::now();
+        let mut entries = self
+            .entries
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+
+        if entries.len() >= LOGIN_MAX_ENTRIES {
+            entries.retain(|_, attempt| {
+                attempt.locked_until.is_some_and(|until| until > now)
+                    || now.duration_since(attempt.window_started) <= self.policy.window
+            });
+        }
+
+        for key in keys {
+            let attempt = entries.entry(key.clone()).or_insert_with(|| Attempt {
+                failures: 0,
+                window_started: now,
+                locked_until: None,
+            });
+            if now.duration_since(attempt.window_started) > self.policy.window {
+                attempt.failures = 0;
+                attempt.window_started = now;
+                attempt.locked_until = None;
+            }
+            attempt.failures = attempt.failures.saturating_add(1);
+            if attempt.failures >= self.policy.max_failures {
+                attempt.locked_until = Some(now + self.policy.lock);
+            }
+        }
+    }
+
+    fn clear(&self, keys: &[String]) {
+        let mut entries = self
+            .entries
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        for key in keys {
+            entries.remove(key);
+        }
+    }
+}
+
+static LOGIN_LIMITER: LazyLock<LoginLimiter> =
+    LazyLock::new(|| LoginLimiter::new(LimiterPolicy::default()));
+
+fn login_keys(username: &str, last_ip: Option<&str>) -> Vec<String> {
+    let mut keys = vec![format!("user:{}", username.trim().to_ascii_lowercase())];
+    if let Some(ip) = last_ip {
+        keys.push(format!("ip:{}", ip.trim()));
+    }
+    keys
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -439,6 +586,41 @@ mod tests {
     #[test]
     fn rejects_invalid_totp_secret() {
         assert!(build_totp("not-base32").is_none());
+    }
+
+    #[test]
+    fn login_limiter_locks_and_clears() {
+        let limiter = LoginLimiter::new(LimiterPolicy {
+            max_failures: 2,
+            window: Duration::from_secs(60),
+            lock: Duration::from_secs(60),
+        });
+        let keys = vec!["user:alice".to_string()];
+        assert!(limiter.locked_for(&keys).is_none());
+        limiter.record_failure(&keys);
+        assert!(limiter.locked_for(&keys).is_none());
+        limiter.record_failure(&keys);
+        assert!(limiter.locked_for(&keys).is_some());
+        limiter.clear(&keys);
+        assert!(limiter.locked_for(&keys).is_none());
+    }
+
+    #[test]
+    fn verifies_and_reports_the_totp_step() {
+        let bytes = [7u8; 20];
+        let secret = Secret::from(bytes).to_base32();
+        let totp = Builder::new()
+            .with_secret(Secret::from(bytes))
+            .with_skew(1)
+            .build()
+            .unwrap();
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_secs();
+        let code = totp.generate(now).to_string();
+        assert_eq!(verify_totp_step(&secret, &code), Some(now / 30));
+        assert!(verify_totp_step(&secret, "not-a-code").is_none());
     }
 
     #[test]
