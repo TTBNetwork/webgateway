@@ -69,7 +69,9 @@ http3_ports = [443]
       "user_agent": "*Mobile*",
       "query": { "version": "v2" },
       "method": ["POST"]
-    }
+    },
+    "weight": 3,
+    "priority": 0
   }
   ```
 
@@ -77,7 +79,10 @@ http3_ports = [443]
   - `match.user_agent`：大小写不敏感 glob；
   - `match.query`：所有键都要匹配，空值表示只要求存在，请求值按 URL 解码；
   - `match.method`：忽略大小写，空数组表示不限制；
-  - 所有配置条件 AND；命中后端轮询；没有任何后端命中时回退到所有后端。
+  - `weight`（默认 1）：同一优先级组内按权重轮询；`priority`（默认 0）：数值越小越优先，
+    数值更大的后端是备用组，只有低优先级组没有匹配后端时才参与；
+  - 所有配置条件 AND；命中后端按权重轮询；没有任何后端命中时回退到所有后端。
+  - 当前**不做失败自动切换**（备用组不是健康检查故障转移）。
 - 上游支持 `http://` 与 `https://`；https 使用 webpki 根 + 可选 `[upstream_tls].ca_file`，gRPC 同样支持 TLS。
 
 ## 4. 请求头（站点级配置）
@@ -164,7 +169,7 @@ http3_ports = [443]
 - QUIC 使用 TLS 1.3 + ALPN `h3`，证书复用 TLS 的 SNI 存储（含默认自签证书）。
 - 请求体完整缓冲后，通过内部 HTTP/1.1 buffered client 转发上游；响应体也完整缓冲后发送。
 - 访问日志记录 `HTTP/3.0`；`get_request_ip` 的 raw/XFF 模式可用，PROXY protocol 不适用。
-- 限制：无流式请求/响应（大 body 占内存）；同一 QUIC 连接内请求串行处理；
+- 限制：无流式请求/响应（大 body 占内存）；每个请求独立 spawn、可并发处理；
   WebSocket / gRPC over h3 未实现；未调 0-RTT / 连接迁移。
 
 ### 5.4 缓存
@@ -214,18 +219,20 @@ http3_ports = [443]
 - 统计：3 条合成日志 → 秒级 30/150 字节；旧秒归并分钟 70/700；旧分归并日 90/900。
 - 缓存：MISS count=1 → HIT count=1 → 304 → 配置更新后 MISS count=2。
 - 上游 TLS：本地 CA + `https://localhost:9443` 后端返回 `upstream-https-ok`。
+- 权重/优先级：40 次请求按 3:1 分到 30/10，备用组 0 次。
+- HTTP/3 并发：同一 QUIC 连接 5 个请求全部 200，按权重 4/1 分流。
 - HTTP 200、HTTPS HTTP/2 200、未知 Host 404、心跳更新、SIGTERM offline。
-- 网关单测 32 个；shared 迁移/单测、fmt、clippy 全通过。
+- 网关单测 33 个；shared 迁移/单测、fmt、clippy 全通过。
 
 ## 8. 尚未实现（下一步）
 
 - 缓存增强：持久化/多级缓存、stale-while-revalidate、Vary 维度、命中率指标。
 - IP / User-Agent 拦截（优先级低）。
 - 上游传输扩展：
-  - HTTP/3 流式请求/响应、同连接并发多请求、0-RTT / 连接迁移调优；
+  - HTTP/3 流式请求/响应、0-RTT / 连接迁移调优；
   - HTTP/2 extended CONNECT / WebSocket over h2；
   - 其余特殊 RFC 按需补充。
-- 更复杂的路由（header / 正则）、后端权重/主备、上游客户端证书。
+- 更复杂的路由（header / 正则）、失败自动切换/健康检查、上游客户端证书。
 
 ## 9. 运行
 

@@ -106,3 +106,9 @@
 - gRPC 与 buffered 客户端复用同一 connector，支持 gRPC over TLS / HTTPS 缓冲请求。
 - E2E：本地 CA + `https://localhost:9443` 后端 → 200 `upstream-https-ok`。
 - 网关单测 32 个；修复 hyper-rustls 预置 ALPN 导致的 panic。
+### 后端权重/优先级 + HTTP/3 并发（分支 `feat/backend-weights`）
+- 后端新增 `weight`（默认 1）与 `priority`（默认 0，越小越优先）；低优先级组内按权重轮询，
+  更高 priority 作为备用组（无自动故障切换）。
+- HTTP/3 每个请求独立 spawn，同一 QUIC 连接可并发处理多个流（body 仍缓冲）。
+- E2E：40 次请求按 3:1 分到 30/10，备用组 0；HTTP/3 同连接 5 个请求全部 200、按权重 4/1。
+- 网关单测 33 个；文档更新。
