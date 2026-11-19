@@ -73,3 +73,9 @@
 - E2E：GET/POST/404 产生 request/response 行；POST 5 字节、响应 12/9 字节，size 表按秒写入。
 - 限制：chunked 长度为 0/NULL；writer 退出时最后一批可能丢；`access_stats_*` 聚合与保留期未做。
 - 网关单测 26 个；文档更新。
+### 网关 WebSocket / CONNECT（分支 `feat/gateway-upgrades`）
+- WebSocket：`Upgrade: websocket` 走升级通路；服务端 `serve_connection_with_upgrades`，
+  上游 HTTP/1.1 握手 + `.with_upgrades()`，101 后双向桥接；非 101 正常回传。
+- CONNECT：authority host 必须命中已配置站点，否则 403；200 后原始 TCP 隧道（非 TLS MITM）。
+- 访问日志记录 101/200；E2E WS echo（hello-websocket）与 CONNECT（localhost:9500）通过。
+- 网关单测 28 个；未做 HTTP/3、HTTP/2 extended CONNECT、上游 TLS。

@@ -1,7 +1,7 @@
 # WebGateway v2 网关（数据面）
 
 > 网关只读取数据库、不执行任何 DDL；主控初始化完成之前网关会等待。
-> 访问统计聚合、缓存、IP-UA 拦截、WebSocket/HTTP3 尚未实现，见文末。
+> 访问统计聚合、缓存、IP-UA 拦截、HTTP/3 尚未实现，见文末。
 
 ## 1. 启动与生命周期
 
@@ -138,6 +138,18 @@ ports = [80, 443]
 - 限制：正文长度取 Content-Length，chunked/未知请求为 0、响应为 NULL；writer 关闭时直接 abort，
   最后一批可能丢；`access_stats_*` 的秒/分/日聚合与保留期尚未实现。
 
+### 5.2 WebSocket 与 CONNECT
+
+- **WebSocket**：请求头 `Upgrade: websocket` 时走升级通路：
+  - 服务端使用 `serve_connection_with_upgrades`；
+  - 到上游做原始 HTTP/1.1 握手，客户端连接启用 `.with_upgrades()`；
+  - 上游返回 101 后双向桥接；非 101 按普通响应回传；
+  - 访问日志记录 101。
+- **CONNECT**：仅允许 authority 的 host 命中已配置站点（否则 403），连接 `host:port` 后返回 200
+  并桥接原始 TCP；不是 TLS MITM，只做透传。访问日志记录 CONNECT + 200。
+- 限制：HTTP/2 extended CONNECT / WebSocket over h2 未实现；升级连接不计字节数（body_length 0）；
+  上游仍只支持明文 `http://`。
+
 ## 6. TLS
 
 - 证书来自 `certificates`（`fullchain` + `private_key` PEM），过期证书不加载。
@@ -153,8 +165,10 @@ ports = [80, 443]
 - PROXY protocol：无头 / v1 / v2 三种连接分别解析出 127.0.0.1 / 198.51.100.7 / 203.0.113.9，并写入上游头。
 - 路由：POST `/api/x?version=v2` + curl UA → upstream-one；version/method/UA 任一不匹配 → upstream-two；`/web` → upstream-two。
 - 访问日志：GET/POST/404 分别产生 request/response 行；POST 5 字节、响应 12/9 字节，size 表按秒记录。
+- WebSocket：Python WS echo 经网关回显 `hello-websocket`（101）。
+- CONNECT：`CONNECT localhost:9500` 返回 200，`ping-through-connect` 原样回显。
 - HTTP 200、HTTPS HTTP/2 200、未知 Host 404、心跳更新、SIGTERM offline。
-- 网关单测 26 个；shared 迁移/单测、fmt、clippy 全通过。
+- 网关单测 28 个；shared 迁移/单测、fmt、clippy 全通过。
 
 ## 8. 尚未实现（下一步）
 
@@ -162,9 +176,9 @@ ports = [80, 443]
 - 网关缓存（主控下发：大小、文件类型、ETag、TTL 等，细节待定）。
 - IP / User-Agent 拦截（优先级低）。
 - 上游传输扩展：
-  - **WebSocket**：服务端 `serve_connection_with_upgrades` + 原始上游握手 + upgrade 双向桥接；
-  - **HTTP/3**：QUIC（quinn）UDP 监听与 0-RTT、连接迁移；
-  - **特殊 RFC**：CONNECT 等，按需协议分发层。
+  - **HTTP/3**：QUIC（quinn）+ h3 + UDP 监听 + ALPN `h3`；需要把代理核心从 hyper 请求类型解耦；
+  - HTTP/2 extended CONNECT / WebSocket over h2；
+  - 其余特殊 RFC 按需补充。
 - 更复杂的路由（header / 正则）、上游 TLS、后端权重/主备。
 
 ## 9. 运行
