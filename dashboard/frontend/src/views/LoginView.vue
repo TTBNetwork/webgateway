@@ -1,36 +1,31 @@
 <script setup lang="ts">
-import { onMounted, ref } from 'vue'
+import { ref } from 'vue'
 import AppIcon from '../components/AppIcon.vue'
 import { api } from '../api'
 import { errorMessage } from '../format'
 import { t } from '../i18n'
 import { prefs } from '../prefs'
 import { navigate } from '../router'
-import { clearToken, session, setToken } from '../session'
+import { session, setSession } from '../session'
 
-const token = ref('')
+const username = ref(session.user?.username ?? 'admin')
+const code = ref('')
 const loading = ref(false)
 const error = ref('')
 
-onMounted(() => {
-  token.value = session.token
-})
-
 async function submit(): Promise<void> {
-  if (!token.value.trim()) {
+  if (!username.value.trim() || !code.value.trim()) {
     error.value = t('login.required')
     return
   }
 
   loading.value = true
   error.value = ''
-  setToken(token.value.trim())
-
   try {
-    await api.summary()
+    const result = await api.login(username.value.trim(), code.value.trim())
+    setSession(result.token, result.user)
     navigate('/')
   } catch (reason) {
-    clearToken()
     error.value = t('login.invalid') + ' ' + errorMessage(reason)
   } finally {
     loading.value = false
@@ -84,14 +79,26 @@ function toggleLocale(): void {
         </div>
 
         <form class="login-form" @submit.prevent="submit">
-          <label class="field-label" for="token">{{ t('login.token') }}</label>
+          <label class="field-label" for="username">{{ t('login.username') }}</label>
           <input
-            id="token"
-            v-model="token"
+            id="username"
+            v-model="username"
             class="input"
-            type="password"
-            autocomplete="current-password"
-            :placeholder="t('login.placeholder')"
+            type="text"
+            autocomplete="username"
+            :placeholder="t('login.usernamePlaceholder')"
+          />
+
+          <label class="field-label" for="code">{{ t('login.code') }}</label>
+          <input
+            id="code"
+            v-model="code"
+            class="input"
+            type="text"
+            inputmode="numeric"
+            autocomplete="one-time-code"
+            maxlength="6"
+            :placeholder="t('login.codePlaceholder')"
           />
 
           <p v-if="error" class="form-error">{{ error }}</p>

@@ -4,6 +4,7 @@
 //! PostgreSQL schema. Gateways wait until this process has published the
 //! schema version in schema_state.
 
+mod auth;
 mod config;
 mod router;
 mod stats;
@@ -20,6 +21,7 @@ async fn main() -> anyhow::Result<()> {
     let database = Database::connect(&config.database).await?;
     database.initialize_master(&config.database).await?;
     database.verify_schema().await?;
+    auth::ensure_default_admin(&database).await?;
 
     let stats_task = stats::spawn(database.clone());
 

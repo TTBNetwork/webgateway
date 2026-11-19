@@ -1,33 +1,9 @@
 <script setup lang="ts">
-import { ref } from 'vue'
 import AppIcon from '../components/AppIcon.vue'
 import { t } from '../i18n'
-import { api } from '../api'
-import { errorMessage } from '../format'
 import { prefs } from '../prefs'
 import { navigate } from '../router'
-import { clearToken, session, setToken } from '../session'
-
-const tokenDraft = ref(session.token)
-const message = ref('')
-const error = ref('')
-const saving = ref(false)
-
-async function saveToken(): Promise<void> {
-  saving.value = true
-  message.value = ''
-  error.value = ''
-  setToken(tokenDraft.value.trim())
-  try {
-    await api.summary()
-    message.value = t('settings.tokenSaved')
-  } catch (reason) {
-    clearToken()
-    error.value = errorMessage(reason)
-  } finally {
-    saving.value = false
-  }
-}
+import { clearToken, session } from '../session'
 
 function signOut(): void {
   clearToken()
@@ -111,28 +87,24 @@ function setLocale(locale: 'zh' | 'en'): void {
         <div class="card-header">
           <div>
             <h3>{{ t('settings.security') }}</h3>
-            <p>{{ t('settings.token') }}</p>
+            <p>{{ t('settings.account') }} / {{ t('settings.role') }}</p>
           </div>
         </div>
 
-        <label class="field-label" for="settings-token">{{ t('settings.token') }}</label>
-        <input
-          id="settings-token"
-          v-model="tokenDraft"
-          class="input"
-          type="password"
-          :placeholder="t('login.placeholder')"
-        />
+        <dl class="kv">
+          <div>
+            <dt>{{ t('settings.account') }}</dt>
+            <dd>{{ session.user?.username ?? '—' }}</dd>
+          </div>
+          <div>
+            <dt>{{ t('settings.role') }}</dt>
+            <dd class="mono">{{ session.user?.role ?? '—' }}</dd>
+          </div>
+        </dl>
+
         <p class="small-text muted">{{ t('settings.tokenHint') }}</p>
 
-        <p v-if="message" class="form-success">{{ message }}</p>
-        <p v-if="error" class="form-error">{{ error }}</p>
-
         <div class="button-row">
-          <button class="btn primary" type="button" :disabled="saving" @click="saveToken">
-            <AppIcon name="check" :size="16" />
-            {{ saving ? t('common.loading') : t('settings.saveToken') }}
-          </button>
           <button class="btn danger-ghost" type="button" @click="signOut">
             <AppIcon name="logout" :size="16" />
             {{ t('settings.signOut') }}

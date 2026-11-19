@@ -1,4 +1,4 @@
-import { clearToken, session } from './session'
+import { clearToken, session, type SessionUser } from './session'
 import { navigate } from './router'
 
 export interface TrafficPoint {
@@ -66,8 +66,22 @@ export interface AccessLog {
   status: number | null
 }
 
+export interface LoginResponse {
+  token: string
+  user: SessionUser
+}
+
 interface Items<T> {
   items: T[]
+}
+
+async function errorText(response: Response): Promise<string> {
+  try {
+    const body = (await response.json()) as { error?: string }
+    return body.error ?? 'HTTP ' + response.status
+  } catch {
+    return 'HTTP ' + response.status
+  }
 }
 
 async function request<T>(path: string): Promise<T> {
@@ -85,20 +99,27 @@ async function request<T>(path: string): Promise<T> {
     throw new Error('Unauthorized')
   }
   if (!response.ok) {
-    let message = 'HTTP ' + response.status
-    try {
-      const body = (await response.json()) as { error?: string }
-      if (body.error) message = body.error
-    } catch {
-      // Non-JSON error body; keep the status message.
-    }
-    throw new Error(message)
+    throw new Error(await errorText(response))
   }
 
   return (await response.json()) as T
 }
 
+async function login(username: string, code: string): Promise<LoginResponse> {
+  const response = await fetch('/api/auth/login', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ username, code }),
+  })
+  if (!response.ok) {
+    throw new Error(await errorText(response))
+  }
+  return (await response.json()) as LoginResponse
+}
+
 export const api = {
+  login,
+  me: () => request<{ user: SessionUser }>('auth/me').then((value) => value.user),
   summary: () => request<Summary>('summary'),
   websites: () => request<Items<Website>>('websites').then((value) => value.items),
   certificates: () => request<Items<Certificate>>('certificates').then((value) => value.items),

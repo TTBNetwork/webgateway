@@ -10,10 +10,14 @@ path = "src/main.rs"
 [dependencies]
 anyhow.workspace = true
 axum.workspace = true
+data-encoding = "2.11.1"
+getrandom = "0.4.3"
+jsonwebtoken = { version = "12.0.0", features = ["rust_crypto"] }
 serde.workspace = true
 serde_json.workspace = true
 shared = { path = "../../crates/shared" }
 sqlx.workspace = true
 tokio.workspace = true
 toml.workspace = true
+totp-rs = "6.0.0"
 tracing.workspace = true

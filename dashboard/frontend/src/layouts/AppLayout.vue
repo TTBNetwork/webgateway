@@ -11,7 +11,7 @@ import WebsitesView from '../views/WebsitesView.vue'
 import { t, type MessageKey } from '../i18n'
 import { prefs } from '../prefs'
 import { navigate, route } from '../router'
-import { clearToken } from '../session'
+import { clearToken, session } from '../session'
 
 interface NavItem {
   path: string
@@ -90,9 +90,9 @@ function logout(): void {
       <div class="sidebar-footer">
         <div class="sidebar-status">
           <span class="status-dot"></span>
-          <span>{{ t('settings.tokenStored') }}</span>
+          <span>{{ session.user?.username ?? 'service' }}</span>
         </div>
-        <small>{{ t('app.footer') }}</small>
+        <small>{{ session.user?.role ?? 'service' }}</small>
       </div>
     </aside>
 

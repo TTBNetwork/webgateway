@@ -1,17 +1,21 @@
 //! Dashboard API and health endpoint.
 
+use std::time::Duration;
+
 use axum::{
     Json, Router,
-    extract::{Query, Request, State},
-    http::{StatusCode, header},
+    extract::{Extension, Query, Request, State},
+    http::{HeaderMap, StatusCode, header},
     middleware::{self, Next},
     response::{IntoResponse, Response},
-    routing::get,
+    routing::{get, post},
 };
 use serde::Deserialize;
 use serde_json::{Value, json};
 use shared::database::{Database, schema_version};
 use sqlx::Row;
+
+use crate::auth::{self, User};
 
 #[derive(Clone)]
 struct AppState {
@@ -25,41 +29,107 @@ pub fn router(database: Database, api_token: Option<String>) -> Router {
         api_token,
     };
 
-    let api = Router::new()
-        .route("/summary", get(summary))
-        .route("/websites", get(websites))
-        .route("/certificates", get(certificates))
-        .route("/gateways", get(gateways))
-        .route("/logs", get(logs))
+    let protected = Router::new()
+        .route("/api/summary", get(summary))
+        .route("/api/websites", get(websites))
+        .route("/api/certificates", get(certificates))
+        .route("/api/gateways", get(gateways))
+        .route("/api/logs", get(logs))
+        .route("/api/auth/me", get(me))
         .route_layer(middleware::from_fn_with_state(state.clone(), require_auth));
 
     Router::new()
         .route("/health", get(health))
-        .nest("/api", api)
+        .route("/api/auth/login", post(login))
+        .merge(protected)
         .with_state(state)
 }
 
-async fn require_auth(State(state): State<AppState>, request: Request, next: Next) -> Response {
-    let Some(expected) = state.api_token.as_deref() else {
-        return next.run(request).await;
-    };
-
-    let authorized = request
+async fn require_auth(State(state): State<AppState>, mut request: Request, next: Next) -> Response {
+    let token = request
         .headers()
         .get(header::AUTHORIZATION)
         .and_then(|value| value.to_str().ok())
         .and_then(|value| value.strip_prefix("Bearer "))
-        .is_some_and(|value| value == expected);
+        .map(str::to_string);
 
-    if authorized {
-        next.run(request).await
-    } else {
-        (
+    let user = match token.as_deref() {
+        Some(token) if state.api_token.as_deref() == Some(token) => Some(User {
+            id: "service".to_string(),
+            username: "service".to_string(),
+            role: "service".to_string(),
+        }),
+        Some(token) => auth::authenticate(&state.database, token).await,
+        None => None,
+    };
+
+    match user {
+        Some(user) => {
+            request.extensions_mut().insert(user);
+            next.run(request).await
+        }
+        None => (
             StatusCode::UNAUTHORIZED,
             Json(json!({ "error": "unauthorized" })),
         )
-            .into_response()
+            .into_response(),
     }
+}
+
+#[derive(Debug, Deserialize)]
+struct LoginRequest {
+    username: String,
+    code: String,
+}
+
+async fn login(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Json(payload): Json<LoginRequest>,
+) -> Result<Json<Value>, ApiError> {
+    if payload.username.trim().is_empty() || payload.code.trim().is_empty() {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            Json(json!({ "error": "username and code are required" })),
+        ));
+    }
+
+    let last_ip = headers
+        .get("x-forwarded-for")
+        .and_then(|value| value.to_str().ok())
+        .map(|value| value.split(',').next().unwrap_or(value).trim().to_string())
+        .or_else(|| {
+            headers
+                .get("x-real-ip")
+                .and_then(|value| value.to_str().ok())
+                .map(str::to_string)
+        });
+
+    match auth::login(
+        &state.database,
+        payload.username.trim(),
+        payload.code.trim(),
+        last_ip,
+    )
+    .await
+    .map_err(internal)?
+    {
+        Some(success) => Ok(Json(json!({
+            "token": success.token,
+            "user": success.user,
+        }))),
+        None => {
+            tokio::time::sleep(Duration::from_millis(500)).await;
+            Err((
+                StatusCode::UNAUTHORIZED,
+                Json(json!({ "error": "invalid username or code" })),
+            ))
+        }
+    }
+}
+
+async fn me(Extension(user): Extension<User>) -> Json<Value> {
+    Json(json!({ "user": user }))
 }
 
 async fn health(State(state): State<AppState>) -> impl IntoResponse {
