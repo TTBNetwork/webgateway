@@ -128,3 +128,23 @@
 - 缓存默认 64 MiB → **16 MiB**，新增 `[server].cache_max_size_bytes` / `GATEWAY_CACHE_MAX_SIZE`。
 - 认证限制（TOTP 重放/限速、JWT 撤销/RBAC、secret 明文）已记录到 issue.md。
 - 验证：admin + TOTP → JWT → /api/summary；dashboard 2 个单测；前端 build/lint 通过。
+
+## 2026-11-19（实时协议联调）
+
+### Nezha gRPC 与 MCSManager WebSocket 联调（分支 `test/realtime-protocols`）
+- 新增 `scripts/e2e/mcsmanager_ws_probe.mjs`：零依赖（Node 全局 WebSocket）Socket.IO v4 探针，
+  经网关完成 engine.io 握手、命名空间连接、daemon key 鉴权、`info/overview` 调用，
+  并保持连接跨过 engine.io ping 周期（默认 20s），验证长连接与 ping/pong。
+- 新增 `scripts/e2e/nezha_grpc_probe.sh`：用真实 nezha-agent 经网关连接 Nezha Dashboard，
+  轮询 Dashboard SQLite 的 `servers` / `online_sessions`，确认 gRPC 会话保持 `ongoing = 1` 且无 RPC 错误。
+- 新增 `e2e-realtime.md`：完整拓扑、站点配置、复现步骤、实测结果与限制。
+- 实测环境与结果：
+  - Nezha Dashboard v2.6.2 + agent v2.4.0：gRPC h2c（18080）与 TLS/ALPN h2（18443）均注册成功；
+    `ReportSystemInfo2` / `ReportSystemState` / `ReportGeoIP` 返回 200，`RequestTask` 双向流保持打开，
+    Dashboard 会话 `ongoing = 1` 约 37s，Agent 停止后正常结束；Go gRPC 客户端未报 trailer 错误。
+  - MCSManager v10.22.1（daemon 4.19.3）：升级 101、Socket.IO 握手、daemon key 鉴权、
+    `info/overview`（daemon 4.19.3）、45s 内两次 engine.io ping/pong 全部通过。
+  - 同一 MCS daemon 开启 SSL 后：直连 wss 成功，经网关失败，复现 B-03（upgrade.rs 走裸 TcpStream，不支持 https 上游）。
+- `gateway.md` 更新 WebSocket 限制与验证清单；`issue.md` 将 F-19/F-20 标为已用真实软件验证，
+  P-02/P-03/B-03/B-13 补充实测结论。
+- 本分支仅新增测试脚本与文档，未改生产代码。

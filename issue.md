@@ -36,8 +36,8 @@
 | F-16 | HTTP/3 入站 | ✅ | quinn/h3/h3-quinn，UDP 监听，TLS 1.3 + ALPN h3 |
 | F-17 | HTTP/3 同连接并发 | ✅ | 每个请求独立 spawn；aioquic 单连接 5 请求全部 200 |
 | F-18 | 上游 HTTP / HTTPS | ✅ | hyper-rustls HttpsConnector；可选 ca_file；webpki 根 |
-| F-19 | gRPC 上游 | ⚠️ | h2c/TLS、application/grpc 检测、TE: trailers、无 60s 超时；无真实 gRPC E2E |
-| F-20 | WebSocket 升级 | ⚠️ | h1 Upgrade、101、双向桥接；仅 http 上游 |
+| F-19 | gRPC 上游 | ✅ | h2c/TLS、application/grpc 检测、TE: trailers、无 60s 超时；Nezha v2.6.2 + agent v2.4.0 真实 E2E 通过（一元/双向流/trailers） |
+| F-20 | WebSocket 升级 | ✅ | h1 Upgrade、101、双向桥接；MCSManager daemon 4.19.3 实测握手/鉴权/业务事件/45s 长连接通过；wss 上游仍缺（B-03） |
 | F-21 | CONNECT 隧道 | ⚠️ | h1；authority host 必须命中已配置站点；非 MITM |
 | F-22 | PROXY protocol v1/v2 | ✅ | 连接入口解析；站点级 get_request_ip 决定信任 |
 | F-23 | 客户端 IP 模式 | ✅ | raw / proxyProtocol / xForwardedFor / xRealIP；E2E 验证 |
@@ -73,7 +73,7 @@
 |---|---|---|---|
 | F-39 | 网关单测 | ✅ | 33 个；fmt/clippy 全通过 |
 | F-40 | shared 测试 | ✅ | 10 单测 + 2 集成（临时库） |
-| F-41 | 本地 E2E | ✅ | NOTIFY、headers、PROXY、路由、日志、统计、缓存、TLS、WS、CONNECT、h3、权重、TOTP/JWT |
+| F-41 | 本地 E2E | ✅ | NOTIFY、headers、PROXY、路由、日志、统计、缓存、TLS、WS、CONNECT、h3、权重、TOTP/JWT；Nezha gRPC 与 MCSManager WS 真实软件联调 |
 
 ---
 
@@ -82,8 +82,8 @@
 | ID | Feature | 限制 |
 |---|---|---|
 | P-01 | HTTP/3 | 请求/响应全缓冲，无流式；无 Alt-Svc；无 0-RTT/连接迁移；h3 不走缓存；WS/gRPC over h3 未实现；无 body 上限 |
-| P-02 | gRPC | 无真实 gRPC server E2E（建议 Nezha 联调），trailers 为设计假设 |
-| P-03 | WebSocket | https 后端不可用（裸 TcpStream，不走 TLS connector）；忽略 backend base path；字节数记 0；建议 MCSManager 联调 |
+| P-02 | gRPC | 已在 Nezha 上验证；访问日志只记 HTTP 200，无法区分 grpc-status；无 gRPC-Web |
+| P-03 | WebSocket | https 后端不可用（裸 TcpStream，不走 TLS connector）；忽略 backend base path；字节数记 0；MCSManager 联调已完成 |
 | P-04 | CONNECT | 仅 h1；400/403 不写日志；已配置 host 的任意端口可隧道；无鉴权 |
 | P-05 | 缓存 | 仅 h1/h2；配置同步清空全部；无持久化/Vary/HEAD/stale-while-revalidate/single-flight/命中率；max_entry_size 在完整收集后判断 |
 | P-06 | 访问日志 | body_length 取 Content-Length；chunked 请求 0、响应 NULL；WS/CONNECT 0；headers 重复键被覆盖；writer 退出丢最后一批 |
@@ -174,6 +174,7 @@
 - 症状：backend URL 为 https 时 WS 握手失败；同时忽略 backend base path。
 - 原因：upgrade.rs 使用裸 TcpStream::connect，不走 HttpsConnector；路径只用客户端 path。
 - 影响：wss 上游、带路径前缀的 WS 服务不可用。
+- 实测（MCSManager daemon 4.19.3 开启 SSL）：直连 wss 成功，经网关失败，确认此 bug。
 - 建议：复用 HttpsConnector；拼接 backend base path；补 E2E。
 - 位置：gateway/src/upgrade.rs
 
@@ -230,9 +231,11 @@
 - h1/h2 响应不广播 h3，客户端不会自动升级，必须显式连接 UDP 端口。
 - 建议：在 TLS 响应加 Alt-Svc: h3=":443"; ma=86400。
 
-#### B-13 gRPC 无真实 E2E
-- content-type 检测、h2 客户端、trailers 透传均未在真实 grpc server 上验证。
-- 建议：CI 起 grpc-go/tonic echo server 做 E2E。
+#### B-13 gRPC 真实 E2E（已解决，2026-11-19）
+- 已用 Nezha Dashboard v2.6.2 + agent v2.4.0 验证：h2c 与 TLS/ALPN h2 入口均注册成功，
+  `ReportSystemInfo2` / `ReportSystemState` / `ReportGeoIP` 返回 200，`RequestTask` 双向流保持打开，
+  Dashboard 会话 `ongoing = 1` 直到 Agent 停止；Go gRPC 客户端未报 trailer 错误。
+- 仍无 CI 级 gRPC E2E（依赖外部软件，见 U-31）；访问日志只有 HTTP 200，不记录 grpc-status。
 
 #### B-14 面板“今日”按 UTC 日界
 - summary 的 date_trunc('day', now()) 是数据库 UTC 日；+08 用户看到的“今日”从本地 08:00 开始。

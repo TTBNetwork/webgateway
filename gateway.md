@@ -161,7 +161,10 @@ http3_ports = [443]
 - **CONNECT**：仅允许 authority 的 host 命中已配置站点（否则 403），连接 `host:port` 后返回 200
   并桥接原始 TCP；不是 TLS MITM，只做透传。访问日志记录 CONNECT + 200。
 - 限制：HTTP/2 extended CONNECT / WebSocket over h2 未实现；升级连接不计字节数（body_length 0）；
-  上游仍只支持明文 `http://`。
+  上游仍只支持明文 `http://`（wss 后端是 B-03，待修）。
+- 已用 MCSManager v10.22.1（daemon 4.19.3）实测：`/socket.io` 升级 101、Socket.IO 握手、
+  daemon key 鉴权、`info/overview` 业务事件、45s 内两次 engine.io ping/pong 全部通过；
+  同一 daemon 开启 SSL 后 wss 上游失败，复现了 B-03。详见 `e2e-realtime.md`。
 
 ### 5.3 HTTP/3（QUIC）
 
@@ -222,6 +225,11 @@ http3_ports = [443]
 - 上游 TLS：本地 CA + `https://localhost:9443` 后端返回 `upstream-https-ok`。
 - 权重/优先级：40 次请求按 3:1 分到 30/10，备用组 0 次。
 - HTTP/3 并发：同一 QUIC 连接 5 个请求全部 200，按权重 4/1 分流。
+- gRPC（Nezha Dashboard v2.6.2 + agent v2.4.0）：h2c 与 TLS/ALPN h2 两种入口均注册成功；
+  `ReportSystemInfo2`、`ReportSystemState`、`ReportGeoIP` 返回 200，`RequestTask` 双向流保持打开，
+  Dashboard `online_sessions.ongoing = 1` 直到 Agent 停止。Go gRPC 客户端未报 trailer 错误。
+- WebSocket（MCSManager daemon 4.19.3）：升级 101、Socket.IO 鉴权、`info/overview`、长连接 ping/pong 通过。
+- wss 上游（MCS daemon 开 SSL）：失败，复现 B-03（upgrade.rs 不走 TLS connector）。
 - HTTP 200、HTTPS HTTP/2 200、未知 Host 404、心跳更新、SIGTERM offline。
 - 网关单测 33 个；shared 迁移/单测、fmt、clippy 全通过。
 
@@ -230,6 +238,7 @@ http3_ports = [443]
 - 缓存增强：持久化/多级缓存、stale-while-revalidate、Vary 维度、命中率指标。
 - IP / User-Agent 拦截（优先级低）。
 - 上游传输扩展：
+  - WebSocket 走 `HttpsConnector`、支持 `wss://` 与后端 base path（B-03）；
   - HTTP/3 流式请求/响应、0-RTT / 连接迁移调优；
   - HTTP/2 extended CONNECT / WebSocket over h2；
   - 其余特殊 RFC 按需补充。
