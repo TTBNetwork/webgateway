@@ -28,3 +28,10 @@
 - 测试：9 个单元测试 + 临时库集成测试（主控初始化、幂等、网关等待超时/就绪）。
 - 验证：在 `webgateway_beta_v2` 实际初始化成功（schema version 1、16 张表、4 周分区、两个扩展已装），
   `GET /health` 返回 200 `{"status":"ok","schema_version":1}`。
+### 时区与技术栈规则（2026-11-18）
+- TimeZone 统一 `UTC+0`：beta 库执行 `ALTER DATABASE webgateway_beta_v2 SET timezone='UTC'`；
+  `postgresql-dockerfile` 的 CMD 增加 `-c timezone=UTC`；集成测试断言主控/网关会话均为 UTC。
+- 面板后续按用户时区展示（前端换算，服务端不做本地时区换算）。
+- 记录网关缓存（主控下发策略：大小上限、文件类型、ETag、TTL 等，细节后续）与 IP/UA 拦截（优先级低）；
+  缓存/拦截配置后续放 `websites.config` JSONB，本步不改 schema。
+- AGENT.md 增加上述规则；database.md 更新时区约定与 `websites.config` 说明。

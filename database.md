@@ -5,7 +5,7 @@
 >
 > 目标库是测试库 `webgateway_beta_v2`；连接串不写入仓库，只通过 `DATABASE_URL` 或本地 `config.toml` 注入。
 > 撰写时实测环境：PostgreSQL 18.2；库为空（仅 `plpgsql` 扩展）；角色 `webgateway` 是库 owner + superuser；
-> `public` schema 可建对象；UTF8 + C collation；`TimeZone = Asia/Shanghai`。
+> `public` schema 可建对象；UTF8 + C collation；`TimeZone` 已统一为 `UTC`（数据库级默认，面板按用户时区展示）。
 
 ## 1. 目标与约束
 
@@ -25,6 +25,7 @@
 7. **网关在线状态**（优先级中等）：网关启动时在 `gateways` 表标记 online 并保持心跳，优雅退出时标记 offline；
    `gateways_online` 视图以心跳新鲜度判定在线，避免崩溃后状态残留。
 8. **统计粒度**（已确认）：最近 1 小时保留秒级聚合，超过 1 小时归并为分钟级；日级由分钟级汇总。
+9. **时区**（已确认）：默认 `UTC+0`，数据库/服务端存储与统计统一 UTC；面板按用户时区展示。
 
 ## 2. 环境与连接
 
@@ -34,7 +35,7 @@
 | 库 | `webgateway_beta_v2` |
 | 角色 | `webgateway`（库 owner、superuser） |
 | 编码 / 排序 | UTF8 / C |
-| 时区 | `Asia/Shanghai` |
+| 时区 | `UTC`（数据库/会话默认；面板按用户时区展示） |
 | 当前对象 | 无表、无视图、仅 `plpgsql` |
 | 可用扩展 | `uint128 1.1.1`、`btree_gin 1.3`、`pg_cron 1.6`、`vchord 0.0.0`（当前均未安装） |
 
@@ -43,6 +44,7 @@
 - 连接串只通过环境变量 `DATABASE_URL` 或本地 `config.toml` 提供；`.gitignore` 忽略 `config.toml`，
   仓库里只提交 `config.example.toml`。
 - 驱动：`sqlx 0.8`（`postgres` + `runtime-tokio` + `chrono` + `migrate`），不启用 TLS feature（与 v1 一致）。
+  sqlx 会把连接会话的 `TimeZone` 固定为 `UTC`；数据库级默认也设为 `UTC`（镜像 `CMD` 与 `ALTER DATABASE`）。
   如果以后要求 `sslmode=require`，需要额外启用 sqlx 的 rustls feature。
 - 连接池：`max_connections = 10`（可配）、`acquire_timeout = 5s`、单次连接超时 `connect_timeout = 10s`。
 
@@ -282,7 +284,7 @@ FROM users;
 | `ports` | `uint2[]` | NOT NULL `DEFAULT '{}'` | 监听端口（`uint2` 天然限制 0..65535，应用层再校验 1..65535） |
 | `certificates` | `TEXT[]` | NOT NULL `DEFAULT '{}'` | 关联证书 id（元数据） |
 | `backends` | `JSONB` | NOT NULL `DEFAULT '[]'` | 上游列表 |
-| `config` | `JSONB` | NOT NULL `DEFAULT '{}'` | 站点行为配置 |
+| `config` | `JSONB` | NOT NULL `DEFAULT '{}'` | 站点行为配置（后续含网关缓存策略、IP/UA 拦截规则等） |
 | `created_at` / `updated_at` | `TIMESTAMPTZ` | NOT NULL `DEFAULT now()` | |
 
 - 索引：`GIN (hosts)`、`GIN (name)`、`(created_at DESC)`。
@@ -458,8 +460,9 @@ $fn$ LANGUAGE plpgsql;
 
 - 主控在第一版迁移末尾调用 `wg_ensure_upcoming_weeks(2)`。
 - 网关后续每小时调用预建/回收（本步只建函数，不写调度）。
-- sqlx 连接会设置 `TimeZone=UTC`，因此周分区按 **UTC 周**（周一起）对齐，`access_stats_*` 的日期也按 UTC；
-  实测分区边界例如 `2026-11-16 08:00+08`（= UTC 周一 00:00）。前端展示时再换算到用户时区。
+- 时区统一 `UTC+0`：sqlx 连接与会话都是 UTC，数据库级默认也设为 UTC；周分区按 **UTC 周**（周一起）对齐，
+  `access_stats_*` 的日期也按 UTC。实测分区边界例如 `2026-11-16 08:00+08`（= UTC 周一 00:00）。
+  面板根据用户时区展示（前端换算），服务端不做本地时区换算。
 
 ### 5.3 就绪标记函数
 
