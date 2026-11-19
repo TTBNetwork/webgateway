@@ -5,6 +5,7 @@
 
 mod access;
 mod config;
+mod http3;
 mod listeners;
 mod node;
 mod notify;
@@ -83,6 +84,12 @@ async fn run() -> anyhow::Result<()> {
         .context("initial configuration sync failed")?;
     listeners.reconcile(&ports, state.clone());
 
+    let http3_tasks = if config.server.http3_ports.is_empty() {
+        Vec::new()
+    } else {
+        http3::spawn(bind, &config.server.http3_ports, state.clone())?
+    };
+
     let heartbeat = spawn_heartbeat(database.clone(), node.clone());
     let (event_tx, mut event_rx) = mpsc::channel(8);
     let notification_task = tokio::spawn(notify::listen(database.clone(), event_tx));
@@ -135,6 +142,9 @@ async fn run() -> anyhow::Result<()> {
     notification_task.abort();
     heartbeat.abort();
     listeners.abort_all();
+    for task in &http3_tasks {
+        task.abort();
+    }
     log_writer.abort();
     node.mark_offline(&database).await?;
     database.pool().close().await;

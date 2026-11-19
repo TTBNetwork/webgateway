@@ -9,7 +9,9 @@ use std::{
     },
 };
 
+use bytes::Bytes;
 use http::{HeaderMap, HeaderName, HeaderValue};
+use http_body_util::Full;
 use hyper::body::Incoming;
 use hyper_util::client::legacy::Client;
 use hyper_util::client::legacy::connect::HttpConnector;
@@ -30,6 +32,8 @@ pub struct AppState {
     pub client: UpstreamClient,
     /// HTTP/2-only client used for gRPC backends (h2c).
     pub grpc_client: UpstreamClient,
+    /// HTTP/1.1 client with a buffered body, used by the HTTP/3 path.
+    pub buffered_client: Client<HttpConnector, Full<Bytes>>,
     pub logs: mpsc::Sender<AccessEvent>,
     pub node: NodeInfo,
 }
@@ -47,6 +51,8 @@ impl AppState {
         let mut grpc_builder = Client::builder(hyper_util::rt::TokioExecutor::new());
         grpc_builder.http2_only(true);
         let grpc_client = grpc_builder.build(HttpConnector::new());
+        let buffered_client: Client<HttpConnector, Full<Bytes>> =
+            Client::builder(hyper_util::rt::TokioExecutor::new()).build(HttpConnector::new());
 
         Ok(Self {
             routing: RwLock::new(Arc::new(Routing::default())),
@@ -54,6 +60,7 @@ impl AppState {
             tls_acceptor,
             client,
             grpc_client,
+            buffered_client,
             logs,
             node,
         })

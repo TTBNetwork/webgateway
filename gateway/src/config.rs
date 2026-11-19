@@ -28,6 +28,8 @@ pub struct NodeConfig {
 pub struct ServerConfig {
     pub bind: String,
     pub ports: Vec<u16>,
+    /// UDP ports for HTTP/3; empty disables the QUIC listener.
+    pub http3_ports: Vec<u16>,
 }
 
 impl Default for ServerConfig {
@@ -35,6 +37,7 @@ impl Default for ServerConfig {
         Self {
             bind: "0.0.0.0".to_string(),
             ports: vec![80, 443],
+            http3_ports: Vec::new(),
         }
     }
 }
@@ -64,6 +67,12 @@ impl Config {
             if !ports.is_empty() {
                 config.server.ports = ports;
             }
+        }
+        if let Ok(raw) = std::env::var("GATEWAY_HTTP3_PORTS") {
+            config.server.http3_ports = raw
+                .split(',')
+                .filter_map(|item| item.trim().parse().ok())
+                .collect();
         }
 
         if config.database.url.trim().is_empty() {

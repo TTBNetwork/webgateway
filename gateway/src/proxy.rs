@@ -11,10 +11,21 @@ use http_body_util::{BodyExt, Full, combinators::BoxBody};
 use hyper::body::Incoming;
 use tracing::{Level, event};
 
-use crate::state::{AppState, Backend};
+use crate::access;
+use crate::state::{AppState, Backend, MatchContext};
 
 pub type ProxyBody = BoxBody<Bytes, Box<dyn Error + Send + Sync>>;
 type BoxError = Box<dyn Error + Send + Sync>;
+
+/// A fully buffered request, used by the HTTP/3 path.
+pub struct BufferedRequest {
+    pub method: http::Method,
+    pub uri: Uri,
+    pub version: Version,
+    pub headers: HeaderMap,
+    pub body: Bytes,
+    pub peer: SocketAddr,
+}
 
 const HOP_BY_HOP: &[&str] = &[
     "connection",
@@ -249,6 +260,225 @@ pub async fn handle(
     *response.status_mut() = status;
     *response.version_mut() = version;
     *response.headers_mut() = headers;
+    response
+}
+
+pub async fn handle_buffered(
+    state: Arc<AppState>,
+    request: BufferedRequest,
+    scheme: &'static str,
+) -> Response<Bytes> {
+    let BufferedRequest {
+        method,
+        uri,
+        version,
+        headers,
+        body,
+        peer,
+    } = request;
+
+    let raw_host = parts_host(&headers, &uri);
+    let path = uri.path().to_string();
+    let query = uri.query().map(str::to_string);
+    let user_agent = headers
+        .get(header::USER_AGENT)
+        .and_then(|value| value.to_str().ok())
+        .map(str::to_string);
+    let mut request_log = access::RequestLog {
+        id: access::next_id(),
+        host: raw_host.clone(),
+        method: method.as_str().to_string(),
+        path: path.clone(),
+        headers: access::headers_json(&headers),
+        http_version: access::version_label(version),
+        remote_addr: peer.ip().to_string(),
+        body_length: body.len() as u64,
+        website_id: None,
+    };
+
+    let Some(site) = state
+        .routing
+        .read()
+        .expect("routing lock poisoned")
+        .lookup(&raw_host)
+    else {
+        return buffered_error(
+            &state,
+            &request_log,
+            StatusCode::NOT_FOUND,
+            "Not Found",
+            version,
+        );
+    };
+
+    let client_ip = site.client_ip.resolve(peer, None, &headers);
+    request_log.remote_addr = client_ip.to_string();
+    request_log.website_id = Some(site.id.clone());
+
+    let context = MatchContext {
+        path: &path,
+        query: query.as_deref(),
+        method: method.as_str(),
+        user_agent: user_agent.as_deref(),
+    };
+    let Some(backend) = site.next_backend(&context).cloned() else {
+        return buffered_error(
+            &state,
+            &request_log,
+            StatusCode::BAD_GATEWAY,
+            "Bad Gateway",
+            version,
+        );
+    };
+
+    let upstream_uri = match build_upstream_uri(&backend, &uri) {
+        Ok(uri) => uri,
+        Err(error) => {
+            event!(Level::ERROR, %error, "failed to build the buffered upstream uri");
+            return buffered_error(
+                &state,
+                &request_log,
+                StatusCode::BAD_GATEWAY,
+                "Bad Gateway",
+                version,
+            );
+        }
+    };
+
+    let mut upstream_headers = headers;
+    remove_hop_by_hop(&mut upstream_headers);
+    if !raw_host.is_empty()
+        && let Ok(value) = HeaderValue::from_str(&raw_host)
+    {
+        upstream_headers.insert(header::HOST, value);
+    }
+    site.headers
+        .apply(&mut upstream_headers, &raw_host, scheme, client_ip);
+
+    let mut upstream_request = match Request::builder()
+        .method(method)
+        .uri(upstream_uri)
+        .version(Version::HTTP_11)
+        .body(Full::new(body))
+    {
+        Ok(request) => request,
+        Err(error) => {
+            event!(Level::ERROR, %error, "failed to build the buffered upstream request");
+            return buffered_error(
+                &state,
+                &request_log,
+                StatusCode::BAD_GATEWAY,
+                "Bad Gateway",
+                version,
+            );
+        }
+    };
+    *upstream_request.headers_mut() = upstream_headers;
+
+    let upstream_response = match tokio::time::timeout(
+        Duration::from_secs(60),
+        state.buffered_client.request(upstream_request),
+    )
+    .await
+    {
+        Ok(Ok(response)) => response,
+        Ok(Err(error)) => {
+            event!(Level::WARN, %error, "buffered upstream request failed");
+            return buffered_error(
+                &state,
+                &request_log,
+                StatusCode::BAD_GATEWAY,
+                "Bad Gateway",
+                version,
+            );
+        }
+        Err(_) => {
+            event!(Level::WARN, "buffered upstream request timed out");
+            return buffered_error(
+                &state,
+                &request_log,
+                StatusCode::GATEWAY_TIMEOUT,
+                "Gateway Timeout",
+                version,
+            );
+        }
+    };
+
+    let status = upstream_response.status();
+    let mut response_headers = upstream_response.headers().clone();
+    remove_hop_by_hop(&mut response_headers);
+    response_headers.insert(header::SERVER, HeaderValue::from_static("WebGateway"));
+    if let Ok(value) = HeaderValue::from_str(&state.node.header_label()) {
+        response_headers.insert(HeaderName::from_static("x-webgateway-node"), value);
+    }
+
+    let response_body = match upstream_response.into_body().collect().await {
+        Ok(body) => body.to_bytes(),
+        Err(error) => {
+            event!(Level::WARN, %error, "failed to read the buffered upstream body");
+            return buffered_error(
+                &state,
+                &request_log,
+                StatusCode::BAD_GATEWAY,
+                "Bad Gateway",
+                version,
+            );
+        }
+    };
+
+    log_event(
+        &state,
+        &request_log,
+        status,
+        &response_headers,
+        Some(response_body.len() as u64),
+        version,
+    );
+
+    let mut response = Response::new(response_body);
+    *response.status_mut() = status;
+    *response.version_mut() = version;
+    *response.headers_mut() = response_headers;
+    response
+}
+
+fn parts_host(headers: &HeaderMap, uri: &Uri) -> String {
+    headers
+        .get(header::HOST)
+        .and_then(|value| value.to_str().ok())
+        .map(str::to_string)
+        .or_else(|| {
+            uri.authority()
+                .map(|authority| authority.as_str().to_string())
+        })
+        .unwrap_or_default()
+}
+
+fn buffered_error(
+    state: &AppState,
+    request: &access::RequestLog,
+    status: StatusCode,
+    message: &'static str,
+    version: Version,
+) -> Response<Bytes> {
+    log_event(
+        state,
+        request,
+        status,
+        &HeaderMap::new(),
+        Some(message.len() as u64),
+        version,
+    );
+
+    let mut response = Response::new(Bytes::from_static(message.as_bytes()));
+    *response.status_mut() = status;
+    *response.version_mut() = version;
+    let headers = response.headers_mut();
+    headers.insert(header::CONTENT_TYPE, HeaderValue::from_static("text/plain"));
+    headers.insert(header::SERVER, HeaderValue::from_static("WebGateway"));
+    if let Ok(value) = HeaderValue::from_str(&state.node.header_label()) {
+        headers.insert(HeaderName::from_static("x-webgateway-node"), value);
+    }
     response
 }
 

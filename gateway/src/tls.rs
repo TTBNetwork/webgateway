@@ -47,6 +47,24 @@ pub fn acceptor(certs: Arc<RwLock<Arc<CertStore>>>) -> anyhow::Result<TlsAccepto
     Ok(TlsAcceptor::from(Arc::new(config)))
 }
 
+/// Build a QUIC server config for HTTP/3 using the same SNI certificate store.
+pub fn quic_server_config(
+    certs: Arc<RwLock<Arc<CertStore>>>,
+) -> anyhow::Result<quinn::ServerConfig> {
+    let provider = Arc::new(rustls::crypto::ring::default_provider());
+    let mut config = ServerConfig::builder_with_provider(provider)
+        .with_protocol_versions(&[&rustls::version::TLS13])
+        .context("failed to select TLS 1.3")?
+        .with_no_client_auth()
+        .with_cert_resolver(Arc::new(Resolver { certs }));
+
+    config.alpn_protocols = vec![b"h3".to_vec()];
+    let quic = quinn::crypto::rustls::QuicServerConfig::try_from(config)
+        .context("failed to build the QUIC server config")?;
+
+    Ok(quinn::ServerConfig::with_crypto(Arc::new(quic)))
+}
+
 /// Generate the self-signed fallback certificate used when SNI has no match.
 pub fn default_certified_key() -> anyhow::Result<Arc<CertifiedKey>> {
     let generated = generate_simple_self_signed(vec!["localhost".to_string()])
