@@ -10,3 +10,5 @@ wait_timeout_secs = 300
 
 [server]
 port = 3000
+# Bearer token required by /api when set; leave empty for development.
+# api_token = "change-me"

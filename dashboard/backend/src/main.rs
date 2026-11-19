@@ -33,9 +33,12 @@ async fn main() -> anyhow::Result<()> {
         "dashboard listening"
     );
 
-    axum::serve(listener, router::router(database))
-        .with_graceful_shutdown(shutdown_signal())
-        .await?;
+    axum::serve(
+        listener,
+        router::router(database, config.server.api_token.clone()),
+    )
+    .with_graceful_shutdown(shutdown_signal())
+    .await?;
 
     stats_task.abort();
     event!(Level::INFO, "dashboard stopped");

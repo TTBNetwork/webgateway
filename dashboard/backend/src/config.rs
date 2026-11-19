@@ -17,11 +17,16 @@ pub struct Config {
 #[serde(default)]
 pub struct ServerConfig {
     pub port: u16,
+    /// When set, /api routes require `Authorization: Bearer <token>`.
+    pub api_token: Option<String>,
 }
 
 impl Default for ServerConfig {
     fn default() -> Self {
-        Self { port: 3000 }
+        Self {
+            port: 3000,
+            api_token: None,
+        }
     }
 }
 
@@ -38,6 +43,10 @@ pub fn load() -> anyhow::Result<Config> {
         config.server.port = raw
             .parse()
             .context("DASHBOARD_API_PORT is not a valid port")?;
+    }
+
+    if let Ok(token) = std::env::var("DASHBOARD_API_TOKEN") {
+        config.server.api_token = Some(token);
     }
 
     if config.database.url.trim().is_empty() {

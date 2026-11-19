@@ -1,0 +1,40 @@
+<script setup lang="ts">
+const props = withDefaults(defineProps<{ name: string; size?: number }>(), { size: 18 })
+
+const paths: Record<string, string> = {
+  dashboard: 'M3 3h8v8H3V3zm10 0h8v5h-8V3zM3 13h8v8H3v-8zm10-3h8v11h-8V10z',
+  websites:
+    'M12 2a10 10 0 1 0 0 20 10 10 0 0 0 0-20zm0 2c1.6 0 3.1 2.5 3.7 6H8.3C8.9 6.5 10.4 4 12 4zM4.3 10h3.9c-.1 1.3-.1 2.7 0 4H4.3a8 8 0 0 1 0-4zm0 6h3.9c.3 2.1.9 4 1.8 5.3A8 8 0 0 1 4.3 16zm4.5-2c-.1-1.3-.1-2.7 0-4h6.4c.1 1.3.1 2.7 0 4H8.8zm2.5 7c-.9-1.3-1.5-3.2-1.8-5.3h3.6c-.3 2.1-.9 4-1.8 5.3zm3.6-5.3h3.9a8 8 0 0 1-5.7 5.3c.9-1.3 1.5-3.2 1.8-5.3zm0-2c-.3-2.1-.9-4-1.8-5.3a8 8 0 0 1 5.7 5.3h-3.9z',
+  certificates:
+    'M12 2 4 5v6c0 5 3.5 9.5 8 11 4.5-1.5 8-6 8-11V5l-8-3zm0 2.2 6 2.2V11c0 3.8-2.5 7.4-6 8.8-3.5-1.4-6-5-6-8.8V6.4l6-2.2z',
+  gateways: 'M4 4h16v6H4V4zm0 10h16v6H4v-6zm3 2h2v2H7v-2zm0-10h2v2H7V6z',
+  logs: 'M4 5h16v2H4V5zm0 6h16v2H4v-2zm0 6h10v2H4v-2z',
+  settings: 'M4 6h16v2H4V6zm0 5h16v2H4v-2zm0 5h16v2H4v-2z',
+  logout: 'M10 17l5-5-5-5v3H3v4h7v3zM14 3h7v18h-7v-2h5V5h-5V3z',
+  menu: 'M4 6h16v2H4V6zm0 5h16v2H4v-2zm0 5h16v2H4v-2z',
+  sun: 'M12 7a5 5 0 1 0 0 10 5 5 0 0 0 0-10zM11 1h2v3h-2V1zm0 19h2v3h-2v-3zM1 11h3v2H1v-2zm19 0h3v2h-3v-2zM4.2 5.6 5.6 4.2l2.1 2.1-1.4 1.4-2.1-2.1zm12.1 12.1 1.4-1.4 2.1 2.1-1.4 1.4-2.1-2.1zm2.1-13.5 1.4 1.4-2.1 2.1-1.4-1.4 2.1-2.1zM4.2 18.4l2.1-2.1 1.4 1.4-2.1 2.1-1.4-1.4z',
+  moon: 'M21 12.8A9 9 0 1 1 11.2 3a7 7 0 0 0 9.8 9.8z',
+  refresh: 'M12 4a8 8 0 0 1 7.4 5H22l-4 4-4-4h2.6A6 6 0 1 0 18 16h2a8 8 0 1 1-8-12z',
+  search:
+    'M10 2a8 8 0 1 0 4.9 14.3l5 5 1.4-1.4-5-5A8 8 0 0 0 10 2zm0 2a6 6 0 1 1 0 12 6 6 0 0 1 0-12z',
+  close:
+    'M6.4 5 5 6.4 10.6 12 5 17.6 6.4 19 12 13.4 17.6 19 19 17.6 13.4 12 19 6.4 17.6 5 12 10.6 6.4 5z',
+  check: 'M9 16.2 4.8 12l-1.4 1.4L9 19 21 7l-1.4-1.4L9 16.2z',
+  alert: 'M12 2 1 21h22L12 2zm0 5 7.5 12h-15L12 7zm-1 4v4h2v-4h-2zm0 6v2h2v-2h-2z',
+  arrow: 'M12 4l-1.4 1.4L16.2 11H4v2h12.2l-5.6 5.6L12 20l8-8-8-8z',
+  dot: 'M12 10a2 2 0 1 0 0 4 2 2 0 0 0 0-4z',
+  plus: 'M11 5h2v6h6v2h-6v6h-2v-6H5v-2h6V5z',
+}
+</script>
+
+<template>
+  <svg
+    :width="props.size"
+    :height="props.size"
+    viewBox="0 0 24 24"
+    fill="currentColor"
+    aria-hidden="true"
+  >
+    <path :d="paths[props.name] ?? paths.dot" />
+  </svg>
+</template>

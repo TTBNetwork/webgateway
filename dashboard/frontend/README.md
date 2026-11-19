@@ -1,48 +1,55 @@
-# frontend
+# WebGateway Console
 
-This template should help get you started developing with Vue 3 in Vite.
+Vue 3 + TypeScript + Vite control-plane panel.
 
-## Recommended IDE Setup
+## Pages
 
-[VS Code](https://code.visualstudio.com/) + [Vue (Official)](https://marketplace.visualstudio.com/items?itemName=Vue.volar) (and disable Vetur).
+- Overview: site/certificate/gateway counts, today traffic and hourly chart.
+- Sites: hosts, ports, backends and update time.
+- Certificates: expiry state and hostnames.
+- Gateways: online/offline nodes, heartbeat and version.
+- Access logs: recent request/response rows with filters.
+- Settings: theme, language, API token and instance info.
 
-## Recommended Browser Setup
+## Development
 
-- Chromium-based browsers (Chrome, Edge, Brave, etc.):
-  - [Vue.js devtools](https://chromewebstore.google.com/detail/vuejs-devtools/nhdogjmejiglipccpnnnanhbledajbpd)
-  - [Turn on Custom Object Formatter in Chrome DevTools](http://bit.ly/object-formatters)
-- Firefox:
-  - [Vue.js devtools](https://addons.mozilla.org/en-US/firefox/addon/vue-js-devtools/)
-  - [Turn on Custom Object Formatter in Firefox DevTools](https://fxdx.dev/firefox-devtools-custom-object-formatters/)
+Start the dashboard API (default port 3000) and the Vite dev server:
 
-## Type Support for `.vue` Imports in TS
+```bash
+# terminal 1
+DATABASE_URL='postgres://...' DASHBOARD_API_TOKEN=dev-token cargo run -p dashboard
 
-TypeScript cannot handle type information for `.vue` imports by default, so we replace the `tsc` CLI with `vue-tsc` for type checking. In editors, we need [Volar](https://marketplace.visualstudio.com/items?itemName=Vue.volar) to make the TypeScript language service aware of `.vue` types.
-
-## Customize configuration
-
-See [Vite Configuration Reference](https://vite.dev/config/).
-
-## Project Setup
-
-```sh
+# terminal 2
+cd dashboard/frontend
 pnpm install
-```
-
-### Compile and Hot-Reload for Development
-
-```sh
 pnpm dev
 ```
 
-### Type-Check, Compile and Minify for Production
+Open http://localhost:5173 and sign in with `dev-token`. Vite proxies `/api` and
+`/health` to `http://127.0.0.1:3000`.
 
-```sh
+## Build
+
+```bash
+pnpm install --frozen-lockfile
+pnpm lint:check
 pnpm build
 ```
 
-### Lint with [ESLint](https://eslint.org/)
+The panel currently uses a small built-in history router and native `fetch`; it
+does not add runtime dependencies beyond Vue.
 
-```sh
-pnpm lint
-```
+For production static hosting, configure the web server to fall back to
+`index.html` for unknown paths (SPA history mode).
+
+## API
+
+The master exposes read-only endpoints (Bearer token when `DASHBOARD_API_TOKEN`
+is set):
+
+- `GET /health`
+- `GET /api/summary`
+- `GET /api/websites`
+- `GET /api/certificates`
+- `GET /api/gateways`
+- `GET /api/logs?limit=50`

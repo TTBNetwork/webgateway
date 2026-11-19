@@ -1,47 +1,24 @@
 <script setup lang="ts">
-import HelloWorld from './components/HelloWorld.vue'
-import TheWelcome from './components/TheWelcome.vue'
+import { computed, watchEffect } from 'vue'
+import AppLayout from './layouts/AppLayout.vue'
+import LoginView from './views/LoginView.vue'
+import { navigate, route } from './router'
+import { session } from './session'
+
+const isLoginRoute = computed(() => route.path === '/login')
+const authenticated = computed(() => session.token.length > 0)
+const showLogin = computed(() => !authenticated.value || isLoginRoute.value)
+
+watchEffect(() => {
+  if (!authenticated.value && !isLoginRoute.value) {
+    navigate('/login')
+  } else if (authenticated.value && isLoginRoute.value) {
+    navigate('/')
+  }
+})
 </script>
 
 <template>
-  <header>
-    <img alt="Vue logo" class="logo" src="./assets/logo.svg" width="125" height="125" />
-
-    <div class="wrapper">
-      <HelloWorld msg="You did it!" />
-    </div>
-  </header>
-
-  <main>
-    <TheWelcome />
-  </main>
+  <LoginView v-if="showLogin" />
+  <AppLayout v-else />
 </template>
-
-<style scoped>
-header {
-  line-height: 1.5;
-}
-
-.logo {
-  display: block;
-  margin: 0 auto 2rem;
-}
-
-@media (min-width: 1024px) {
-  header {
-    display: flex;
-    place-items: center;
-    padding-right: calc(var(--section-gap) / 2);
-  }
-
-  .logo {
-    margin: 0 2rem 0 0;
-  }
-
-  header .wrapper {
-    display: flex;
-    place-items: flex-start;
-    flex-wrap: wrap;
-  }
-}
-</style>
