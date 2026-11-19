@@ -209,3 +209,20 @@
   - 面板 format/lint/type-check/build 通过；dashboard 5 单测、shared 12 + 3 集成。
 - 文档：新增 `certificates.md`（API、凭据、流程、vendor 补丁、限制）；`database.md` 更新 schema v4；
   `issue.md` 新增 F-42/F-43/F-44、P-13，更新 U-01/U-03/U-25/P-09。
+
+### 管理面：站点/用户 CRUD、RBAC 与 JWT 撤销（分支 `feat/dashboard-rbac`）
+- 迁移 0005 `user_token_version.sql`：`users.token_version INTEGER NOT NULL DEFAULT 0`；schema version → **5**。
+- `auth.rs`：JWT claims 增加 `token_version`；认证时与数据库比对，logout/管理员撤销/角色变更/TOTP 重置
+  都会 bump 版本，旧 JWT 立即 401；新增用户管理（列表/创建/改角色/删除/重置 TOTP/撤销）、
+  `is_admin` / `can_write_certificates` 与角色校验；last-admin 保护。
+- `router.rs`：路由拆成 read / certificate-write / admin 三组；
+  - `view` 只读；`user` 可管理证书；`admin` 全量；服务令牌视为 admin；
+  - 新增 `POST /api/auth/logout`、`/api/users`（GET/POST/PATCH/DELETE）、
+    `/api/users/{id}/totp`、`/api/users/{id}/revoke`、站点 CRUD、网关更新/删除。
+- 新增 `websites.rs`：hosts/ports/backends/config 校验（URL scheme、权重/优先级、JSON 对象）、
+  `int[]::uint2[]` 写入、创建/更新/删除。
+- 面板：新增用户管理页（admin 导航）、站点新增/编辑/删除表单（仅 admin 显示）、
+  退出时先调用服务端 logout 撤销 JWT；i18n 中英。
+- 验证（beta 库）：服务令牌创建站点/用户；view JWT 读 200、写 403；revoke/logout 后旧 JWT 401；
+  角色更新 bump token_version；禁止删除最后一个 admin；站点创建/更新/删除成功（ports 正确写入）。
+- 文档：`database.md` schema v5、`issue.md` F-33/F-34/F-45/F-46、B-30 已修复、P-09/U-01/U-02 更新。

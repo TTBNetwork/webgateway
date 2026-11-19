@@ -8,6 +8,8 @@ const paths: Record<string, string> = {
   certificates:
     'M12 2 4 5v6c0 5 3.5 9.5 8 11 4.5-1.5 8-6 8-11V5l-8-3zm0 2.2 6 2.2V11c0 3.8-2.5 7.4-6 8.8-3.5-1.4-6-5-6-8.8V6.4l6-2.2z',
   gateways: 'M4 4h16v6H4V4zm0 10h16v6H4v-6zm3 2h2v2H7v-2zm0-10h2v2H7V6z',
+  users:
+    'M9 4a4 4 0 1 1 0 8 4 4 0 0 1 0-8zm0 10c3.3 0 6 1.3 6 3v3H3v-3c0-1.7 2.7-3 6-3zm7-10a3 3 0 0 1 0 6 5.9 5.9 0 0 0-1.5-3.9A3 3 0 0 1 16 4zm1 8c2.2.3 4 1.4 4 3v3h-5v-3c0-1.2-.6-2.2-1.7-3H17z',
   logs: 'M4 5h16v2H4V5zm0 6h16v2H4v-2zm0 6h10v2H4v-2z',
   settings: 'M4 6h16v2H4V6zm0 5h16v2H4v-2zm0 5h16v2H4v-2z',
   logout: 'M10 17l5-5-5-5v3H3v4h7v3zM14 3h7v18h-7v-2h5V5h-5V3z',

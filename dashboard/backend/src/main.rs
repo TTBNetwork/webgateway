@@ -8,6 +8,7 @@ mod auth;
 mod certificate;
 mod config;
 mod router;
+mod websites;
 
 use shared::database::{Database, schema_version};
 use tracing::{Level, event};

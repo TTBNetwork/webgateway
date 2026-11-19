@@ -33,7 +33,8 @@ value = { "key_pem": "-----BEGIN PRIVATE KEY-----..." }
 
 ## 2. API
 
-所有接口与现有 /api 一样需要 JWT 或 `DASHBOARD_API_TOKEN` 服务令牌；RBAC 细分仍未实现。
+所有接口需要 JWT 或 `DASHBOARD_API_TOKEN` 服务令牌。证书写接口要求 `user` 或 `admin`；
+站点/用户/DNS provider 写接口要求 `admin`；`view` 只读。
 
 ### 2.1 手动上传
 
@@ -178,7 +179,7 @@ Tencent_SecretId / Tencent_SecretKey
 - 通配符证书（`*.example.com`）代码按 identifier 生成 `_acme-challenge.example.com`，但尚未实测。
 - ACME account 私钥、证书私钥均为明文入库；后续需要加密存储与轮换。
 - ACME HTTP 请求 60s 轮询、失败约 10 分钟后重试；没有更细的退避/告警。
-- 面板按钮使用当前登录 JWT；RBAC 细分（只读用户不能改证书）尚未实现。
+- 面板按钮使用当前登录 JWT；证书写接口按 `user`/`admin` 授权（`view` 只读）。
 
 ## 7. vendored acmex（0.8.0）
 

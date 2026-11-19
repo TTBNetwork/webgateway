@@ -60,9 +60,9 @@
 
 | ID | Feature | 状态 | 说明 |
 |---|---|---|---|
-| F-33 | 面板 API | ✅ | /api/summary、websites、certificates、gateways、logs；证书已有上传/签发/删除写接口 |
-| F-34 | API 鉴权 | ⚠️ | 用户名 + TOTP → 每用户 JWT；DASHBOARD_API_TOKEN 作为服务令牌；无 RBAC 细分/撤销 |
-| F-35 | Vue 3 面板 | ✅ | 登录、概览、站点、证书、网关、日志、设置 |
+| F-33 | 面板 API | ✅ | 读接口 + 证书/站点/网关/用户写接口；错误/校验统一 JSON |
+| F-34 | API 鉴权 | ✅ | TOTP + 每用户 JWT；admin/user/view RBAC；token_version 撤销（logout/revoke/角色变更/重置 TOTP）；服务令牌视为 admin；无 refresh token / 每用户 API key |
+| F-35 | Vue 3 面板 | ✅ | 登录、概览、站点 CRUD、证书 CRUD、网关、日志、用户管理、设置 |
 | F-36 | 视觉 / 交互 | ✅ | 深/浅色、中/英、响应式侧栏、统计卡片、SVG 流量图 |
 | F-37 | 前端工程 | ✅ | 自写 history router + 原生 fetch；无新增依赖；package/lock 未改 |
 | F-38 | 面板验证 | ✅ | Vite 代理 401/200 + 真实数据；format/lint/build 通过 |
@@ -82,6 +82,8 @@
 | F-42 | 证书手动上传 | ✅ | POST /api/certificates；SAN/私钥校验、到期时间解析；入库后网关 NOTIFY 加载 |
 | F-43 | ACME 自动签发/续期 | ✅ | ZeroSSL（EAB 优先）→ Let's Encrypt；DNS-01 腾讯云 DNSPod；账户 key 持久化、10 分钟租约、到期前 30 天续期；实测 LE 签发成功 |
 | F-44 | 证书面板 | ✅ | 自动/手动添加、重新签发、删除、状态/错误展示 |
+| F-45 | 站点/网关 CRUD | ✅ | 站点创建/更新/删除（JSON 后端与配置校验）；网关名称/位置更新与删除 |
+| F-46 | 用户管理 / RBAC / 撤销 | ✅ | 用户列表/创建/角色/删除/TOTP 重置/会话撤销；token_version JWT 撤销；admin/user/view 路由级 RBAC；面板用户页 |
 
 ---
 
@@ -97,8 +99,8 @@
 | P-06 | 访问日志 | body_length 取 Content-Length；chunked 请求 0、响应 NULL；WS/CONNECT 0；headers 重复键被覆盖；writer 退出丢最后一批 |
 | P-07 | 统计 | total_ips 跨秒重复；sizes 依赖日志 Content-Length；保留期（7 天）仍硬编码；整周过期分区已 DROP，边界分区仍逐行 DELETE |
 | P-08 | 上游 TLS | 只信 webpki + ca_file，不读系统 native roots；无 mTLS/SNI 覆盖 |
-| P-09 | 面板 | 站点/网关/用户仍只读；证书可上传/签发/删除；TOTP/JWT 登录但无 RBAC 细分/刷新/撤销；JWT 存 localStorage；无服务端分页；无静态托管；无前端测试 |
-| P-13 | 证书 | 仅腾讯云 DNS-01；一张证书只能一个 DNS zone；ZeroSSL 必须配置 EAB；通配符未实测；ACME account key 明文入库；证书接口未按角色细分 |
+| P-09 | 面板 | 站点/证书/用户已可写；网关只读列表+API 删除；JWT 存 localStorage；无 refresh token/每用户 API key；无服务端分页；无静态托管；无前端测试 |
+| P-13 | 证书 | 仅腾讯云 DNS-01；一张证书只能一个 DNS zone；ZeroSSL 必须配置 EAB；通配符未实测；ACME account key 明文入库 |
 | P-10 | 负载均衡 | priority 为静态备用组；无健康检查/失败自动切换 |
 | P-11 | 管理面 | 无 CRUD、ACME/DNS、审计；有登录但无用户管理/RBAC 细分 |
 | P-12 | 可观测性 | 无 /metrics、无 tracing 导出；面板仅有基础统计 |
@@ -109,8 +111,7 @@
 
 ### 3.1 管理面 / 安全
 
-- U-01 站点/网关/用户 CRUD API（证书上传/签发/删除已完成）
-- U-02 用户管理、RBAC、JWT 刷新/撤销、API Key 管理
+- U-02 JWT refresh token / 短期令牌、每用户 API Key 管理（用户管理、RBAC、撤销已完成）
 - U-04 面板静态托管 / SPA fallback / nginx 配置
 - U-05 审计日志、操作记录、配置回滚
 - U-06 IP / User-Agent 拦截（按用户要求暂缓）
@@ -140,9 +141,7 @@
 
 ### 3.4 前端
 
-- U-25 站点 CRUD 表单与校验（证书表单已完成）
 - U-26 服务端分页、排序、高级筛选
-- U-27 用户/角色管理页面
 - U-28 图表时间范围选择、导出
 - U-29 前端单测 / 组件测试 / 浏览器 E2E
 - U-30 面板深链部署（history fallback）文档/配置
@@ -263,11 +262,10 @@
 - 失败仅延迟 500ms，无按用户/IP 的速率限制或锁定。
 - 建议：记录 last_totp_step、失败计数/锁定。
 
-#### B-30 JWT 无撤销、RBAC 不细化
-- JWT 默认 7 天有效；退出只清浏览器，服务端仍接受旧 JWT。
-- role 写入 JWT，但 /api 路由不区分角色；任何登录用户拥有全部只读权限。
-- 服务令牌（DASHBOARD_API_TOKEN）无过期/轮换。
-- 建议：token version/撤销列表、按角色授权、服务令牌轮换。
+#### B-30 JWT 无撤销、RBAC 不细化（已修复，2026-11-19）
+- 修复：users.token_version（迁移 0005）+ JWT claims 版本校验；logout/管理员 revoke/角色变更/重置 TOTP 都会 bump 版本，旧 JWT 立即 401。
+- RBAC：admin（全部）、user（证书写）、view（只读）；路由分组 + 中间件强制。
+- 仍需：服务令牌（DASHBOARD_API_TOKEN）过期/轮换；refresh token / 每用户 API Key。
 
 #### B-31 认证密钥暴露面
 - 默认管理员 TOTP secret 只在首次创建时打印 WARN 日志；日志集中后可能泄露。
@@ -284,7 +282,7 @@
 - 数据量大时性能和体验下降。
 
 #### B-18 面板硬编码版本信息
-- schema v3 / panel 0.1.0 / API 基址写死。
+- schema v5 / panel 0.1.0 / API 基址写死。
 - 建议：从 /health 或构建注入。
 
 #### B-19 升级连接无字节统计
@@ -310,9 +308,10 @@
 
 ## 5. 当前状态
 
-- 最新分支：feat/certificates（叠加在 fix/gateway-websocket-tls 之后）
-- 测试：网关 34、dashboard 5、shared 12 + 3 集成（含 stats 回填/分区回收）；前端 format/lint/build 通过
-- 数据库：schema v4；2026-11-19 联调/统计/证书验证的临时数据已清理（websites/gateways/users/logs/stats = 0；测试证书已删除）
+- 最新分支：feat/dashboard-rbac（叠加在 feat/certificates 之后）
+- 测试：网关 34、dashboard 8、shared 12 + 3 集成（含 stats 回填/分区回收）；前端 format/lint/type-check/build 通过
+- 数据库：schema v5；2026-11-19 联调/统计/证书/CRUD 验证的临时数据已清理（websites/gateways/users/logs/stats = 0；测试证书已删除）
+- 管理面：站点/网关/用户 CRUD + admin/user/view RBAC + token_version 撤销；面板站点/用户编辑页完成
 - 证书：手动上传 + ACME（Let's Encrypt 实测签发；ZeroSSL 需 EAB）→ 网关 SNI 加载验证通过，见 `certificates.md`
 - 实时协议：Nezha gRPC（h2c/TLS/双向流）与 MCSManager WS（101/鉴权/长连接）已用真实软件验证，见 `e2e-realtime.md`
 - 面板：TOTP + JWT 登录；默认缓存 16 MiB（可配）；Vite 代理 /api → 127.0.0.1:3000
@@ -320,7 +319,7 @@
 ## 6. 建议优先级
 
 1. ~~B-01 / B-02：分区续建 + 统计补算（P0）~~ ✅
-2. 面板 CRUD + 用户管理/RBAC/JWT 撤销（U-01/U-02）；证书管理已完成，剩余站点/网关/用户 CRUD
+2. ~~面板 CRUD + 用户管理/RBAC/JWT 撤销（U-01/U-02）~~ ✅（剩 refresh token/API key/服务令牌轮换）
 3. ~~B-03~~ ✅ / B-04 / B-05 / B-06：h3 限制、优雅停机、日志可靠性
 4. U-11/U-13：h3 流式/Alt-Svc、h2 extended CONNECT
 5. U-17/U-19/U-23：健康检查、metrics、缓存持久化

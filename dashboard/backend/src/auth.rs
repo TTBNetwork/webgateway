@@ -25,8 +25,39 @@ struct Claims {
     sub: String,
     username: String,
     role: String,
+    /// Bumped on logout/admin revoke/role change/TOTP reset. Tokens issued with
+    /// an older value are rejected by authenticate().
+    #[serde(default)]
+    token_version: i64,
     iat: usize,
     exp: usize,
+}
+
+/// User row returned by the admin user-management API (never includes secrets).
+#[derive(Debug, Clone, Serialize, sqlx::FromRow)]
+pub struct UserSummary {
+    pub id: String,
+    pub username: String,
+    pub role: String,
+    pub token_version: i32,
+    pub last_login: Option<String>,
+    pub last_ip: Option<String>,
+    pub created_at: String,
+}
+
+pub const USER_ROLES: &[&str] = &["admin", "user", "view"];
+
+pub fn is_valid_role(role: &str) -> bool {
+    USER_ROLES.contains(&role)
+}
+
+/// Service tokens act as an administrator.
+pub fn is_admin(user: &User) -> bool {
+    user.role == "admin" || user.role == "service"
+}
+
+pub fn can_write_certificates(user: &User) -> bool {
+    is_admin(user) || user.role == "user"
 }
 
 pub struct LoginSuccess {
@@ -91,16 +122,22 @@ pub async fn ensure_default_admin(database: &Database) -> anyhow::Result<()> {
 /// Verify a bearer JWT and return the current user.
 pub async fn authenticate(database: &Database, token: &str) -> Option<User> {
     let claims = unverified_claims(token)?;
-    let row = sqlx::query("SELECT id, username, role, jwt_secret FROM users WHERE id = $1")
-        .bind(&claims.sub)
-        .fetch_optional(database.pool())
-        .await
-        .ok()??;
+    let row = sqlx::query(
+        "SELECT id, username, role, jwt_secret, token_version FROM users WHERE id = $1",
+    )
+    .bind(&claims.sub)
+    .fetch_optional(database.pool())
+    .await
+    .ok()??;
 
     let jwt_secret: String = row.try_get("jwt_secret").ok()?;
     let validation = Validation::new(Algorithm::HS256);
     let key = DecodingKey::from_secret(jwt_secret.as_bytes()).ok()?;
-    decode::<Claims>(token, &key, &validation).ok()?;
+    let decoded = decode::<Claims>(token, &key, &validation).ok()?;
+    let token_version: i32 = row.try_get("token_version").ok()?;
+    if decoded.claims.token_version != i64::from(token_version) {
+        return None;
+    }
 
     Some(User {
         id: row.try_get("id").ok()?,
@@ -118,7 +155,7 @@ pub async fn login(
     last_ip: Option<String>,
 ) -> anyhow::Result<Option<LoginSuccess>> {
     let row = sqlx::query(
-        "SELECT id, username, role, totp_secret, jwt_secret
+        "SELECT id, username, role, totp_secret, jwt_secret, token_version
            FROM users
           WHERE lower(username) = lower($1)",
     )
@@ -165,10 +202,12 @@ pub async fn login(
 
     let username: String = row.try_get("username")?;
     let role: String = row.try_get("role")?;
+    let token_version: i32 = row.try_get("token_version")?;
     let claims = Claims {
         sub: id.clone(),
         username: username.clone(),
         role: role.clone(),
+        token_version: i64::from(token_version),
         iat: now,
         exp: now.saturating_add(expires),
     };
@@ -203,10 +242,182 @@ fn build_totp(secret: &str) -> Option<Totp> {
     Builder::new().with_secret(secret).with_skew(1).build().ok()
 }
 
+pub(crate) fn random_id() -> anyhow::Result<String> {
+    random_hex(12)
+}
+
 fn random_hex(bytes: usize) -> anyhow::Result<String> {
     let mut buffer = vec![0u8; bytes];
     getrandom::fill(&mut buffer).map_err(|error| anyhow::anyhow!("randomness failed: {error}"))?;
     Ok(data_encoding::HEXLOWER.encode(&buffer))
+}
+
+fn new_totp_secret() -> anyhow::Result<String> {
+    let mut bytes = [0u8; 20];
+    getrandom::fill(&mut bytes).map_err(|error| anyhow::anyhow!("randomness failed: {error}"))?;
+    Ok(Secret::from(bytes).to_base32())
+}
+
+pub async fn list_users(database: &Database) -> anyhow::Result<Vec<UserSummary>> {
+    sqlx::query_as::<_, UserSummary>(
+        "SELECT id, username, role, token_version,
+                to_char(last_login, 'YYYY-MM-DD\"T\"HH24:MI:SS\"Z\"') AS last_login,
+                last_ip,
+                to_char(created_at, 'YYYY-MM-DD\"T\"HH24:MI:SS\"Z\"') AS created_at
+           FROM users
+          ORDER BY created_at",
+    )
+    .fetch_all(database.pool())
+    .await
+    .context("failed to list users")
+}
+
+pub async fn get_user(database: &Database, id: &str) -> anyhow::Result<Option<UserSummary>> {
+    sqlx::query_as::<_, UserSummary>(
+        "SELECT id, username, role, token_version,
+                to_char(last_login, 'YYYY-MM-DD\"T\"HH24:MI:SS\"Z\"') AS last_login,
+                last_ip,
+                to_char(created_at, 'YYYY-MM-DD\"T\"HH24:MI:SS\"Z\"') AS created_at
+           FROM users
+          WHERE id = $1",
+    )
+    .bind(id)
+    .fetch_optional(database.pool())
+    .await
+    .context("failed to load the user")
+}
+
+/// Create a user and return the one-time TOTP secret. The secret is never
+/// returned again; an admin must hand it to the user immediately.
+pub async fn create_user(
+    database: &Database,
+    username: &str,
+    role: &str,
+) -> anyhow::Result<(UserSummary, String)> {
+    let username = username.trim();
+    if username.is_empty() {
+        bail!("username is required");
+    }
+    if !is_valid_role(role) {
+        bail!("invalid role: {role}");
+    }
+
+    let id = random_hex(12)?;
+    let totp_secret = new_totp_secret()?;
+    let jwt_secret = random_hex(32)?;
+    match sqlx::query(
+        "INSERT INTO users (id, username, totp_secret, jwt_secret, role, addresses)
+         VALUES ($1, $2, $3, $4, $5, ARRAY[]::text[])",
+    )
+    .bind(&id)
+    .bind(username)
+    .bind(&totp_secret)
+    .bind(&jwt_secret)
+    .bind(role)
+    .execute(database.pool())
+    .await
+    {
+        Ok(_) => {}
+        Err(sqlx::Error::Database(error)) if error.code().as_deref() == Some("23505") => {
+            bail!("username already exists")
+        }
+        Err(error) => return Err(error).context("failed to create the user"),
+    }
+
+    let summary = get_user(database, &id)
+        .await?
+        .context("created user disappeared")?;
+    Ok((summary, totp_secret))
+}
+
+/// Update the username and/or role. A role change bumps token_version so the
+/// previous JWT (which carries the old role) stops working immediately.
+pub async fn update_user(
+    database: &Database,
+    id: &str,
+    username: Option<&str>,
+    role: Option<&str>,
+) -> anyhow::Result<Option<UserSummary>> {
+    if let Some(username) = username {
+        let username = username.trim();
+        if username.is_empty() {
+            bail!("username is required");
+        }
+        match sqlx::query("UPDATE users SET username = $2 WHERE id = $1")
+            .bind(id)
+            .bind(username)
+            .execute(database.pool())
+            .await
+        {
+            Ok(_) => {}
+            Err(sqlx::Error::Database(error)) if error.code().as_deref() == Some("23505") => {
+                bail!("username already exists")
+            }
+            Err(error) => return Err(error).context("failed to update the username"),
+        }
+    }
+
+    if let Some(role) = role {
+        if !is_valid_role(role) {
+            bail!("invalid role: {role}");
+        }
+        sqlx::query(
+            "UPDATE users
+                SET role = $2, token_version = token_version + 1
+              WHERE id = $1",
+        )
+        .bind(id)
+        .bind(role)
+        .execute(database.pool())
+        .await
+        .context("failed to update the role")?;
+    }
+
+    get_user(database, id).await
+}
+
+pub async fn delete_user(database: &Database, id: &str) -> anyhow::Result<bool> {
+    let result = sqlx::query("DELETE FROM users WHERE id = $1")
+        .bind(id)
+        .execute(database.pool())
+        .await
+        .context("failed to delete the user")?;
+    Ok(result.rows_affected() > 0)
+}
+
+/// Replace a user's TOTP secret and invalidate existing sessions.
+pub async fn reset_totp(database: &Database, id: &str) -> anyhow::Result<Option<String>> {
+    let secret = new_totp_secret()?;
+    let result = sqlx::query(
+        "UPDATE users
+            SET totp_secret = $2, token_version = token_version + 1
+          WHERE id = $1",
+    )
+    .bind(id)
+    .bind(&secret)
+    .execute(database.pool())
+    .await
+    .context("failed to reset the TOTP secret")?;
+    if result.rows_affected() == 0 {
+        return Ok(None);
+    }
+    Ok(Some(secret))
+}
+
+pub async fn revoke_tokens(database: &Database, id: &str) -> anyhow::Result<bool> {
+    let result = sqlx::query("UPDATE users SET token_version = token_version + 1 WHERE id = $1")
+        .bind(id)
+        .execute(database.pool())
+        .await
+        .context("failed to revoke the user tokens")?;
+    Ok(result.rows_affected() > 0)
+}
+
+pub async fn count_admins(database: &Database) -> anyhow::Result<i64> {
+    sqlx::query_scalar("SELECT count(*) FROM users WHERE role = 'admin'")
+        .fetch_one(database.pool())
+        .await
+        .context("failed to count admins")
 }
 
 #[cfg(test)]
@@ -228,5 +439,41 @@ mod tests {
     #[test]
     fn rejects_invalid_totp_secret() {
         assert!(build_totp("not-base32").is_none());
+    }
+
+    #[test]
+    fn validates_roles_and_permissions() {
+        for role in ["admin", "user", "view"] {
+            assert!(is_valid_role(role));
+        }
+        assert!(!is_valid_role("root"));
+
+        let admin = User {
+            id: "1".into(),
+            username: "admin".into(),
+            role: "admin".into(),
+        };
+        let user = User {
+            id: "2".into(),
+            username: "user".into(),
+            role: "user".into(),
+        };
+        let view = User {
+            id: "3".into(),
+            username: "view".into(),
+            role: "view".into(),
+        };
+        let service = User {
+            id: "service".into(),
+            username: "service".into(),
+            role: "service".into(),
+        };
+
+        assert!(is_admin(&admin));
+        assert!(is_admin(&service));
+        assert!(!is_admin(&user));
+        assert!(can_write_certificates(&admin));
+        assert!(can_write_certificates(&user));
+        assert!(!can_write_certificates(&view));
     }
 }

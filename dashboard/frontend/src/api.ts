@@ -72,6 +72,29 @@ export interface IssueCertificatePayload {
   dns_zone?: string
 }
 
+export interface UserSummary {
+  id: string
+  username: string
+  role: string
+  token_version: number
+  last_login: string | null
+  last_ip: string | null
+  created_at: string
+}
+
+export interface CreateUserResult {
+  user: UserSummary
+  totp_secret: string
+}
+
+export interface WebsiteInput {
+  name?: string
+  hosts: string[]
+  ports: number[]
+  backends: unknown
+  config: unknown
+}
+
 export interface Gateway {
   id: string
   name: string | null
@@ -173,6 +196,29 @@ export const api = {
   deleteCertificate: (id: string) =>
     send<{ deleted: boolean }>('certificates/' + encodeURIComponent(id), 'DELETE'),
   dnsProviders: () => request<Items<DnsProvider>>('dns-providers').then((value) => value.items),
+  users: () => request<Items<UserSummary>>('users').then((value) => value.items),
+  createUser: (username: string, role: string) =>
+    send<CreateUserResult>('users', 'POST', { username, role }),
+  updateUser: (id: string, payload: { username?: string; role?: string }) =>
+    send<{ user: UserSummary }>('users/' + encodeURIComponent(id), 'PATCH', payload),
+  deleteUser: (id: string) =>
+    send<{ deleted: boolean }>('users/' + encodeURIComponent(id), 'DELETE'),
+  resetUserTotp: (id: string) =>
+    send<{ totp_secret: string }>('users/' + encodeURIComponent(id) + '/totp', 'POST'),
+  revokeUser: (id: string) =>
+    send<{ revoked: boolean }>('users/' + encodeURIComponent(id) + '/revoke', 'POST'),
+  logout: () => send<{ status: string }>('auth/logout', 'POST'),
+  createWebsite: (payload: WebsiteInput) => send<{ id: string }>('websites', 'POST', payload),
+  updateWebsite: (id: string, payload: WebsiteInput) =>
+    send<{ updated: boolean }>('websites/' + encodeURIComponent(id), 'PUT', payload),
+  deleteWebsite: (id: string) =>
+    send<{ deleted: boolean }>('websites/' + encodeURIComponent(id), 'DELETE'),
+  updateGateway: (
+    id: string,
+    payload: { name?: string; country?: string; city?: string; address?: string },
+  ) => send<{ updated: boolean }>('gateways/' + encodeURIComponent(id), 'PATCH', payload),
+  deleteGateway: (id: string) =>
+    send<{ deleted: boolean }>('gateways/' + encodeURIComponent(id), 'DELETE'),
   gateways: () => request<Items<Gateway>>('gateways').then((value) => value.items),
   logs: (limit: number) =>
     request<Items<AccessLog>>('logs?limit=' + String(limit)).then((value) => value.items),

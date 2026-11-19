@@ -7,7 +7,9 @@ import GatewaysView from '../views/GatewaysView.vue'
 import LogsView from '../views/LogsView.vue'
 import NotFoundView from '../views/NotFoundView.vue'
 import SettingsView from '../views/SettingsView.vue'
+import UsersView from '../views/UsersView.vue'
 import WebsitesView from '../views/WebsitesView.vue'
+import { api } from '../api'
 import { t, type MessageKey } from '../i18n'
 import { prefs } from '../prefs'
 import { navigate, route } from '../router'
@@ -19,12 +21,13 @@ interface NavItem {
   icon: string
 }
 
-const navigation: NavItem[] = [
+const allNavigation: NavItem[] = [
   { path: '/', key: 'nav.dashboard', icon: 'dashboard' },
   { path: '/websites', key: 'nav.websites', icon: 'websites' },
   { path: '/certificates', key: 'nav.certificates', icon: 'certificates' },
   { path: '/gateways', key: 'nav.gateways', icon: 'gateways' },
   { path: '/logs', key: 'nav.logs', icon: 'logs' },
+  { path: '/users', key: 'nav.users', icon: 'users' },
   { path: '/settings', key: 'nav.settings', icon: 'settings' },
 ]
 
@@ -34,11 +37,16 @@ const views = {
   '/certificates': CertificatesView,
   '/gateways': GatewaysView,
   '/logs': LogsView,
+  '/users': UsersView,
   '/settings': SettingsView,
 }
 
 const menuOpen = ref(false)
-const current = computed(() => navigation.find((item) => item.path === route.path))
+const isAdmin = computed(() => ['admin', 'service'].includes(session.user?.role ?? ''))
+const navigation = computed(() =>
+  allNavigation.filter((item) => item.path !== '/users' || isAdmin.value),
+)
+const current = computed(() => navigation.value.find((item) => item.path === route.path))
 const title = computed(() => (current.value ? t(current.value.key) : t('notFound.title')))
 const activeView = computed(() => views[route.path as keyof typeof views] ?? NotFoundView)
 
@@ -55,7 +63,12 @@ function toggleLocale(): void {
   prefs.locale = prefs.locale === 'zh' ? 'en' : 'zh'
 }
 
-function logout(): void {
+async function logout(): Promise<void> {
+  try {
+    await api.logout()
+  } catch {
+    // The token may already be invalid; clearing the local session is enough.
+  }
   clearToken()
   navigate('/login')
 }
@@ -137,7 +150,7 @@ function logout(): void {
 
       <footer class="footer">
         <span>{{ t('app.footer') }}</span>
-        <span>schema v2 · 3000/api</span>
+        <span>schema v5 · 3000/api</span>
       </footer>
     </div>
 

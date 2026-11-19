@@ -8,7 +8,7 @@ use axum::{
     http::{HeaderMap, StatusCode, header},
     middleware::{self, Next},
     response::{IntoResponse, Response},
-    routing::{delete, get, post},
+    routing::{delete, get, patch, post, put},
 };
 use serde::Deserialize;
 use serde_json::{Value, json};
@@ -18,6 +18,7 @@ use tracing::{Level, event};
 
 use crate::auth::{self, User};
 use crate::certificate;
+use crate::websites;
 
 #[derive(Clone)]
 struct AppState {
@@ -31,24 +32,44 @@ pub fn router(database: Database, api_token: Option<String>) -> Router {
         api_token,
     };
 
-    let protected = Router::new()
+    let read = Router::new()
         .route("/api/summary", get(summary))
         .route("/api/websites", get(websites))
-        .route(
-            "/api/certificates",
-            get(certificates).post(create_certificate),
-        )
-        .route("/api/certificates/issue", post(issue_certificate))
-        .route("/api/certificates/{id}", delete(delete_certificate))
-        .route("/api/certificates/{id}/issue", post(reissue_certificate))
-        .route(
-            "/api/dns-providers",
-            get(dns_providers).post(create_dns_provider),
-        )
-        .route("/api/dns-providers/{id}", delete(delete_dns_provider))
+        .route("/api/certificates", get(certificates))
+        .route("/api/dns-providers", get(dns_providers))
         .route("/api/gateways", get(gateways))
         .route("/api/logs", get(logs))
         .route("/api/auth/me", get(me))
+        .route("/api/auth/logout", post(logout));
+
+    let certificate_write = Router::new()
+        .route("/api/certificates", post(create_certificate))
+        .route("/api/certificates/issue", post(issue_certificate))
+        .route("/api/certificates/{id}", delete(delete_certificate))
+        .route("/api/certificates/{id}/issue", post(reissue_certificate))
+        .route_layer(middleware::from_fn(require_certificate_writer));
+
+    let admin = Router::new()
+        .route("/api/dns-providers", post(create_dns_provider))
+        .route("/api/dns-providers/{id}", delete(delete_dns_provider))
+        .route("/api/websites", post(create_website))
+        .route(
+            "/api/websites/{id}",
+            put(update_website).delete(delete_website),
+        )
+        .route(
+            "/api/gateways/{id}",
+            patch(update_gateway).delete(delete_gateway),
+        )
+        .route("/api/users", get(list_users).post(create_user))
+        .route("/api/users/{id}", patch(update_user).delete(delete_user))
+        .route("/api/users/{id}/totp", post(reset_user_totp))
+        .route("/api/users/{id}/revoke", post(revoke_user))
+        .route_layer(middleware::from_fn(require_admin));
+
+    let protected = read
+        .merge(certificate_write)
+        .merge(admin)
         .route_layer(middleware::from_fn_with_state(state.clone(), require_auth));
 
     Router::new()
@@ -84,6 +105,28 @@ async fn require_auth(State(state): State<AppState>, mut request: Request, next:
         None => (
             StatusCode::UNAUTHORIZED,
             Json(json!({ "error": "unauthorized" })),
+        )
+            .into_response(),
+    }
+}
+
+async fn require_admin(request: Request, next: Next) -> Response {
+    match request.extensions().get::<User>() {
+        Some(user) if auth::is_admin(user) => next.run(request).await,
+        _ => (
+            StatusCode::FORBIDDEN,
+            Json(json!({ "error": "admin role required" })),
+        )
+            .into_response(),
+    }
+}
+
+async fn require_certificate_writer(request: Request, next: Next) -> Response {
+    match request.extensions().get::<User>() {
+        Some(user) if auth::can_write_certificates(user) => next.run(request).await,
+        _ => (
+            StatusCode::FORBIDDEN,
+            Json(json!({ "error": "certificate write permission required" })),
         )
             .into_response(),
     }
@@ -143,6 +186,211 @@ async fn login(
 
 async fn me(Extension(user): Extension<User>) -> Json<Value> {
     Json(json!({ "user": user }))
+}
+
+async fn logout(
+    State(state): State<AppState>,
+    Extension(user): Extension<User>,
+) -> Result<Json<Value>, ApiError> {
+    if user.role != "service" {
+        auth::revoke_tokens(&state.database, &user.id)
+            .await
+            .map_err(internal)?;
+    }
+    Ok(Json(json!({ "status": "ok" })))
+}
+
+async fn list_users(State(state): State<AppState>) -> Result<Json<Value>, ApiError> {
+    let users = auth::list_users(&state.database).await.map_err(internal)?;
+    Ok(Json(json!({ "items": users })))
+}
+
+#[derive(Debug, Deserialize)]
+struct CreateUserRequest {
+    username: String,
+    role: String,
+}
+
+async fn create_user(
+    State(state): State<AppState>,
+    Json(payload): Json<CreateUserRequest>,
+) -> Result<Json<Value>, ApiError> {
+    let (user, totp_secret) = auth::create_user(&state.database, &payload.username, &payload.role)
+        .await
+        .map_err(auth_error)?;
+    Ok(Json(json!({ "user": user, "totp_secret": totp_secret })))
+}
+
+#[derive(Debug, Deserialize)]
+struct UpdateUserRequest {
+    username: Option<String>,
+    role: Option<String>,
+}
+
+async fn update_user(
+    State(state): State<AppState>,
+    Path(id): Path<String>,
+    Json(payload): Json<UpdateUserRequest>,
+) -> Result<Json<Value>, ApiError> {
+    if payload.username.is_none() && payload.role.is_none() {
+        return Err(bad_request("nothing to update"));
+    }
+    match auth::update_user(
+        &state.database,
+        &id,
+        payload.username.as_deref(),
+        payload.role.as_deref(),
+    )
+    .await
+    .map_err(auth_error)?
+    {
+        Some(user) => Ok(Json(json!({ "user": user }))),
+        None => Err(not_found("user")),
+    }
+}
+
+async fn delete_user(
+    State(state): State<AppState>,
+    Extension(current): Extension<User>,
+    Path(id): Path<String>,
+) -> Result<Json<Value>, ApiError> {
+    if id == current.id {
+        return Err(bad_request("cannot delete the current user"));
+    }
+    let target = auth::get_user(&state.database, &id)
+        .await
+        .map_err(internal)?;
+    let Some(target) = target else {
+        return Err(not_found("user"));
+    };
+    if target.role == "admin"
+        && auth::count_admins(&state.database)
+            .await
+            .map_err(internal)?
+            <= 1
+    {
+        return Err(bad_request("cannot delete the last admin"));
+    }
+    match auth::delete_user(&state.database, &id)
+        .await
+        .map_err(internal)?
+    {
+        true => Ok(Json(json!({ "deleted": true }))),
+        false => Err(not_found("user")),
+    }
+}
+
+async fn reset_user_totp(
+    State(state): State<AppState>,
+    Path(id): Path<String>,
+) -> Result<Json<Value>, ApiError> {
+    match auth::reset_totp(&state.database, &id)
+        .await
+        .map_err(internal)?
+    {
+        Some(secret) => Ok(Json(json!({ "totp_secret": secret }))),
+        None => Err(not_found("user")),
+    }
+}
+
+async fn revoke_user(
+    State(state): State<AppState>,
+    Path(id): Path<String>,
+) -> Result<Json<Value>, ApiError> {
+    match auth::revoke_tokens(&state.database, &id)
+        .await
+        .map_err(internal)?
+    {
+        true => Ok(Json(json!({ "revoked": true }))),
+        false => Err(not_found("user")),
+    }
+}
+
+async fn create_website(
+    State(state): State<AppState>,
+    Json(input): Json<websites::WebsiteInput>,
+) -> Result<Json<Value>, ApiError> {
+    let id = websites::create(&state.database, input)
+        .await
+        .map_err(bad_request)?;
+    Ok(Json(json!({ "id": id })))
+}
+
+async fn update_website(
+    State(state): State<AppState>,
+    Path(id): Path<String>,
+    Json(input): Json<websites::WebsiteInput>,
+) -> Result<Json<Value>, ApiError> {
+    match websites::update(&state.database, &id, input)
+        .await
+        .map_err(bad_request)?
+    {
+        true => Ok(Json(json!({ "updated": true }))),
+        false => Err(not_found("website")),
+    }
+}
+
+async fn delete_website(
+    State(state): State<AppState>,
+    Path(id): Path<String>,
+) -> Result<Json<Value>, ApiError> {
+    match websites::delete(&state.database, &id)
+        .await
+        .map_err(internal)?
+    {
+        true => Ok(Json(json!({ "deleted": true }))),
+        false => Err(not_found("website")),
+    }
+}
+
+#[derive(Debug, Deserialize)]
+struct UpdateGatewayRequest {
+    name: Option<String>,
+    country: Option<String>,
+    city: Option<String>,
+    address: Option<String>,
+}
+
+async fn update_gateway(
+    State(state): State<AppState>,
+    Path(id): Path<String>,
+    Json(payload): Json<UpdateGatewayRequest>,
+) -> Result<Json<Value>, ApiError> {
+    let result = sqlx::query(
+        "UPDATE gateways
+            SET name = COALESCE($2, name),
+                country = COALESCE($3, country),
+                city = COALESCE($4, city),
+                address = COALESCE($5, address)
+          WHERE id = $1",
+    )
+    .bind(&id)
+    .bind(payload.name)
+    .bind(payload.country)
+    .bind(payload.city)
+    .bind(payload.address)
+    .execute(state.database.pool())
+    .await
+    .map_err(internal)?;
+    if result.rows_affected() == 0 {
+        return Err(not_found("gateway"));
+    }
+    Ok(Json(json!({ "updated": true })))
+}
+
+async fn delete_gateway(
+    State(state): State<AppState>,
+    Path(id): Path<String>,
+) -> Result<Json<Value>, ApiError> {
+    let result = sqlx::query("DELETE FROM gateways WHERE id = $1")
+        .bind(&id)
+        .execute(state.database.pool())
+        .await
+        .map_err(internal)?;
+    if result.rows_affected() == 0 {
+        return Err(not_found("gateway"));
+    }
+    Ok(Json(json!({ "deleted": true })))
 }
 
 async fn health(State(state): State<AppState>) -> impl IntoResponse {
@@ -556,6 +804,25 @@ async fn logs(
 
 fn parse_json(raw: &str) -> Value {
     serde_json::from_str(raw).unwrap_or(Value::Null)
+}
+
+fn not_found(resource: &str) -> ApiError {
+    (
+        StatusCode::NOT_FOUND,
+        Json(json!({ "error": format!("{resource} not found") })),
+    )
+}
+
+fn bad_request(message: impl std::fmt::Display) -> ApiError {
+    (
+        StatusCode::BAD_REQUEST,
+        Json(json!({ "error": message.to_string() })),
+    )
+}
+
+fn auth_error(error: anyhow::Error) -> ApiError {
+    event!(Level::WARN, error = %format!("{error:#}"), "user API request failed");
+    bad_request(error.to_string())
 }
 
 fn certificate_error(error: anyhow::Error) -> ApiError {
