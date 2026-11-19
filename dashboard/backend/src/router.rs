@@ -4,18 +4,20 @@ use std::time::Duration;
 
 use axum::{
     Json, Router,
-    extract::{Extension, Query, Request, State},
+    extract::{Extension, Path, Query, Request, State},
     http::{HeaderMap, StatusCode, header},
     middleware::{self, Next},
     response::{IntoResponse, Response},
-    routing::{get, post},
+    routing::{delete, get, post},
 };
 use serde::Deserialize;
 use serde_json::{Value, json};
 use shared::database::{Database, schema_version};
 use sqlx::Row;
+use tracing::{Level, event};
 
 use crate::auth::{self, User};
+use crate::certificate;
 
 #[derive(Clone)]
 struct AppState {
@@ -32,7 +34,18 @@ pub fn router(database: Database, api_token: Option<String>) -> Router {
     let protected = Router::new()
         .route("/api/summary", get(summary))
         .route("/api/websites", get(websites))
-        .route("/api/certificates", get(certificates))
+        .route(
+            "/api/certificates",
+            get(certificates).post(create_certificate),
+        )
+        .route("/api/certificates/issue", post(issue_certificate))
+        .route("/api/certificates/{id}", delete(delete_certificate))
+        .route("/api/certificates/{id}/issue", post(reissue_certificate))
+        .route(
+            "/api/dns-providers",
+            get(dns_providers).post(create_dns_provider),
+        )
+        .route("/api/dns-providers/{id}", delete(delete_dns_provider))
         .route("/api/gateways", get(gateways))
         .route("/api/logs", get(logs))
         .route("/api/auth/me", get(me))
@@ -269,7 +282,14 @@ async fn websites(State(state): State<AppState>) -> Result<Json<Value>, ApiError
 
 async fn certificates(State(state): State<AppState>) -> Result<Json<Value>, ApiError> {
     let rows = sqlx::query(
-        "SELECT id, name, hostnames, email, dns_provider_id,
+        "SELECT id, name, hostnames, email, dns_provider_id, auto_renew, dns_zone, last_error,
+                CASE
+                    WHEN fullchain IS NULL THEN 'pending'
+                    WHEN expires_at IS NOT NULL AND expires_at < now() THEN 'expired'
+                    WHEN expires_at IS NOT NULL AND expires_at < now() + interval '30 days' THEN 'expiring'
+                    ELSE 'valid'
+                END AS status,
+                to_char(signing_started_at, 'YYYY-MM-DD\"T\"HH24:MI:SS\"Z\"') AS signing_started_at,
                 to_char(expires_at, 'YYYY-MM-DD\"T\"HH24:MI:SS\"Z\"') AS expires_at,
                 to_char(created_at, 'YYYY-MM-DD\"T\"HH24:MI:SS\"Z\"') AS created_at
            FROM certificates
@@ -288,6 +308,11 @@ async fn certificates(State(state): State<AppState>) -> Result<Json<Value>, ApiE
                 "hostnames": row.try_get::<Vec<String>, _>("hostnames").map_err(internal)?,
                 "email": row.try_get::<Option<String>, _>("email").map_err(internal)?,
                 "dns_provider_id": row.try_get::<Option<String>, _>("dns_provider_id").map_err(internal)?,
+                "auto_renew": row.try_get::<bool, _>("auto_renew").map_err(internal)?,
+                "dns_zone": row.try_get::<Option<String>, _>("dns_zone").map_err(internal)?,
+                "last_error": row.try_get::<Option<String>, _>("last_error").map_err(internal)?,
+                "status": row.try_get::<String, _>("status").map_err(internal)?,
+                "signing_started_at": row.try_get::<Option<String>, _>("signing_started_at").map_err(internal)?,
                 "expires_at": row.try_get::<Option<String>, _>("expires_at").map_err(internal)?,
                 "created_at": row.try_get::<String, _>("created_at").map_err(internal)?,
             }))
@@ -295,6 +320,157 @@ async fn certificates(State(state): State<AppState>) -> Result<Json<Value>, ApiE
         .collect::<Result<Vec<_>, ApiError>>()?;
 
     Ok(Json(json!({ "items": items })))
+}
+
+#[derive(Debug, Deserialize)]
+struct UploadCertificateRequest {
+    name: Option<String>,
+    hostnames: Option<Vec<String>>,
+    fullchain: String,
+    private_key: String,
+    email: Option<String>,
+}
+
+async fn create_certificate(
+    State(state): State<AppState>,
+    Json(payload): Json<UploadCertificateRequest>,
+) -> Result<Json<Value>, ApiError> {
+    let uploaded = certificate::upload_certificate(
+        &state.database,
+        payload.name,
+        payload.hostnames,
+        payload.fullchain,
+        payload.private_key,
+        payload.email,
+    )
+    .await
+    .map_err(certificate_error)?;
+
+    Ok(Json(json!({
+        "id": uploaded.id,
+        "hostnames": uploaded.hostnames,
+        "expires_at": uploaded.expires_at,
+        "status": "valid",
+    })))
+}
+
+#[derive(Debug, Deserialize)]
+struct IssueCertificateRequest {
+    name: Option<String>,
+    hostnames: Vec<String>,
+    email: Option<String>,
+    dns_provider_id: Option<String>,
+    dns_zone: Option<String>,
+}
+
+async fn issue_certificate(
+    State(state): State<AppState>,
+    Json(payload): Json<IssueCertificateRequest>,
+) -> Result<Json<Value>, ApiError> {
+    let id = certificate::create_pending(
+        &state.database,
+        payload.name,
+        payload.hostnames,
+        payload.email,
+        payload.dns_provider_id,
+        payload.dns_zone,
+    )
+    .await
+    .map_err(certificate_error)?;
+
+    certificate::trigger(state.database.clone(), id.clone());
+    Ok(Json(json!({ "id": id, "status": "queued" })))
+}
+
+async fn reissue_certificate(
+    State(state): State<AppState>,
+    Path(id): Path<String>,
+) -> Result<Json<Value>, ApiError> {
+    certificate::mark_for_issue(&state.database, &id)
+        .await
+        .map_err(certificate_error)?;
+    certificate::trigger(state.database.clone(), id.clone());
+    Ok(Json(json!({ "id": id, "status": "queued" })))
+}
+
+async fn delete_certificate(
+    State(state): State<AppState>,
+    Path(id): Path<String>,
+) -> Result<Json<Value>, ApiError> {
+    match certificate::delete_certificate(&state.database, &id)
+        .await
+        .map_err(certificate_error)?
+    {
+        true => Ok(Json(json!({ "deleted": true }))),
+        false => Err((
+            StatusCode::NOT_FOUND,
+            Json(json!({ "error": "certificate not found" })),
+        )),
+    }
+}
+
+async fn dns_providers(State(state): State<AppState>) -> Result<Json<Value>, ApiError> {
+    let providers = certificate::list_dns_providers(&state.database)
+        .await
+        .map_err(certificate_error)?;
+    let items: Vec<Value> = providers
+        .into_iter()
+        .map(|provider| {
+            json!({
+                "id": provider.id,
+                "name": provider.name,
+                "domains": provider.domains,
+                "kind": provider.kind,
+                "from_env": provider.from_env,
+            })
+        })
+        .collect();
+    Ok(Json(json!({ "items": items })))
+}
+
+#[derive(Debug, Deserialize)]
+struct CreateDnsProviderRequest {
+    name: Option<String>,
+    domains: Vec<String>,
+    kind: Option<String>,
+    #[serde(default)]
+    from_env: bool,
+    secret_id: Option<String>,
+    secret_key: Option<String>,
+}
+
+async fn create_dns_provider(
+    State(state): State<AppState>,
+    Json(payload): Json<CreateDnsProviderRequest>,
+) -> Result<Json<Value>, ApiError> {
+    let id = certificate::create_dns_provider(
+        &state.database,
+        payload.name,
+        payload.domains,
+        payload.kind,
+        payload.from_env,
+        payload.secret_id,
+        payload.secret_key,
+    )
+    .await
+    .map_err(certificate_error)?;
+    Ok(Json(json!({ "id": id })))
+}
+
+async fn delete_dns_provider(
+    State(state): State<AppState>,
+    Path(id): Path<String>,
+) -> Result<Json<Value>, ApiError> {
+    match certificate::delete_dns_provider(&state.database, &id)
+        .await
+        .map_err(certificate_error)?
+    {
+        true => Ok(Json(json!({ "deleted": true }))),
+        false => Err((
+            StatusCode::NOT_FOUND,
+            Json(json!({ "error": "DNS provider not found" })),
+        )),
+    }
 }
 
 async fn gateways(State(state): State<AppState>) -> Result<Json<Value>, ApiError> {
@@ -380,6 +556,14 @@ async fn logs(
 
 fn parse_json(raw: &str) -> Value {
     serde_json::from_str(raw).unwrap_or(Value::Null)
+}
+
+fn certificate_error(error: anyhow::Error) -> ApiError {
+    event!(Level::WARN, error = %format!("{error:#}"), "certificate API request failed");
+    (
+        StatusCode::BAD_REQUEST,
+        Json(json!({ "error": error.to_string() })),
+    )
 }
 
 type ApiError = (StatusCode, Json<Value>);

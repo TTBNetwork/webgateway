@@ -1,8 +1,7 @@
 .lh
 old_project/
-
 # Rust
 target/
-
 # Local configuration (may contain credentials)
 config.toml
+.secrets/

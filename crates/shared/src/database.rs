@@ -61,6 +61,9 @@ const REQUIRED_TABLES: &[&str] = &[
 const REQUIRED_COLUMNS: &[(&str, &str)] = &[
     ("users", "role"),
     ("certificates", "signing_started_at"),
+    ("certificates", "auto_renew"),
+    ("certificates", "dns_zone"),
+    ("certificates", "last_error"),
     ("access_request_logs", "remote_addr"),
     ("gateways", "machine_id"),
     ("access_stats_second", "second_at"),
@@ -487,10 +490,11 @@ mod tests {
     const MIGRATION_SQL: &str = include_str!("../migrations/0001_initial_schema.sql");
     const MIGRATION_SQL_2: &str = include_str!("../migrations/0002_notify_deletes.sql");
     const MIGRATION_SQL_3: &str = include_str!("../migrations/0003_stats_maintenance.sql");
+    const MIGRATION_SQL_4: &str = include_str!("../migrations/0004_certificate_issuance.sql");
 
     #[test]
     fn schema_version_is_positive() {
-        assert!(schema_version() >= 3);
+        assert!(schema_version() >= 4);
     }
 
     #[test]
@@ -518,6 +522,19 @@ mod tests {
                 .trim_end()
                 .ends_with("SELECT wg_mark_schema_version(3);")
         );
+        assert!(
+            MIGRATION_SQL_4
+                .trim_end()
+                .ends_with("SELECT wg_mark_schema_version(4);")
+        );
+    }
+
+    #[test]
+    fn certificate_issuance_migration_adds_renewal_state() {
+        assert!(MIGRATION_SQL_4.contains("ADD COLUMN auto_renew"));
+        assert!(MIGRATION_SQL_4.contains("ADD COLUMN dns_zone"));
+        assert!(MIGRATION_SQL_4.contains("ADD COLUMN last_error"));
+        assert!(MIGRATION_SQL_4.contains("certificates_renewal_idx"));
     }
 
     #[test]

@@ -10,7 +10,14 @@ resolver = "3"
 version = "0.1.0"
 edition = "2024"
 
+[patch.crates-io]
+# The published acmex 0.8.0 hardcodes aws-lc-rs's "fips" feature, which fails
+# to build on this toolchain. The vendored copy (same version, same license)
+# only drops that hardcoded feature; see vendor/acmex and changelog.md.
+acmex = { path = "vendor/acmex" }
+
 [workspace.dependencies]
+acmex = { version = "0.8.0", features = ["dns-tencent", "zerossl-ca"] }
 anyhow = "1.0.101"
 axum = "0.8.8"
 serde = { version = "1.0.228", features = ["derive"] }
