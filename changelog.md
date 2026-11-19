@@ -35,3 +35,12 @@
 - 记录网关缓存（主控下发策略：大小上限、文件类型、ETag、TTL 等，细节后续）与 IP/UA 拦截（优先级低）；
   缓存/拦截配置后续放 `websites.config` JSONB，本步不改 schema。
 - AGENT.md 增加上述规则；database.md 更新时区约定与 `websites.config` 说明。
+### 网关（分支 `feat/gateway`）
+- 新增 `gateway` crate：等待主控 schema；`gateways` 注册 online、10s 心跳、SIGTERM/Ctrl-C 优雅 offline。
+- 每 10s 全量同步 websites/certificates；监听端口取配置与 `websites.ports` 的并集，随同步增删。
+- HTTP/HTTPS 反向代理：Host 精确/通配符路由、`match_path` + 轮询、`X-Forwarded-*`、60s 超时、404/502/504。
+- TLS：数据库 PEM 证书 + SNI 解析 + 默认自签证书 + ALPN h2/http1.1（E2E 实测 HTTP/2）。
+- 响应增加 `Server: WebGateway` 与 `X-WebGateway-Node: <country-city>`。
+- 单元测试 9 个；beta 库 E2E 验证 HTTP/HTTPS/404/在线/心跳/离线（测试数据已清理）。
+- 文档 `gateway.md`，`database.md` 更新实施状态。
+- 未实现（下一步）：访问日志与统计、缓存、IP/UA 拦截、WebSocket、上游 TLS。

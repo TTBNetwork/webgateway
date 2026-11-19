@@ -310,7 +310,7 @@ FROM users;
 - 触发器：`gateways_updated_at`。
 - 视图 `gateways_online`：`status = 'online' AND last_seen_at >= now() - INTERVAL '30 seconds'`。
   网关崩溃时不会执行下线标记，因此在线判断必须叠加心跳新鲜度（心跳间隔计划 10s 左右）。
-  上线/下线写库属于网关侧下一步代码。
+  网关已实现：启动注册 online、每 10s 心跳更新 `last_seen_at`、SIGTERM/Ctrl-C 优雅退出标记 offline。
 
 #### access_request_logs（按周分区）
 
@@ -622,13 +622,14 @@ pub async fn wait_for_master_schema(cfg: &DatabaseConfig) -> anyhow::Result<Data
 
 ## 10. 实施状态
 
-**已完成**：workspace（`shared` + `dashboard`）、完整 schema 迁移、主控迁移与就绪标记、`verify_schema`、
-shared 的网关等待函数、dashboard `/health`、单元测试 + 集成测试（临时库）。
+**已完成**：workspace（`shared` + `dashboard` + `gateway`）、完整 schema 迁移、主控迁移与就绪标记、
+`verify_schema`、dashboard `/health`、单元测试 + 集成测试（临时库）；
+网关二进制（等待就绪、`gateways` 上下线与心跳、站点/证书同步、HTTP/HTTPS 反向代理、节点 header）。
 
 **下一步**：
-1. 网关二进制：调用 `wait_for_master_schema`，注册 `gateways`（online + 心跳），优雅退出标记 offline；
-2. 访问日志写入与秒级/分钟级/日级汇总、保留期清理；
-3. 配置表的 LISTEN/NOTIFY 网关同步、CRUD/仓储层、REST API、认证、ACME、代理链路、前端对接。
+1. 访问日志写入与秒级/分钟级/日级汇总、保留期清理；
+2. 网关缓存（主控下发）与 IP/UA 拦截；
+3. 配置表的 LISTEN/NOTIFY 增量同步、CRUD/仓储层、REST API、认证、ACME、前端对接。
 
 ## 11. 决策记录（2026-11-18）
 
