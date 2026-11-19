@@ -44,20 +44,36 @@ impl NodeInfo {
         }
     }
 
-    /// HTTP header safe variant of the node label (ASCII only).
+    /// HTTP header value: "<country-city>-<hash>" where the hash mixes the
+    /// location and the machine id, e.g. "cn-shanghai-1f3c9a...".
     pub fn header_label(&self) -> String {
-        let label: String = self
-            .label()
+        let location = self.location_label();
+        let hash = fnv1a64(format!("{location}{}", self.machine_id).as_bytes());
+        format!("{location}-{hash:016x}")
+    }
+
+    fn location_label(&self) -> String {
+        let raw = match (&self.country, &self.city) {
+            (Some(country), Some(city)) if !country.is_empty() && !city.is_empty() => {
+                format!("{country}-{city}")
+            }
+            _ => self
+                .name
+                .clone()
+                .filter(|name| !name.is_empty())
+                .unwrap_or_else(|| "node".to_string()),
+        };
+
+        let sanitized: String = raw
             .chars()
-            .filter(|character| {
-                character.is_ascii_alphanumeric() || matches!(character, '-' | '_' | '.')
-            })
-            .collect();
-        let label = label.trim_matches(|character| matches!(character, '-' | '_' | '.'));
-        if label.is_empty() {
-            self.machine_id.clone()
+            .filter(|character| character.is_ascii_alphanumeric() || *character == '-')
+            .collect::<String>()
+            .to_ascii_lowercase();
+        let sanitized = sanitized.trim_matches('-');
+        if sanitized.is_empty() {
+            "node".to_string()
         } else {
-            label.to_string()
+            sanitized.to_string()
         }
     }
 
@@ -121,6 +137,18 @@ impl NodeInfo {
     }
 }
 
+fn fnv1a64(bytes: &[u8]) -> u64 {
+    const OFFSET: u64 = 0xcbf2_9ce4_8422_2325;
+    const PRIME: u64 = 0x0000_0100_0000_01b3;
+
+    let mut hash = OFFSET;
+    for byte in bytes {
+        hash ^= u64::from(*byte);
+        hash = hash.wrapping_mul(PRIME);
+    }
+    hash
+}
+
 fn generate_id() -> String {
     let nanos = SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -150,9 +178,26 @@ mod tests {
     }
 
     #[test]
-    fn header_label_is_ascii_safe() {
+    fn header_label_contains_location_and_hash() {
+        let node = node();
+        let label = node.header_label();
+        assert!(label.starts_with("cn-shanghai-"));
+        assert_eq!(label.len(), "cn-shanghai-".len() + 16);
+        assert_eq!(label, node.header_label());
+    }
+
+    #[test]
+    fn header_label_hashes_the_machine_id() {
+        let first = node().header_label();
+        let mut other = node();
+        other.machine_id = "machine-2".to_string();
+        assert_ne!(first, other.header_label());
+    }
+
+    #[test]
+    fn header_label_falls_back_to_node_for_non_ascii_location() {
         let mut node = node();
         node.city = Some("上海".to_string());
-        assert_eq!(node.header_label(), "CN");
+        assert!(node.header_label().starts_with("cn-"));
     }
 }

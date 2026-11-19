@@ -60,20 +60,13 @@ pub async fn handle(
     let mut headers = request.headers().clone();
     remove_hop_by_hop(&mut headers);
 
+    // Keep the original Host unless the site proxy headers override it.
     if !raw_host.is_empty()
         && let Ok(value) = HeaderValue::from_str(&raw_host)
     {
-        headers.insert(header::HOST, value.clone());
-        headers.insert(HeaderName::from_static("x-forwarded-host"), value);
+        headers.insert(header::HOST, value);
     }
-    if let Ok(value) = HeaderValue::from_str(&peer.ip().to_string()) {
-        headers.insert(HeaderName::from_static("x-real-ip"), value.clone());
-        headers.insert(HeaderName::from_static("x-forwarded-for"), value);
-    }
-    headers.insert(
-        HeaderName::from_static("x-forwarded-proto"),
-        HeaderValue::from_static(scheme),
-    );
+    site.headers.apply(&mut headers, &raw_host, scheme, peer);
 
     let method = request.method().clone();
     let body = request.into_body();

@@ -6,6 +6,7 @@
 mod config;
 mod listeners;
 mod node;
+mod notify;
 mod proxy;
 mod state;
 mod sync;
@@ -19,13 +20,14 @@ use std::{
 
 use anyhow::Context;
 use shared::database::wait_for_master_schema;
-use tokio::task::JoinHandle;
+use tokio::{sync::mpsc, task::JoinHandle};
 use tracing::{Level, event};
 
 use crate::{
     config::Config,
     listeners::Listeners,
     node::NodeInfo,
+    notify::ConfigEvent,
     state::{AppState, CertStore},
     tls::default_certified_key,
 };
@@ -72,12 +74,14 @@ async fn run() -> anyhow::Result<()> {
         .with_context(|| format!("invalid [server].bind address: {}", config.server.bind))?;
     let mut listeners = Listeners::new(bind);
 
-    let mut ports = sync::sync_once(&database, &state, &config.server.ports)
+    let (mut ports, mut watermark) = sync::sync_once(&database, &state, &config.server.ports)
         .await
         .context("initial configuration sync failed")?;
     listeners.reconcile(&ports, state.clone());
 
     let heartbeat = spawn_heartbeat(database.clone(), node.clone());
+    let (event_tx, mut event_rx) = mpsc::channel(8);
+    let notification_task = tokio::spawn(notify::listen(database.clone(), event_tx));
 
     loop {
         tokio::select! {
@@ -85,20 +89,46 @@ async fn run() -> anyhow::Result<()> {
                 event!(Level::INFO, "shutdown signal received");
                 break;
             }
-            _ = tokio::time::sleep(Duration::from_secs(10)) => {
-                match sync::sync_once(&database, &state, &config.server.ports).await {
-                    Ok(next_ports) => {
-                        ports = next_ports;
-                        listeners.reconcile(&ports, state.clone());
+            Some(event) = event_rx.recv() => {
+                // Coalesce notifications that arrived while the last sync ran.
+                let mut force = event == ConfigEvent::Changed;
+                while let Ok(next) = event_rx.try_recv() {
+                    force |= next == ConfigEvent::Changed;
+                }
+
+                let should_sync = if force {
+                    true
+                } else {
+                    match sync::current_watermark(&database).await {
+                        Ok(current) if current == watermark => {
+                            event!(Level::DEBUG, "gateway configuration is up to date");
+                            false
+                        }
+                        Ok(_) => true,
+                        Err(error) => {
+                            event!(Level::WARN, %error, "failed to read the configuration watermark");
+                            false
+                        }
                     }
-                    Err(error) => {
-                        event!(Level::WARN, %error, "configuration sync failed; keeping the previous configuration");
+                };
+
+                if should_sync {
+                    match sync::sync_once(&database, &state, &config.server.ports).await {
+                        Ok((next_ports, next_watermark)) => {
+                            ports = next_ports;
+                            watermark = next_watermark;
+                            listeners.reconcile(&ports, state.clone());
+                        }
+                        Err(error) => {
+                            event!(Level::WARN, %error, "configuration sync failed; keeping the previous configuration");
+                        }
                     }
                 }
             }
         }
     }
 
+    notification_task.abort();
     heartbeat.abort();
     listeners.abort_all();
     node.mark_offline(&database).await?;

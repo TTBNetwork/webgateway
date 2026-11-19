@@ -1,12 +1,15 @@
-//! Load websites and certificates from PostgreSQL and apply them to the state.
+//! Load websites and certificates from PostgreSQL and track a change watermark.
 
-use std::{collections::BTreeSet, sync::Arc};
+use std::{
+    collections::{BTreeSet, HashMap},
+    sync::Arc,
+};
 
 use anyhow::Context;
 use tracing::{Level, event};
 use url::Url;
 
-use crate::state::{AppState, Backend, CertStore, Routing, Site};
+use crate::state::{AppState, Backend, CertStore, ProxyHeaders, Routing, Site};
 use shared::database::Database;
 
 #[derive(Debug, sqlx::FromRow)]
@@ -16,6 +19,7 @@ struct WebsiteRow {
     hosts: Vec<String>,
     ports: Vec<i32>,
     backends: String,
+    config: String,
 }
 
 #[derive(Debug, serde::Deserialize)]
@@ -23,6 +27,20 @@ struct BackendRow {
     url: String,
     #[serde(default)]
     match_path: Option<String>,
+}
+
+#[derive(Debug, serde::Deserialize, Default)]
+struct WebsiteConfigRow {
+    #[serde(default)]
+    headers: Option<HeaderConfigRow>,
+}
+
+#[derive(Debug, serde::Deserialize, Default)]
+struct HeaderConfigRow {
+    #[serde(default)]
+    set: HashMap<String, String>,
+    #[serde(default)]
+    remove: Vec<String>,
 }
 
 #[derive(Debug, sqlx::FromRow)]
@@ -33,18 +51,50 @@ struct CertificateRow {
     private_key: String,
 }
 
+/// Lightweight fingerprint used to decide whether a full reload is needed.
+///
+/// Counts catch inserts and deletes; MAX(updated_at) catches updates. Comparing
+/// both avoids polling the full configuration.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Watermark {
+    websites_count: i64,
+    websites_updated: String,
+    certificates_count: i64,
+    certificates_updated: String,
+}
+
+pub async fn current_watermark(database: &Database) -> anyhow::Result<Watermark> {
+    let row: (i64, String, i64, String) = sqlx::query_as(
+        "SELECT (SELECT COUNT(*) FROM websites),
+                (SELECT COALESCE(MAX(updated_at)::text, '') FROM websites),
+                (SELECT COUNT(*) FROM certificates),
+                (SELECT COALESCE(MAX(updated_at)::text, '') FROM certificates)",
+    )
+    .fetch_one(database.pool())
+    .await
+    .context("failed to read the configuration watermark")?;
+
+    Ok(Watermark {
+        websites_count: row.0,
+        websites_updated: row.1,
+        certificates_count: row.2,
+        certificates_updated: row.3,
+    })
+}
+
 /// Reload the full configuration and swap it into the running state.
 pub async fn sync_once(
     database: &Database,
     state: &AppState,
     config_ports: &[u16],
-) -> anyhow::Result<BTreeSet<u16>> {
+) -> anyhow::Result<(BTreeSet<u16>, Watermark)> {
     let default_cert = state.current_default_cert();
 
     let websites = sqlx::query_as::<_, WebsiteRow>(
         "SELECT id, name, hosts,
                 ARRAY(SELECT x::int FROM unnest(ports) AS x)::int[] AS ports,
-                backends::text AS backends
+                backends::text AS backends,
+                config::text AS config
            FROM websites",
     )
     .fetch_all(database.pool())
@@ -61,6 +111,18 @@ pub async fn sync_once(
                 event!(Level::WARN, website = %row.id, %error, "ignoring website with invalid backends");
                 continue;
             }
+        };
+
+        let config: WebsiteConfigRow = match serde_json::from_str(&row.config) {
+            Ok(config) => config,
+            Err(error) => {
+                event!(Level::WARN, website = %row.id, %error, "invalid website config; using defaults");
+                WebsiteConfigRow::default()
+            }
+        };
+        let headers = match config.headers {
+            Some(headers) => ProxyHeaders::from_config(headers.set, headers.remove),
+            None => ProxyHeaders::defaults(),
         };
 
         let mut backends = Vec::new();
@@ -97,7 +159,9 @@ pub async fn sync_once(
             .collect();
         database_ports.extend(ports.iter().copied());
 
-        let site = Arc::new(Site::new(row.id, row.name, row.hosts, ports, backends));
+        let site = Arc::new(Site::new(
+            row.id, row.name, row.hosts, ports, backends, headers,
+        ));
         event!(
             Level::DEBUG,
             website = %site.id,
@@ -140,6 +204,8 @@ pub async fn sync_once(
     let certificate_host_count = certificates.hostname_count();
     state.apply_config(routing, certificates);
 
+    let watermark = current_watermark(database).await?;
+
     event!(
         Level::INFO,
         website_hosts = host_count,
@@ -148,5 +214,5 @@ pub async fn sync_once(
         "gateway configuration synced"
     );
 
-    Ok(desired_ports)
+    Ok((desired_ports, watermark))
 }

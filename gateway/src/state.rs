@@ -1,13 +1,15 @@
-//! Routing tables, certificate store and per-process state.
+//! Routing tables, per-site proxy headers, certificate store and process state.
 
 use std::{
     collections::HashMap,
+    net::SocketAddr,
     sync::{
         Arc, RwLock,
         atomic::{AtomicUsize, Ordering},
     },
 };
 
+use http::{HeaderMap, HeaderName, HeaderValue};
 use hyper::body::Incoming;
 use hyper_util::client::legacy::Client;
 use hyper_util::client::legacy::connect::HttpConnector;
@@ -61,6 +63,101 @@ pub struct Backend {
     pub match_path: Option<String>,
 }
 
+#[derive(Debug, Clone)]
+pub struct HeaderRule {
+    pub name: HeaderName,
+    pub template: String,
+}
+
+/// Per-website request header rules.
+///
+/// The defaults mirror the previous hard-coded behaviour; a website config can
+/// replace them with its own map or disable them by providing an empty map.
+#[derive(Debug, Clone)]
+pub struct ProxyHeaders {
+    pub set: Vec<HeaderRule>,
+    pub remove: Vec<HeaderName>,
+}
+
+impl Default for ProxyHeaders {
+    fn default() -> Self {
+        Self::defaults()
+    }
+}
+
+impl ProxyHeaders {
+    pub fn defaults() -> Self {
+        let defaults = [
+            ("X-Real-IP", "$remote_addr"),
+            ("X-Forwarded-For", "$remote_addr"),
+            ("X-Forwarded-Proto", "$scheme"),
+            ("X-Forwarded-Host", "$host"),
+        ]
+        .into_iter()
+        .map(|(name, template)| (name.to_string(), template.to_string()))
+        .collect();
+
+        Self::from_parts(defaults, Vec::new())
+    }
+
+    pub fn from_config(set: HashMap<String, String>, remove: Vec<String>) -> Self {
+        Self::from_parts(set, remove)
+    }
+
+    fn from_parts(set: HashMap<String, String>, remove: Vec<String>) -> Self {
+        let mut rules: Vec<HeaderRule> = set
+            .into_iter()
+            .filter_map(|(name, template)| {
+                parse_header_name(&name).map(|name| HeaderRule { name, template })
+            })
+            .collect();
+        rules.sort_by(|left, right| left.name.as_str().cmp(right.name.as_str()));
+
+        let remove = remove
+            .into_iter()
+            .filter_map(|name| parse_header_name(&name))
+            .collect();
+
+        Self { set: rules, remove }
+    }
+
+    /// Apply the configured set/remove rules to outgoing upstream headers.
+    pub fn apply(&self, headers: &mut HeaderMap, host: &str, scheme: &str, peer: SocketAddr) {
+        let remote_addr = peer.ip().to_string();
+
+        for rule in &self.set {
+            let value = rule
+                .template
+                .replace("$remote_addr", &remote_addr)
+                .replace("$scheme", scheme)
+                .replace("$host", host);
+
+            match HeaderValue::from_str(&value) {
+                Ok(value) => {
+                    headers.insert(rule.name.clone(), value);
+                }
+                Err(error) => {
+                    tracing::debug!(header = %rule.name, value = %value, %error, "ignoring invalid proxy header value");
+                }
+            }
+        }
+
+        for name in &self.remove {
+            headers.remove(name);
+        }
+    }
+}
+
+fn parse_header_name(name: &str) -> Option<HeaderName> {
+    match HeaderName::from_bytes(name.to_ascii_lowercase().as_bytes()) {
+        Ok(name) => Some(name),
+        Err(error) => {
+            tracing::warn!(header = %name, %error, "ignoring invalid proxy header name");
+            None
+        }
+    }
+}
+
 #[derive(Debug)]
 pub struct Site {
     pub id: String,
@@ -68,6 +165,7 @@ pub struct Site {
     pub hosts: Vec<String>,
     pub ports: Vec<u16>,
     pub backends: Vec<Backend>,
+    pub headers: ProxyHeaders,
     selector: AtomicUsize,
 }
 
@@ -78,6 +176,7 @@ impl Site {
         hosts: Vec<String>,
         ports: Vec<u16>,
         backends: Vec<Backend>,
+        headers: ProxyHeaders,
     ) -> Self {
         Self {
             id,
@@ -85,6 +184,7 @@ impl Site {
             hosts,
             ports,
             backends,
+            headers,
             selector: AtomicUsize::new(0),
         }
     }
@@ -279,6 +379,7 @@ mod tests {
             hosts.iter().map(|host| (*host).to_string()).collect(),
             vec![80],
             backends,
+            ProxyHeaders::defaults(),
         ))
     }
 
@@ -340,5 +441,34 @@ mod tests {
 
         assert!(store.lookup(Some("a.api.example.com")).is_some());
         assert!(store.lookup(Some("unknown.example.org")).is_some());
+    }
+
+    #[test]
+    fn default_headers_are_rendered() {
+        let peer: SocketAddr = "203.0.113.9:1234".parse().unwrap();
+        let mut headers = HeaderMap::new();
+        ProxyHeaders::defaults().apply(&mut headers, "example.com", "https", peer);
+
+        assert_eq!(headers["x-real-ip"], "203.0.113.9");
+        assert_eq!(headers["x-forwarded-for"], "203.0.113.9");
+        assert_eq!(headers["x-forwarded-proto"], "https");
+        assert_eq!(headers["x-forwarded-host"], "example.com");
+    }
+
+    #[test]
+    fn custom_headers_replace_defaults() {
+        let peer: SocketAddr = "203.0.113.9:1234".parse().unwrap();
+        let mut set = HashMap::new();
+        set.insert("X-Node".to_string(), "node=$host".to_string());
+
+        let headers_config = ProxyHeaders::from_config(set, vec!["X-Forwarded-For".to_string()]);
+        let mut headers = HeaderMap::new();
+        headers.insert("x-forwarded-for", HeaderValue::from_static("1.2.3.4"));
+
+        headers_config.apply(&mut headers, "example.com", "http", peer);
+
+        assert_eq!(headers["x-node"], "node=example.com");
+        assert!(headers.get("x-forwarded-for").is_none());
+        assert!(headers.get("x-forwarded-proto").is_none());
     }
 }

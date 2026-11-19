@@ -483,10 +483,11 @@ mod tests {
     use super::*;
 
     const MIGRATION_SQL: &str = include_str!("../migrations/0001_initial_schema.sql");
+    const MIGRATION_SQL_2: &str = include_str!("../migrations/0002_notify_deletes.sql");
 
     #[test]
     fn schema_version_is_positive() {
-        assert!(schema_version() >= 1);
+        assert!(schema_version() >= 2);
     }
 
     #[test]
@@ -498,12 +499,33 @@ mod tests {
     }
 
     #[test]
-    fn migration_marks_the_schema_version_last() {
+    fn every_migration_marks_its_schema_version_last() {
         assert!(
             MIGRATION_SQL
                 .trim_end()
                 .ends_with("SELECT wg_mark_schema_version(1);")
         );
+        assert!(
+            MIGRATION_SQL_2
+                .trim_end()
+                .ends_with("SELECT wg_mark_schema_version(2);")
+        );
+    }
+
+    #[test]
+    fn deletes_are_notified_for_config_tables() {
+        for table in [
+            "configurations",
+            "dns_providers",
+            "certificates",
+            "websites",
+        ] {
+            assert!(
+                MIGRATION_SQL_2.contains(&format!("AFTER DELETE ON {table}")),
+                "missing delete notification for {table}"
+            );
+        }
+        assert!(MIGRATION_SQL_2.contains("pg_notify(TG_TABLE_NAME || '_updater'"));
     }
 
     #[test]
