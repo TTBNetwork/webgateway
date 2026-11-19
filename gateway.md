@@ -191,7 +191,8 @@ http3_ports = [443]
   请求带 `Authorization` 或 `Cookie` 时跳过缓存。
 - `content_types` 为空表示所有类型；匹配忽略大小写，`image/` 这类以 `/` 结尾的按前缀匹配。
 - TTL 取站点 `ttl` 与上游 `s-maxage` / `max-age` 的较小值。
-- 全局内存上限 64 MiB，LRU 淘汰；单条上限 `max_entry_size`；重启后缓存清空。
+- 全局内存上限默认 **16 MiB**（`[server].cache_max_size_bytes` / `GATEWAY_CACHE_MAX_SIZE`），LRU 淘汰；
+  单条上限 `max_entry_size`；重启后缓存清空。
 - 命中：`X-WebGateway-Cache: HIT` + `Age`；未命中：`MISS`；`If-None-Match` 命中返回 304；
   上游无 ETag 时生成弱 ETag。
 - 配置同步（NOTIFY）时清空缓存。

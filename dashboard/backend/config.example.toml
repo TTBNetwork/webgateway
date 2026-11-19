@@ -10,5 +10,10 @@ wait_timeout_secs = 300
 
 [server]
 port = 3000
-# Bearer token required by /api when set; leave empty for development.
+# Optional service token accepted as `Authorization: Bearer <token>`.
 # api_token = "change-me"
+#
+# The panel uses username + TOTP. On an empty users table the master creates an
+# admin and logs its TOTP secret. Env overrides:
+#   DASHBOARD_ADMIN_USERNAME / DASHBOARD_ADMIN_TOTP_SECRET / DASHBOARD_JWT_SECRET
+#   DASHBOARD_TOKEN_EXPIRES (default 604800)

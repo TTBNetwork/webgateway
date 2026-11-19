@@ -54,14 +54,14 @@
 | F-29 | 权重 / 优先级 | ✅ | weight 默认 1；priority 越小越优先；备用组静态 |
 | F-30 | 站点 headers | ✅ | set/remove、$remote_addr/$scheme/$host、逐跳头剔除 |
 | F-31 | 节点标识头 | ✅ | X-WebGateway-Node: cn-shanghai-<16 hex> |
-| F-32 | 缓存 | ⚠️ | 64MiB LRU、TTL/类型白名单、ETag/304、HIT/MISS/Age；h3 不缓存 |
+| F-32 | 缓存 | ⚠️ | 默认 16MiB LRU（可配）、TTL/类型白名单、ETag/304、HIT/MISS/Age；h3 不缓存 |
 
 ### 1.4 管理面板
 
 | ID | Feature | 状态 | 说明 |
 |---|---|---|---|
 | F-33 | 只读 API | ✅ | /api/summary、websites、certificates、gateways、logs |
-| F-34 | API 鉴权 | ⚠️ | DASHBOARD_API_TOKEN + Bearer；未设置则开发模式开放 |
+| F-34 | API 鉴权 | ⚠️ | 用户名 + TOTP → 每用户 JWT；DASHBOARD_API_TOKEN 作为服务令牌；无 RBAC 细分/撤销 |
 | F-35 | Vue 3 面板 | ✅ | 登录、概览、站点、证书、网关、日志、设置 |
 | F-36 | 视觉 / 交互 | ✅ | 深/浅色、中/英、响应式侧栏、统计卡片、SVG 流量图 |
 | F-37 | 前端工程 | ✅ | 自写 history router + 原生 fetch；无新增依赖；package/lock 未改 |
@@ -73,7 +73,7 @@
 |---|---|---|---|
 | F-39 | 网关单测 | ✅ | 33 个；fmt/clippy 全通过 |
 | F-40 | shared 测试 | ✅ | 10 单测 + 2 集成（临时库） |
-| F-41 | 本地 E2E | ✅ | NOTIFY、headers、PROXY、路由、日志、统计、缓存、TLS、WS、CONNECT、h3、权重 |
+| F-41 | 本地 E2E | ✅ | NOTIFY、headers、PROXY、路由、日志、统计、缓存、TLS、WS、CONNECT、h3、权重、TOTP/JWT |
 
 ---
 
@@ -82,16 +82,16 @@
 | ID | Feature | 限制 |
 |---|---|---|
 | P-01 | HTTP/3 | 请求/响应全缓冲，无流式；无 Alt-Svc；无 0-RTT/连接迁移；h3 不走缓存；WS/gRPC over h3 未实现；无 body 上限 |
-| P-02 | gRPC | 无真实 gRPC server E2E，trailers 为设计假设 |
-| P-03 | WebSocket | https 后端不可用（裸 TcpStream，不走 TLS connector）；忽略 backend base path；字节数记 0 |
+| P-02 | gRPC | 无真实 gRPC server E2E（建议 Nezha 联调），trailers 为设计假设 |
+| P-03 | WebSocket | https 后端不可用（裸 TcpStream，不走 TLS connector）；忽略 backend base path；字节数记 0；建议 MCSManager 联调 |
 | P-04 | CONNECT | 仅 h1；400/403 不写日志；已配置 host 的任意端口可隧道；无鉴权 |
 | P-05 | 缓存 | 仅 h1/h2；配置同步清空全部；无持久化/Vary/HEAD/stale-while-revalidate/single-flight/命中率；max_entry_size 在完整收集后判断 |
 | P-06 | 访问日志 | body_length 取 Content-Length；chunked 请求 0、响应 NULL；WS/CONNECT 0；headers 重复键被覆盖；writer 退出丢最后一批 |
 | P-07 | 统计 | total_ips 跨秒重复；sizes 依赖日志 Content-Length；保留期硬编码；原始日志只删行不 drop 分区 |
 | P-08 | 上游 TLS | 只信 webpki + ca_file，不读系统 native roots；无 mTLS/SNI 覆盖 |
-| P-09 | 面板 | 只读；共享静态令牌，无用户/RBAC；令牌存 localStorage；无服务端分页；无静态托管；无前端测试 |
+| P-09 | 面板 | 只读；TOTP/JWT 登录，但无 RBAC 细分/刷新/撤销；JWT 存 localStorage；无服务端分页；无静态托管；无前端测试 |
 | P-10 | 负载均衡 | priority 为静态备用组；无健康检查/失败自动切换 |
-| P-11 | 管理面 | 无 CRUD、ACME/DNS、审计、用户体系 |
+| P-11 | 管理面 | 无 CRUD、ACME/DNS、审计；有登录但无用户管理/RBAC 细分 |
 | P-12 | 可观测性 | 无 /metrics、无 tracing 导出；面板仅有基础统计 |
 
 ---
@@ -101,7 +101,7 @@
 ### 3.1 管理面 / 安全
 
 - U-01 站点/证书/网关/用户 CRUD API（当前只读）
-- U-02 用户登录、会话、RBAC、API Key 管理
+- U-02 用户管理、RBAC、JWT 刷新/撤销、API Key 管理
 - U-03 ACME 自动签发/续期、DNS provider 集成
 - U-04 面板静态托管 / SPA fallback / nginx 配置
 - U-05 审计日志、操作记录、配置回滚
@@ -238,10 +238,26 @@
 - summary 的 date_trunc('day', now()) 是数据库 UTC 日；+08 用户看到的“今日”从本地 08:00 开始。
 - 建议：按用户时区或站点时区聚合；至少文档说明。
 
-#### B-15 面板令牌安全
-- 静态共享 token；localStorage 存储；未设置 DASHBOARD_API_TOKEN 时 /api 完全开放（开发模式）。
-- 无用户/RBAC、无速率限制/锁定；token 比较非恒定时间。
-- 建议：用户登录 + HttpOnly Cookie/短时 token；生产强制设置 token；加 CSP。
+#### B-15 面板认证安全
+- JWT 存 localStorage，存在 XSS 读取风险；无 CSP。
+- 静态服务令牌仍可用于 API；服务令牌比较为非恒定时间。
+- 建议：HttpOnly Cookie 或短时 token、加 CSP、恒定时间比较。
+
+#### B-29 TOTP 无重放保护/速率限制
+- totp-rs 明确要求调用方保证同一 step 只使用一次；当前未记录已用 step，30s 内可重放。
+- 失败仅延迟 500ms，无按用户/IP 的速率限制或锁定。
+- 建议：记录 last_totp_step、失败计数/锁定。
+
+#### B-30 JWT 无撤销、RBAC 不细化
+- JWT 默认 7 天有效；退出只清浏览器，服务端仍接受旧 JWT。
+- role 写入 JWT，但 /api 路由不区分角色；任何登录用户拥有全部只读权限。
+- 服务令牌（DASHBOARD_API_TOKEN）无过期/轮换。
+- 建议：token version/撤销列表、按角色授权、服务令牌轮换。
+
+#### B-31 认证密钥暴露面
+- 默认管理员 TOTP secret 只在首次创建时打印 WARN 日志；日志集中后可能泄露。
+- users.totp_secret / jwt_secret 明文存库（沿用 v1）；JWT secret 未轮换。
+- 建议：一次性初始化流程/加密存储/密钥轮换。
 
 #### B-16 面板 API 错误泄露
 - internal() 把数据库 error.to_string() 返回给客户端。
@@ -266,7 +282,7 @@
 
 ### P3 — 工程 / 运维
 
-- B-21 分支堆叠未合并：ci/test-workflow → ... → feat/dashboard-panel，main 未集成；PR 未合并。
+- B-21 分支堆叠未合并：ci/test-workflow → ... → feat/dashboard-auth，main 未集成；PR 未合并。
 - B-22 CI 不跑 E2E：shared 集成测试在无 DATABASE_URL 时跳过；HTTP/3/WS/gRPC/CONNECT 仅本地验证。
 - B-23 无 cargo audit / 前端依赖审计。
 - B-24 PostgreSQL 18 beta + uint128 扩展的生产兼容/升级风险。
@@ -279,17 +295,16 @@
 
 ## 5. 当前状态
 
-- 最新分支：feat/dashboard-panel
-- 最新提交：dc5b666（API + Vue 面板）、78f8222（docs）；issue.md 为后续文档提交
-- CI：44545263511 全绿（针对 78f8222）
-- 测试：网关 33、shared 10 + 2 集成；前端 format/lint/build 通过
-- 数据库：schema v2；测试数据已清理（websites/certs/gateways/logs = 0）
-- 面板：只读；Vite 代理 /api → 127.0.0.1:3000；DASHBOARD_API_TOKEN 控制鉴权
+- 最新分支：feat/dashboard-auth
+- 最新提交：本次认证 + 缓存配置提交；CI 以 GitHub Actions 最新 run 为准
+- 测试：网关 33、dashboard 2（TOTP/JWT）、shared 10 + 2 集成；前端 format/lint/build 通过
+- 数据库：schema v2；测试数据已清理（users/websites/logs/stats = 0；首次启动会创建 admin）
+- 面板：TOTP + JWT 登录；默认缓存 16 MiB（可配）；Vite 代理 /api → 127.0.0.1:3000
 
 ## 6. 建议优先级
 
 1. B-01 / B-02：分区续建 + 统计补算（P0）
-2. 面板 CRUD + 用户登录/RBAC（U-01/U-02）
+2. 面板 CRUD + 用户管理/RBAC/JWT 撤销（U-01/U-02）
 3. B-03 / B-04 / B-05 / B-06：WS TLS、h3 限制、优雅停机、日志可靠性
 4. U-11/U-13：h3 流式/Alt-Svc、h2 extended CONNECT
 5. U-17/U-19/U-23：健康检查、metrics、缓存持久化

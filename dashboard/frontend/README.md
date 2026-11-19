@@ -9,7 +9,7 @@ Vue 3 + TypeScript + Vite control-plane panel.
 - Certificates: expiry state and hostnames.
 - Gateways: online/offline nodes, heartbeat and version.
 - Access logs: recent request/response rows with filters.
-- Settings: theme, language, API token and instance info.
+- Settings: account, theme, language and instance info.
 
 ## Development
 
@@ -17,7 +17,7 @@ Start the dashboard API (default port 3000) and the Vite dev server:
 
 ```bash
 # terminal 1
-DATABASE_URL='postgres://...' DASHBOARD_API_TOKEN=dev-token cargo run -p dashboard
+DATABASE_URL='postgres://...' DASHBOARD_ADMIN_TOTP_SECRET=OBWGC2LOFVZXI4TJNZTS243FMNZGK5BNGEZDG cargo run -p dashboard
 
 # terminal 2
 cd dashboard/frontend
@@ -25,8 +25,11 @@ pnpm install
 pnpm dev
 ```
 
-Open http://localhost:5173 and sign in with `dev-token`. Vite proxies `/api` and
-`/health` to `http://127.0.0.1:3000`.
+Open http://localhost:5173 and sign in as `admin` with a TOTP code. The master
+logs the default admin secret on first start; `DASHBOARD_ADMIN_TOTP_SECRET`
+(base32) pins it for development. `DASHBOARD_API_TOKEN` remains available as a
+service token for API clients. Vite proxies `/api` and `/health` to
+`http://127.0.0.1:3000`.
 
 ## Build
 
@@ -44,8 +47,9 @@ For production static hosting, configure the web server to fall back to
 
 ## API
 
-The master exposes read-only endpoints (Bearer token when `DASHBOARD_API_TOKEN`
-is set):
+The master exposes read-only endpoints protected by a JWT from
+`POST /api/auth/login` (username + TOTP). A service token can be supplied via
+`DASHBOARD_API_TOKEN`:
 
 - `GET /health`
 - `GET /api/summary`

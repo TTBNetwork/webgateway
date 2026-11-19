@@ -120,3 +120,11 @@
 - 无新增前端运行时依赖：自写 history router + 原生 fetch，`package.json` / `pnpm-lock.yaml` 未改。
 - 验证：Vite 代理 401/200、真实数据、`pnpm format:check` / `lint:check` / `build` 通过；后端 fmt/clippy/test 通过。
 - 当前面板只读；CRUD、用户体系、ACME、静态托管后续。
+### 面板认证 + 缓存默认值（分支 `feat/dashboard-auth`）
+- 主控 TOTP/JWT 登录：空 users 表自动创建默认 admin（TOTP secret 仅首次 WARN 日志打印）；
+  `POST /api/auth/login` 校验用户名 + 6 位码，签发每用户 HS256 JWT（默认 7 天）。
+- `DASHBOARD_API_TOKEN` 保留为服务令牌；所有 /api 默认需要 JWT 或服务令牌。
+- 面板登录改为用户名 + TOTP，JWT/用户信息存 localStorage；设置页显示账号/角色。
+- 缓存默认 64 MiB → **16 MiB**，新增 `[server].cache_max_size_bytes` / `GATEWAY_CACHE_MAX_SIZE`。
+- 认证限制（TOTP 重放/限速、JWT 撤销/RBAC、secret 明文）已记录到 issue.md。
+- 验证：admin + TOTP → JWT → /api/summary；dashboard 2 个单测；前端 build/lint 通过。
