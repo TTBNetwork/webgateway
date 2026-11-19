@@ -137,7 +137,7 @@ pub async fn sync_once(
         let mut backends = Vec::new();
         for spec in specs {
             match Url::parse(&spec.url) {
-                Ok(url) if url.scheme() == "http" => {
+                Ok(url) if matches!(url.scheme(), "http" | "https") => {
                     if url.host_str().is_none() {
                         event!(Level::WARN, website = %row.id, url = %spec.url, "ignoring backend without a host");
                         continue;
@@ -153,7 +153,7 @@ pub async fn sync_once(
                         Level::WARN,
                         website = %row.id,
                         url = %url,
-                        "ignoring non-http backend (upstream TLS is not implemented yet)"
+                        "ignoring backend with an unsupported scheme (expected http or https)"
                     );
                 }
                 Err(error) => {

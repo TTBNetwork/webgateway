@@ -2,17 +2,21 @@
 
 use std::{
     collections::HashMap,
+    io::Cursor,
     net::{IpAddr, SocketAddr},
+    path::Path,
     sync::{
         Arc, RwLock,
         atomic::{AtomicUsize, Ordering},
     },
 };
 
+use anyhow::Context;
 use bytes::Bytes;
 use http::{HeaderMap, HeaderName, HeaderValue};
 use http_body_util::Full;
 use hyper::body::Incoming;
+use hyper_rustls::{HttpsConnector, HttpsConnectorBuilder};
 use hyper_util::client::legacy::Client;
 use hyper_util::client::legacy::connect::HttpConnector;
 use rustls::sign::CertifiedKey;
@@ -24,7 +28,44 @@ use crate::access::AccessEvent;
 use crate::cache::{Cache, CacheConfig};
 use crate::node::NodeInfo;
 
-pub type UpstreamClient = Client<HttpConnector, Incoming>;
+pub type UpstreamConnector = HttpsConnector<HttpConnector>;
+pub type UpstreamClient = Client<UpstreamConnector, Incoming>;
+pub type BufferedUpstreamClient = Client<UpstreamConnector, Full<Bytes>>;
+
+/// Build the upstream connector used for both HTTP/1.1 and HTTP/2 backends.
+pub fn upstream_connector(ca_file: Option<&Path>) -> anyhow::Result<UpstreamConnector> {
+    let mut roots = rustls::RootCertStore::empty();
+    roots.extend(webpki_roots::TLS_SERVER_ROOTS.iter().cloned());
+
+    if let Some(path) = ca_file {
+        let pem = std::fs::read(path)
+            .with_context(|| format!("failed to read upstream CA file {}", path.display()))?;
+        let mut cursor = Cursor::new(pem);
+        let certificates = rustls_pemfile::certs(&mut cursor)
+            .collect::<Result<Vec<_>, _>>()
+            .with_context(|| format!("failed to parse upstream CA file {}", path.display()))?;
+        for certificate in certificates {
+            roots
+                .add(certificate)
+                .with_context(|| format!("failed to add a CA from {}", path.display()))?;
+        }
+    }
+
+    let provider = Arc::new(rustls::crypto::ring::default_provider());
+    let tls = rustls::ClientConfig::builder_with_provider(provider)
+        .with_safe_default_protocol_versions()
+        .context("failed to select TLS protocol versions")?
+        .with_root_certificates(roots)
+        .with_no_client_auth();
+
+    // hyper-rustls configures ALPN itself; pre-setting it panics.
+    Ok(HttpsConnectorBuilder::new()
+        .with_tls_config(tls)
+        .https_or_http()
+        .enable_http1()
+        .enable_http2()
+        .build())
+}
 
 pub struct AppState {
     pub routing: RwLock<Arc<Routing>>,
@@ -34,7 +75,7 @@ pub struct AppState {
     /// HTTP/2-only client used for gRPC backends (h2c).
     pub grpc_client: UpstreamClient,
     /// HTTP/1.1 client with a buffered body, used by the HTTP/3 path.
-    pub buffered_client: Client<HttpConnector, Full<Bytes>>,
+    pub buffered_client: BufferedUpstreamClient,
     pub cache: Cache,
     pub logs: mpsc::Sender<AccessEvent>,
     pub node: NodeInfo,
@@ -45,16 +86,17 @@ impl AppState {
         node: NodeInfo,
         certs: Arc<RwLock<Arc<CertStore>>>,
         logs: mpsc::Sender<AccessEvent>,
+        upstream_ca_file: Option<&Path>,
     ) -> anyhow::Result<Self> {
         let tls_acceptor = crate::tls::acceptor(certs.clone())?;
-        let client =
-            Client::builder(hyper_util::rt::TokioExecutor::new()).build(HttpConnector::new());
+        let connector = upstream_connector(upstream_ca_file)?;
+        let client = Client::builder(hyper_util::rt::TokioExecutor::new()).build(connector.clone());
 
         let mut grpc_builder = Client::builder(hyper_util::rt::TokioExecutor::new());
         grpc_builder.http2_only(true);
-        let grpc_client = grpc_builder.build(HttpConnector::new());
-        let buffered_client: Client<HttpConnector, Full<Bytes>> =
-            Client::builder(hyper_util::rt::TokioExecutor::new()).build(HttpConnector::new());
+        let grpc_client = grpc_builder.build(connector.clone());
+        let buffered_client: BufferedUpstreamClient =
+            Client::builder(hyper_util::rt::TokioExecutor::new()).build(connector);
 
         Ok(Self {
             routing: RwLock::new(Arc::new(Routing::default())),

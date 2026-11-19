@@ -12,6 +12,14 @@ pub struct Config {
     pub database: DatabaseConfig,
     pub node: NodeConfig,
     pub server: ServerConfig,
+    pub upstream_tls: UpstreamTlsConfig,
+}
+
+#[derive(Debug, Clone, Default, Deserialize)]
+#[serde(default)]
+pub struct UpstreamTlsConfig {
+    /// Extra PEM CA certificates trusted for https backends.
+    pub ca_file: Option<String>,
 }
 
 #[derive(Debug, Clone, Default, Deserialize)]
@@ -55,6 +63,7 @@ impl Config {
         overlay_string("GATEWAY_NODE_COUNTRY", &mut config.node.country);
         overlay_string("GATEWAY_NODE_CITY", &mut config.node.city);
         overlay_string("GATEWAY_NODE_ADDRESS", &mut config.node.address);
+        overlay_string("GATEWAY_UPSTREAM_CA_FILE", &mut config.upstream_tls.ca_file);
 
         if let Ok(bind) = std::env::var("GATEWAY_BIND") {
             config.server.bind = bind;

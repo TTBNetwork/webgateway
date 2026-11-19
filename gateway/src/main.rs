@@ -71,7 +71,17 @@ async fn run() -> anyhow::Result<()> {
         default_cert,
     ))));
     let (log_sender, log_writer) = access::spawn(database.clone());
-    let state = Arc::new(AppState::new(node.clone(), certs, log_sender)?);
+    let upstream_ca_file = config
+        .upstream_tls
+        .ca_file
+        .as_deref()
+        .map(std::path::Path::new);
+    let state = Arc::new(AppState::new(
+        node.clone(),
+        certs,
+        log_sender,
+        upstream_ca_file,
+    )?);
 
     let bind: IpAddr = config
         .server
