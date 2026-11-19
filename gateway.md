@@ -83,7 +83,8 @@ http3_ports = [443]
     数值更大的后端是备用组，只有低优先级组没有匹配后端时才参与；
   - 所有配置条件 AND；命中后端按权重轮询；没有任何后端命中时回退到所有后端。
   - 当前**不做失败自动切换**（备用组不是健康检查故障转移）。
-- 上游支持 `http://` 与 `https://`；https 使用 webpki 根 + 可选 `[upstream_tls].ca_file`，gRPC 同样支持 TLS。
+- 上游支持 `http://` 与 `https://`；https 使用 webpki 根 + 可选 `[upstream_tls].ca_file`，gRPC 与
+  WebSocket 升级（wss）同样支持 TLS，WebSocket 还会拼接后端 base path。
 
 ## 4. 请求头（站点级配置）
 
@@ -160,11 +161,13 @@ http3_ports = [443]
   - 访问日志记录 101。
 - **CONNECT**：仅允许 authority 的 host 命中已配置站点（否则 403），连接 `host:port` 后返回 200
   并桥接原始 TCP；不是 TLS MITM，只做透传。访问日志记录 CONNECT + 200。
+- 上游支持 `http://` 与 `https://`：https 后端先用同一 TLS 配置（webpki 根 + 可选 ca_file）握手，
+  ALPN 固定 `http/1.1`；后端 URL 的 base path 会拼到客户端 path 前（`/mc` + `/socket.io/...`）。
 - 限制：HTTP/2 extended CONNECT / WebSocket over h2 未实现；升级连接不计字节数（body_length 0）；
-  上游仍只支持明文 `http://`（wss 后端是 B-03，待修）。
-- 已用 MCSManager v10.22.1（daemon 4.19.3）实测：`/socket.io` 升级 101、Socket.IO 握手、
-  daemon key 鉴权、`info/overview` 业务事件、45s 内两次 engine.io ping/pong 全部通过；
-  同一 daemon 开启 SSL 后 wss 上游失败，复现了 B-03。详见 `e2e-realtime.md`。
+  无 mTLS / SNI 覆盖。
+- 已用 MCSManager v10.22.1（daemon 4.19.3）实测：明文 ws、wss（测试 CA）、带 base path 的 wss `/mc`
+  三种场景均通过；升级 101、Socket.IO 握手、daemon key 鉴权、`info/overview` 与 engine.io ping/pong 正常。
+  详见 `e2e-realtime.md`。
 
 ### 5.3 HTTP/3（QUIC）
 
@@ -229,7 +232,7 @@ http3_ports = [443]
   `ReportSystemInfo2`、`ReportSystemState`、`ReportGeoIP` 返回 200，`RequestTask` 双向流保持打开，
   Dashboard `online_sessions.ongoing = 1` 直到 Agent 停止。Go gRPC 客户端未报 trailer 错误。
 - WebSocket（MCSManager daemon 4.19.3）：升级 101、Socket.IO 鉴权、`info/overview`、长连接 ping/pong 通过。
-- wss 上游（MCS daemon 开 SSL）：失败，复现 B-03（upgrade.rs 不走 TLS connector）。
+- wss 上游（MCS daemon 开 SSL + 测试 CA）：经网关导入 `info/overview` 成功；后端 base path `/mc` 生效。
 - HTTP 200、HTTPS HTTP/2 200、未知 Host 404、心跳更新、SIGTERM offline。
 - 网关单测 33 个；shared 迁移/单测、fmt、clippy 全通过。
 
@@ -238,7 +241,6 @@ http3_ports = [443]
 - 缓存增强：持久化/多级缓存、stale-while-revalidate、Vary 维度、命中率指标。
 - IP / User-Agent 拦截（优先级低）。
 - 上游传输扩展：
-  - WebSocket 走 `HttpsConnector`、支持 `wss://` 与后端 base path（B-03）；
   - HTTP/3 流式请求/响应、0-RTT / 连接迁移调优；
   - HTTP/2 extended CONNECT / WebSocket over h2；
   - 其余特殊 RFC 按需补充。

@@ -22,6 +22,13 @@ use crate::{
 
 type BoxError = Box<dyn std::error::Error + Send + Sync>;
 
+/// A plain TCP or TLS-wrapped upstream stream. WebSocket upgrades need the raw
+/// stream so hyper can hand it to the 101 upgrade bridge after the handshake.
+trait WebsocketUpstream: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send {}
+impl<T: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send> WebsocketUpstream for T {}
+
+type BoxedUpstreamStream = Box<dyn WebsocketUpstream>;
+
 pub fn is_websocket(request: &Request<Incoming>) -> bool {
     is_websocket_headers(request.headers())
 }
@@ -104,7 +111,7 @@ pub async fn handle_websocket(
     site.headers
         .apply(&mut headers, &raw_host, scheme, client_ip);
 
-    let stream = match tokio::time::timeout(
+    let tcp = match tokio::time::timeout(
         Duration::from_secs(10),
         TcpStream::connect((host.as_str(), port)),
     )
@@ -121,6 +128,41 @@ pub async fn handle_websocket(
             log_failure(&state, &request_log, StatusCode::GATEWAY_TIMEOUT, 15);
             return proxy::text_response(StatusCode::GATEWAY_TIMEOUT, "Gateway Timeout", &state);
         }
+    };
+
+    // WebSocket upstreams may be https://; the raw TCP path above must be
+    // wrapped in TLS before the HTTP/1.1 upgrade request is written.
+    let stream: BoxedUpstreamStream = if backend.url.scheme() == "https" {
+        let server_name = match rustls::pki_types::ServerName::try_from(host.clone()) {
+            Ok(server_name) => server_name,
+            Err(error) => {
+                event!(Level::WARN, %error, backend = %backend.url, "invalid websocket upstream server name");
+                log_failure(&state, &request_log, StatusCode::BAD_GATEWAY, 11);
+                return proxy::text_response(StatusCode::BAD_GATEWAY, "Bad Gateway", &state);
+            }
+        };
+        let connector = tokio_rustls::TlsConnector::from(state.websocket_tls.clone());
+        match tokio::time::timeout(Duration::from_secs(10), connector.connect(server_name, tcp))
+            .await
+        {
+            Ok(Ok(stream)) => Box::new(stream),
+            Ok(Err(error)) => {
+                event!(Level::WARN, %error, backend = %backend.url, "websocket upstream TLS handshake failed");
+                log_failure(&state, &request_log, StatusCode::BAD_GATEWAY, 11);
+                return proxy::text_response(StatusCode::BAD_GATEWAY, "Bad Gateway", &state);
+            }
+            Err(_) => {
+                event!(Level::WARN, backend = %backend.url, "websocket upstream TLS handshake timed out");
+                log_failure(&state, &request_log, StatusCode::GATEWAY_TIMEOUT, 15);
+                return proxy::text_response(
+                    StatusCode::GATEWAY_TIMEOUT,
+                    "Gateway Timeout",
+                    &state,
+                );
+            }
+        }
+    } else {
+        Box::new(tcp)
     };
 
     let (mut sender, connection) = match hyper::client::conn::http1::handshake::<_, Empty<Bytes>>(
@@ -141,14 +183,14 @@ pub async fn handle_websocket(
         }
     });
 
-    let path_and_query = request
-        .uri()
-        .path_and_query()
-        .map(|value| value.as_str())
-        .unwrap_or("/");
-    let uri = path_and_query
-        .parse::<Uri>()
-        .unwrap_or_else(|_| Uri::from_static("/"));
+    let uri = match backend_request_target(&backend, request.uri()).parse::<Uri>() {
+        Ok(uri) => uri,
+        Err(error) => {
+            event!(Level::WARN, %error, backend = %backend.url, "failed to build the websocket upstream target");
+            log_failure(&state, &request_log, StatusCode::BAD_GATEWAY, 11);
+            return proxy::text_response(StatusCode::BAD_GATEWAY, "Bad Gateway", &state);
+        }
+    };
 
     let mut upstream_request = match Request::builder()
         .method(method)
@@ -314,6 +356,17 @@ pub async fn handle_connect(
         .expect("empty CONNECT response")
 }
 
+/// Join the backend base path with the client request target. The client path
+/// is preserved verbatim; only the base path is prepended.
+fn backend_request_target(backend: &Backend, request_uri: &Uri) -> String {
+    let base = backend.url.path().trim_end_matches('/');
+    let path_and_query = request_uri
+        .path_and_query()
+        .map(|value| value.as_str())
+        .unwrap_or("/");
+    format!("{base}{path_and_query}")
+}
+
 fn backend_addr(backend: &Backend) -> Option<(String, u16)> {
     let host = backend.url.host_str()?;
     let host = host.trim_start_matches('[').trim_end_matches(']');
@@ -409,6 +462,33 @@ mod tests {
 
         headers.insert(header::UPGRADE, HeaderValue::from_static("h2c"));
         assert!(!is_websocket_headers(&headers));
+    }
+
+    fn backend(url: &str) -> Backend {
+        Backend {
+            url: url::Url::parse(url).unwrap(),
+            match_path: None,
+            rules: crate::state::MatchRules::default(),
+            weight: 1,
+            priority: 0,
+        }
+    }
+
+    #[test]
+    fn joins_the_backend_base_path_for_websockets() {
+        let uri: Uri = "/socket.io/?EIO=4&transport=websocket".parse().unwrap();
+        assert_eq!(
+            backend_request_target(&backend("https://127.0.0.1:24444/mc"), &uri),
+            "/mc/socket.io/?EIO=4&transport=websocket"
+        );
+        assert_eq!(
+            backend_request_target(&backend("https://127.0.0.1:24444"), &uri),
+            "/socket.io/?EIO=4&transport=websocket"
+        );
+        assert_eq!(
+            backend_request_target(&backend("https://127.0.0.1:24444/"), &uri),
+            "/socket.io/?EIO=4&transport=websocket"
+        );
     }
 
     #[test]

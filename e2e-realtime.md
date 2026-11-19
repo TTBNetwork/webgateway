@@ -126,18 +126,21 @@ node scripts/e2e/mcsmanager_ws_probe.mjs
 | 业务事件 | ✅ | `info/overview` 返回 daemon 版本 4.19.3 |
 | 长连接 / 心跳 | ✅ | 45s 内收到 2 次 engine.io ping 并正确回 pong |
 | 升级连接字节统计 | ❌ 已知限制 | WS 的 body_length 记为 0（B-19） |
-| 上游 TLS（wss） | ❌ 已知缺陷 | 见下节 B-03 |
+| 上游 TLS（wss） | ✅（修复后） | 见下节；B-03 已修复 |
 
-### 上游 TLS（wss）实测
+### 上游 TLS（wss）实测（B-03 修复后）
 
-把 MCS daemon 开启 SSL（`ssl: true` + 自签证书）后：
+MCS daemon 开启 SSL（`ssl: true`，使用测试 CA 签发的 leaf 证书：`basicConstraints=CA:FALSE`，
+SAN 含 `DNS:localhost` / `IP:127.0.0.1`），网关通过 `GATEWAY_UPSTREAM_CA_FILE` 信任测试 CA：
 
 - 直连 `wss://127.0.0.1:24444/socket.io/...`：✅ 探针 PASS。
-- 经网关（站点后端 `https://127.0.0.1:24444`）：❌ WS 升级失败。
+- 经网关（站点后端 `https://127.0.0.1:24444`）：修复前 ❌（B-03：裸 TcpStream 不走 TLS）。
+- 修复后：✅ 后端 `https://127.0.0.1:24444/mc` + 客户端 `/socket.io/...` → 上游 `/mc/socket.io/...`；
+  探针完成鉴权、`info/overview`、25s 内 ping/pong，PASS。
+- 回归：daemon 关闭 SSL 后，明文 `ws://` 路径仍 PASS。
 
-原因即 issue.md 的 **B-03**：`gateway/src/upgrade.rs` 用裸 `TcpStream::connect` 直连后端，
-不经过 `HttpsConnector`，所以 https 后端收到的是明文 HTTP；另外后端 base path 被忽略。
-该问题在后续 B-03 修复中处理（需要验证证书/CA 配置）。
+注意：rustls 不接受 `CA:TRUE` 的自签证书作为服务端 leaf（`CaUsedAsEndEntity`），
+测试证书必须是 CA 签发的 `CA:FALSE` leaf。
 
 ## 4. 复现步骤
 
@@ -157,4 +160,4 @@ node scripts/e2e/mcsmanager_ws_probe.mjs
 
 - gRPC（h2c、TLS、单向/服务端流/双向流、trailers）在真实 Nezha 监控上验证通过。
 - WebSocket（升级、Socket.IO 握手、鉴权、业务事件、长连接心跳）在真实 MCSManager 上验证通过。
-- 同时确认了 WS 上游 TLS（wss）与 base path 仍是已知缺陷（B-03），以及升级连接无字节统计（B-19）。
+- WS 上游 TLS（wss）与后端 base path 已修复（B-03）并复测通过；升级连接仍无字节统计（B-19）。

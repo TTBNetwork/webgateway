@@ -37,7 +37,7 @@
 | F-17 | HTTP/3 同连接并发 | ✅ | 每个请求独立 spawn；aioquic 单连接 5 请求全部 200 |
 | F-18 | 上游 HTTP / HTTPS | ✅ | hyper-rustls HttpsConnector；可选 ca_file；webpki 根 |
 | F-19 | gRPC 上游 | ✅ | h2c/TLS、application/grpc 检测、TE: trailers、无 60s 超时；Nezha v2.6.2 + agent v2.4.0 真实 E2E 通过（一元/双向流/trailers） |
-| F-20 | WebSocket 升级 | ✅ | h1 Upgrade、101、双向桥接；MCSManager daemon 4.19.3 实测握手/鉴权/业务事件/45s 长连接通过；wss 上游仍缺（B-03） |
+| F-20 | WebSocket 升级 | ✅ | h1 Upgrade、101、双向桥接；wss（TLS）+ 后端 base path；MCSManager daemon 4.19.3 的明文 / wss / 带前缀三种场景实测通过 |
 | F-21 | CONNECT 隧道 | ⚠️ | h1；authority host 必须命中已配置站点；非 MITM |
 | F-22 | PROXY protocol v1/v2 | ✅ | 连接入口解析；站点级 get_request_ip 决定信任 |
 | F-23 | 客户端 IP 模式 | ✅ | raw / proxyProtocol / xForwardedFor / xRealIP；E2E 验证 |
@@ -83,7 +83,7 @@
 |---|---|---|
 | P-01 | HTTP/3 | 请求/响应全缓冲，无流式；无 Alt-Svc；无 0-RTT/连接迁移；h3 不走缓存；WS/gRPC over h3 未实现；无 body 上限 |
 | P-02 | gRPC | 已在 Nezha 上验证；访问日志只记 HTTP 200，无法区分 grpc-status；无 gRPC-Web |
-| P-03 | WebSocket | https 后端不可用（裸 TcpStream，不走 TLS connector）；忽略 backend base path；字节数记 0；MCSManager 联调已完成 |
+| P-03 | WebSocket | 升级连接字节数记 0；无 mTLS / SNI 覆盖；wss 与后端 base path 已支持（2026-11-19） |
 | P-04 | CONNECT | 仅 h1；400/403 不写日志；已配置 host 的任意端口可隧道；无鉴权 |
 | P-05 | 缓存 | 仅 h1/h2；配置同步清空全部；无持久化/Vary/HEAD/stale-while-revalidate/single-flight/命中率；max_entry_size 在完整收集后判断 |
 | P-06 | 访问日志 | body_length 取 Content-Length；chunked 请求 0、响应 NULL；WS/CONNECT 0；headers 重复键被覆盖；writer 退出丢最后一批 |
@@ -116,7 +116,6 @@
 - U-11 HTTP/3 流式 body、Alt-Svc、0-RTT、连接迁移
 - U-12 gRPC / WebSocket over HTTP/3
 - U-13 HTTP/2 extended CONNECT / WebSocket over h2
-- U-14 上游 WebSocket TLS（wss）+ base path
 - U-15 gRPC-Web、CONNECT-UDP 等扩展
 - U-16 HTTP/3 单连接并发请求限制/流控
 
@@ -173,13 +172,15 @@
 
 ### P1 — 功能错误 / 数据 / 内存风险
 
-#### B-03 WebSocket 到 https 后端不可用
+#### B-03 WebSocket 到 https 后端不可用（已修复）
 - 症状：backend URL 为 https 时 WS 握手失败；同时忽略 backend base path。
-- 原因：upgrade.rs 使用裸 TcpStream::connect，不走 HttpsConnector；路径只用客户端 path。
-- 影响：wss 上游、带路径前缀的 WS 服务不可用。
-- 实测（MCSManager daemon 4.19.3 开启 SSL）：直连 wss 成功，经网关失败，确认此 bug。
-- 建议：复用 HttpsConnector；拼接 backend base path；补 E2E。
-- 位置：gateway/src/upgrade.rs
+- 原因：upgrade.rs 使用裸 TcpStream::connect，不走 TLS；路径只用客户端 path。
+- 修复：`AppState` 新增 `websocket_tls`（复用上游 CA 配置，ALPN 固定 http/1.1）；
+  upgrade.rs 在 https 后端上做 TLS 握手后再执行 HTTP/1.1 upgrade；上游 target 由
+  backend base path + 客户端 path/query 拼接（`backend_request_target`）。
+- 验证（MCSManager daemon 4.19.3）：明文 ws、wss（测试 CA）、wss + 后端 `/mc` base path
+  三种场景均完成 Socket.IO 握手/鉴权/`info/overview`/ping-pong；网关 34 个单测通过。
+- 位置：gateway/src/upgrade.rs、gateway/src/state.rs
 
 #### B-04 HTTP/3 绕过缓存 + 无 body 上限
 - 症状：h3 请求不查/写缓存；请求体 BytesMut 与响应 collect 无上限。
@@ -301,8 +302,8 @@
 
 ## 5. 当前状态
 
-- 最新分支：feat/stats-maintenance（叠加在 test/realtime-protocols 之后）
-- 测试：网关 33、dashboard 2、shared 11 + 3 集成（含 stats 回填/分区回收）；前端 format/lint/build 通过
+- 最新分支：fix/gateway-websocket-tls（叠加在 feat/stats-maintenance 之后）
+- 测试：网关 34、dashboard 2、shared 11 + 3 集成（含 stats 回填/分区回收）；前端 format/lint/build 通过
 - 数据库：schema v3；2026-11-19 联调临时数据已清理（见文末）
 - 实时协议：Nezha gRPC（h2c/TLS/双向流）与 MCSManager WS（101/鉴权/长连接）已用真实软件验证，见 `e2e-realtime.md`
 - 面板：TOTP + JWT 登录；默认缓存 16 MiB（可配）；Vite 代理 /api → 127.0.0.1:3000
@@ -311,7 +312,7 @@
 
 1. ~~B-01 / B-02：分区续建 + 统计补算（P0）~~ ✅
 2. 面板 CRUD + 用户管理/RBAC/JWT 撤销（U-01/U-02）
-3. B-03 / B-04 / B-05 / B-06：WS TLS、h3 限制、优雅停机、日志可靠性
+3. ~~B-03~~ ✅ / B-04 / B-05 / B-06：h3 限制、优雅停机、日志可靠性
 4. U-11/U-13：h3 流式/Alt-Svc、h2 extended CONNECT
 5. U-17/U-19/U-23：健康检查、metrics、缓存持久化
 6. B-21：合并分支、清理 PR 栈

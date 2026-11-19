@@ -165,3 +165,17 @@
   重启主控后 8 周前分区被 DROP；schema version 3；测试数据已清理。
 - 文档：`database.md` 5.2 / 5.4 / 6 / 9 更新；`issue.md` 将 B-01/B-02 标为已修复，
   更新 F-03 / F-05 / F-09 / P-07 / U-21。
+
+### WebSocket 上游 TLS 与 base path（分支 `fix/gateway-websocket-tls`）
+- `gateway/src/upgrade.rs` 不再对 https 后端发明文 HTTP：
+  - `state.rs` 抽出 `upstream_tls_config()`，HTTP 客户端与 WebSocket 升级共用同一 CA 配置；
+  - `AppState` 新增 `websocket_tls`（ALPN http/1.1），wss 后端先 TLS 握手再执行 HTTP/1.1 upgrade；
+  - 上游 target 改为 backend base path + 客户端 path/query（`backend_request_target`），
+    修复忽略后端路径前缀的问题。
+- 新增单测：base path 拼接（带/不带尾斜杠、无 base path）；网关单测 33 → 34。
+- E2E（MCSManager daemon 4.19.3）：
+  - 明文 ws（`/socket.io`）：PASS；
+  - wss（测试 CA 签发的 CA:FALSE leaf，`GATEWAY_UPSTREAM_CA_FILE`）：PASS；
+  - wss + 后端 `/mc` base path：客户端 `/socket.io/...` 映射到上游 `/mc/socket.io/...`，PASS。
+- 注意：rustls 拒绝 `CA:TRUE` 自签证书作为服务端 leaf（`CaUsedAsEndEntity`），测试证书需由 CA 签发。
+- 文档：`gateway.md` 3/5.2/7/8、`e2e-realtime.md`、`issue.md`（B-03 已修复，P-03/U-14 更新）。

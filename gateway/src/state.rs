@@ -32,8 +32,11 @@ pub type UpstreamConnector = HttpsConnector<HttpConnector>;
 pub type UpstreamClient = Client<UpstreamConnector, Incoming>;
 pub type BufferedUpstreamClient = Client<UpstreamConnector, Full<Bytes>>;
 
-/// Build the upstream connector used for both HTTP/1.1 and HTTP/2 backends.
-pub fn upstream_connector(ca_file: Option<&Path>) -> anyhow::Result<UpstreamConnector> {
+/// Build the upstream TLS client configuration (webpki roots + optional PEM CA).
+///
+/// HTTP clients let hyper-rustls configure ALPN; the WebSocket upgrade path
+/// derives its own config with ALPN fixed to http/1.1.
+pub fn upstream_tls_config(ca_file: Option<&Path>) -> anyhow::Result<rustls::ClientConfig> {
     let mut roots = rustls::RootCertStore::empty();
     roots.extend(webpki_roots::TLS_SERVER_ROOTS.iter().cloned());
 
@@ -57,14 +60,19 @@ pub fn upstream_connector(ca_file: Option<&Path>) -> anyhow::Result<UpstreamConn
         .context("failed to select TLS protocol versions")?
         .with_root_certificates(roots)
         .with_no_client_auth();
+    Ok(tls)
+}
 
-    // hyper-rustls configures ALPN itself; pre-setting it panics.
-    Ok(HttpsConnectorBuilder::new()
+/// Build the upstream connector used for both HTTP/1.1 and HTTP/2 backends.
+///
+/// hyper-rustls configures ALPN itself; pre-setting it panics.
+pub fn upstream_connector(tls: rustls::ClientConfig) -> UpstreamConnector {
+    HttpsConnectorBuilder::new()
         .with_tls_config(tls)
         .https_or_http()
         .enable_http1()
         .enable_http2()
-        .build())
+        .build()
 }
 
 pub struct AppState {
@@ -76,6 +84,8 @@ pub struct AppState {
     pub grpc_client: UpstreamClient,
     /// HTTP/1.1 client with a buffered body, used by the HTTP/3 path.
     pub buffered_client: BufferedUpstreamClient,
+    /// TLS client configuration for WebSocket upgrades (ALPN http/1.1).
+    pub websocket_tls: Arc<rustls::ClientConfig>,
     pub cache: Cache,
     pub logs: mpsc::Sender<AccessEvent>,
     pub node: NodeInfo,
@@ -90,8 +100,12 @@ impl AppState {
         cache_max_size_bytes: u64,
     ) -> anyhow::Result<Self> {
         let tls_acceptor = crate::tls::acceptor(certs.clone())?;
-        let connector = upstream_connector(upstream_ca_file)?;
+        let upstream_tls = upstream_tls_config(upstream_ca_file)?;
+        let connector = upstream_connector(upstream_tls.clone());
         let client = Client::builder(hyper_util::rt::TokioExecutor::new()).build(connector.clone());
+
+        let mut websocket_tls = upstream_tls;
+        websocket_tls.alpn_protocols = vec![b"http/1.1".to_vec()];
 
         let mut grpc_builder = Client::builder(hyper_util::rt::TokioExecutor::new());
         grpc_builder.http2_only(true);
@@ -106,6 +120,7 @@ impl AppState {
             client,
             grpc_client,
             buffered_client,
+            websocket_tls: Arc::new(websocket_tls),
             cache: Cache::new(cache_max_size_bytes),
             logs,
             node,
