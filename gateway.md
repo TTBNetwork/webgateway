@@ -38,6 +38,10 @@ bind = "0.0.0.0"
 ports = [80, 443]
 # UDP；为空不启动 HTTP/3
 http3_ports = [443]
+
+[upstream_tls]
+# 额外的 PEM CA，用于 https 后端；webpki 根证书始终受信
+# ca_file = "/etc/webgateway/upstream-ca.pem"
 ````
 
 | 环境变量 | 覆盖项 |
@@ -47,6 +51,7 @@ http3_ports = [443]
 | `GATEWAY_NODE_NAME` / `GATEWAY_NODE_COUNTRY` / `GATEWAY_NODE_CITY` / `GATEWAY_NODE_ADDRESS` | 节点信息 |
 | `GATEWAY_PORTS` | 逗号分隔的 TCP 监听端口 |
 | `GATEWAY_HTTP3_PORTS` | 逗号分隔的 UDP 端口（HTTP/3） |
+| `GATEWAY_UPSTREAM_CA_FILE` | https 后端的额外 CA PEM |
 | `GATEWAY_BIND` | 监听地址 |
 
 ## 3. 路由
@@ -73,7 +78,7 @@ http3_ports = [443]
   - `match.query`：所有键都要匹配，空值表示只要求存在，请求值按 URL 解码；
   - `match.method`：忽略大小写，空数组表示不限制；
   - 所有配置条件 AND；命中后端轮询；没有任何后端命中时回退到所有后端。
-- 上游只支持 `http://`（含 gRPC h2c）；`https://` 后端跳过并告警（上游 TLS 未实现）。
+- 上游支持 `http://` 与 `https://`；https 使用 webpki 根 + 可选 `[upstream_tls].ca_file`，gRPC 同样支持 TLS。
 
 ## 4. 请求头（站点级配置）
 
@@ -208,6 +213,7 @@ http3_ports = [443]
 - HTTP/3：aioquic 客户端 GET `/h3` → 200，body `http3-upstream-ok`；访问日志 `HTTP/3.0`。
 - 统计：3 条合成日志 → 秒级 30/150 字节；旧秒归并分钟 70/700；旧分归并日 90/900。
 - 缓存：MISS count=1 → HIT count=1 → 304 → 配置更新后 MISS count=2。
+- 上游 TLS：本地 CA + `https://localhost:9443` 后端返回 `upstream-https-ok`。
 - HTTP 200、HTTPS HTTP/2 200、未知 Host 404、心跳更新、SIGTERM offline。
 - 网关单测 32 个；shared 迁移/单测、fmt、clippy 全通过。
 
@@ -219,7 +225,7 @@ http3_ports = [443]
   - HTTP/3 流式请求/响应、同连接并发多请求、0-RTT / 连接迁移调优；
   - HTTP/2 extended CONNECT / WebSocket over h2；
   - 其余特殊 RFC 按需补充。
-- 更复杂的路由（header / 正则）、上游 TLS、后端权重/主备。
+- 更复杂的路由（header / 正则）、后端权重/主备、上游客户端证书。
 
 ## 9. 运行
 

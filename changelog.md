@@ -99,3 +99,10 @@
 - 命中 `X-WebGateway-Cache: HIT` + `Age`；未命中 `MISS`；ETag/If-None-Match → 304。
 - 配置同步（NOTIFY）时清空缓存；E2E：MISS count=1 → HIT count=1 → 304 → 配置更新后 MISS count=2。
 - 网关单测 32 个；限制：无持久化、HEAD/POST 不缓存、不支持 stale-while-revalidate/Vary。
+### 上游 TLS（分支 `feat/upstream-tls`）
+- 用 hyper-rustls `HttpsConnector` 替换 `HttpConnector`；支持 `http://` 与 `https://` 后端，
+  ALPN 由 connector 自动配置（h2/http/1.1）。
+- `[upstream_tls].ca_file` / `GATEWAY_UPSTREAM_CA_FILE` 追加 PEM CA；webpki 根始终受信。
+- gRPC 与 buffered 客户端复用同一 connector，支持 gRPC over TLS / HTTPS 缓冲请求。
+- E2E：本地 CA + `https://localhost:9443` 后端 → 200 `upstream-https-ok`。
+- 网关单测 32 个；修复 hyper-rustls 预置 ALPN 导致的 panic。
