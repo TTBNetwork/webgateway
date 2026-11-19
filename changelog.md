@@ -148,3 +148,20 @@
 - `gateway.md` 更新 WebSocket 限制与验证清单；`issue.md` 将 F-19/F-20 标为已用真实软件验证，
   P-02/P-03/B-03/B-13 补充实测结论。
 - 本分支仅新增测试脚本与文档，未改生产代码。
+
+### 统计维护：分区续建 + 水位补算（分支 `feat/stats-maintenance`）
+- 迁移 0003 `crates/shared/migrations/0003_stats_maintenance.sql`：`stats_state` 单行水位表
+  （created_at/updated_at + 触发器）、`wg_drop_expired_weekly_partitions(days)`（只 DROP 整周都过期的分区，
+  < 7 天拒绝）、`wg_ensure_upcoming_weeks(3)`，schema version → **3**。
+- 统计任务从 `dashboard/backend/src/stats.rs` 移到 `crates/shared/src/stats.rs`（主控启动，便于集成测试）：
+  - 每轮按 `stats_state.last_aggregated_at` 计算窗口，且总是至少重算最近 90s（保留旧行为，延迟批次仍可重放）；
+  - 水位缺口超过 1 小时的部分直接按分钟从原始日志回填，最近 1 小时写秒表，随后秒→分→日；
+  - 水位推进与所有聚合在同一个事务内提交；首个 tick 立即执行分区续建/回收，之后每小时一次；
+  - 原始日志保留 7 天不变：整周过期分区整表 DROP，边界分区仍逐行 DELETE。
+- `verify_schema` 增加 `stats_state` 表与 `last_aggregated_at` 列检查；单元测试覆盖迁移 0003；
+  新增集成测试 `crates/shared/tests/stats_rollup.rs`（3 天缺口回填、最近 10s 进秒表、重复执行不重复计数、
+  8 周前分区 DROP、当前周 + 未来 3 周存在）。
+- 实测 beta 库：水位回拨 3 小时后，2 小时前的原始日志回填为分钟级 1 请求/1 响应、11/22 字节；
+  重启主控后 8 周前分区被 DROP；schema version 3；测试数据已清理。
+- 文档：`database.md` 5.2 / 5.4 / 6 / 9 更新；`issue.md` 将 B-01/B-02 标为已修复，
+  更新 F-03 / F-05 / F-09 / P-07 / U-21。

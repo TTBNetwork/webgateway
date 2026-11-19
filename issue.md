@@ -2,7 +2,7 @@
 
 > 生成时间：2026-11-19  
 > 截至提交：78f8222（feat/dashboard-panel；issue.md 本身未计入）  
-> 验证环境：beta PostgreSQL（schema v2）、本地 E2E、GitHub Actions  
+> 验证环境：beta PostgreSQL（schema v3）、本地 E2E、GitHub Actions  
 > 图例：✅ 已完成并验证；⚠️ 可用但有明确限制；❌ 未实现
 
 ---
@@ -15,13 +15,13 @@
 |---|---|---|---|
 | F-01 | Rust workspace | ✅ | crates/shared、dashboard/backend、gateway；edition 2024 |
 | F-02 | CI 流水线 | ✅ | fmt、clippy -D warnings、workspace 单测、前端 lint/build；CI run 44545263511 全绿 |
-| F-03 | PostgreSQL schema v2 | ✅ | 迁移 0001/0002，schema_state 版本标记，_sqlx_migrations |
+| F-03 | PostgreSQL schema v3 | ✅ | 迁移 0001/0002/0003，schema_state 版本标记，_sqlx_migrations |
 | F-04 | 数据库表结构 | ✅ | users/configs/certificates/DNS/websites/gateways、4 张访问日志表、秒/分/日统计表 |
-| F-05 | 周分区 | ✅ | access_* 四张表按周分区；迁移时预建未来两周 |
+| F-05 | 周分区 | ✅ | access_* 四张表按周分区；迁移预建，主控启动/每小时续建当前周 + 3 周，整周过期分区 DROP |
 | F-06 | NOTIFY 触发器 | ✅ | websites/certificates/configurations/dns_providers 的 INSERT/UPDATE/DELETE |
 | F-07 | 主控独占迁移 | ✅ | advisory lock；网关只等待 schema_state，不执行 DDL |
 | F-08 | 主控 /health | ✅ | 返回数据库状态与 schema 版本 |
-| F-09 | 统计 rollup | ✅ | 主控 10s 任务；90s 窗口、2s lag；秒→分→日；事务级 advisory lock |
+| F-09 | 统计 rollup | ✅ | 主控 10s 任务；水位 `stats_state.last_aggregated_at` + 90s 重算；缺口按分钟/秒回填；秒→分→日；事务级 advisory lock |
 | F-10 | 网关生命周期 | ✅ | 等待主控、注册 online、10s 心跳、SIGTERM/Ctrl-C offline |
 | F-11 | 动态端口 | ✅ | 配置端口 ∪ websites.ports，同步后自动增删监听 |
 | F-12 | NOTIFY + 水位同步 | ✅ | LISTEN websites/certificates；重连后比较 (COUNT, MAX(updated_at)) |
@@ -87,7 +87,7 @@
 | P-04 | CONNECT | 仅 h1；400/403 不写日志；已配置 host 的任意端口可隧道；无鉴权 |
 | P-05 | 缓存 | 仅 h1/h2；配置同步清空全部；无持久化/Vary/HEAD/stale-while-revalidate/single-flight/命中率；max_entry_size 在完整收集后判断 |
 | P-06 | 访问日志 | body_length 取 Content-Length；chunked 请求 0、响应 NULL；WS/CONNECT 0；headers 重复键被覆盖；writer 退出丢最后一批 |
-| P-07 | 统计 | total_ips 跨秒重复；sizes 依赖日志 Content-Length；保留期硬编码；原始日志只删行不 drop 分区 |
+| P-07 | 统计 | total_ips 跨秒重复；sizes 依赖日志 Content-Length；保留期（7 天）仍硬编码；整周过期分区已 DROP，边界分区仍逐行 DELETE |
 | P-08 | 上游 TLS | 只信 webpki + ca_file，不读系统 native roots；无 mTLS/SNI 覆盖 |
 | P-09 | 面板 | 只读；TOTP/JWT 登录，但无 RBAC 细分/刷新/撤销；JWT 存 localStorage；无服务端分页；无静态托管；无前端测试 |
 | P-10 | 负载均衡 | priority 为静态备用组；无健康检查/失败自动切换 |
@@ -126,7 +126,7 @@
 - U-18 优雅停机 / 连接 drain（当前直接 abort）
 - U-19 Prometheus /metrics、tracing 导出、告警
 - U-20 配置热加载（证书/CA 目前需重启或 NOTIFY）
-- U-21 统计保留期配置化、分区自动创建/删除
+- U-21 统计保留期配置化（分区自动创建/删除已实现）
 - U-22 访问日志重试/落盘/丢弃指标
 - U-23 缓存持久化、多级缓存、single-flight、命中率
 - U-24 OpenAPI / API 文档
@@ -153,20 +153,23 @@
 
 ### P0 — 线上故障级
 
-#### B-01 周分区只在迁移时创建
+#### B-01 周分区只在迁移时创建（已修复）
 - 症状：部署运行超过约 2 周后，新一周 access_* 分区不存在，日志 INSERT 失败。
 - 原因：迁移 0001 仅在应用时执行一次 wg_ensure_upcoming_weeks(2)；运行期无定时调用。
-- 影响：访问日志丢失；缓存/统计不影响。
-- 临时规避：定期手工执行 SELECT wg_ensure_upcoming_weeks(2);
-- 建议：主控 stats 任务周期性 ensure + drop 过期分区。
-- 位置：crates/shared/migrations/0001_initial_schema.sql、dashboard/backend/src/stats.rs
+- 修复：迁移 0003 新增 `wg_drop_expired_weekly_partitions()`；`shared::stats` 在启动后的第一个 tick
+  以及随后每小时执行 `wg_ensure_upcoming_weeks(3)` + `wg_drop_expired_weekly_partitions(7)`。
+- 验证：beta 库重启主控后 8 周前分区被整周 DROP，当前周 + 未来 3 周分区存在；
+  集成测试 `crates/shared/tests/stats_rollup.rs` 覆盖。
+- 位置：crates/shared/migrations/0003_stats_maintenance.sql、crates/shared/src/stats.rs
 
-#### B-02 统计停机超过 90s 永久丢聚合
+#### B-02 统计停机超过 90s 永久丢聚合（已修复）
 - 症状：主控/统计任务停止超过约 90s，gap 内原始日志不再进入 access_stats_*；7 天后原始日志被删，统计永久缺失。
 - 原因：秒级 rollup 只扫 now()-90s 到 now()-2s，无水位/补算。
-- 临时规避：不要长时间停主控；或手工补算。
-- 建议：记录 last_aggregated_at，按分钟/小时补算；或直接以分钟为粒度补。
-- 位置：dashboard/backend/src/stats.rs
+- 修复：迁移 0003 新增 `stats_state`；每轮从 `LEAST(水位, now-90s)` 开始，缺口超过 1 小时的部分
+  直接按分钟从原始日志回填，最近 1 小时写入秒表，然后正常归并；水位在同一事务内推进。
+- 验证：beta 库把水位回拨 3 小时后，2 小时前的日志回填为分钟级 1 请求/1 响应/11、22 字节；
+  集成测试覆盖 3 天缺口与重复执行不重复计数。上限为原始日志保留期 7 天。
+- 位置：crates/shared/migrations/0003_stats_maintenance.sql、crates/shared/src/stats.rs
 
 ### P1 — 功能错误 / 数据 / 内存风险
 
@@ -272,7 +275,7 @@
 - 数据量大时性能和体验下降。
 
 #### B-18 面板硬编码版本信息
-- schema v2 / panel 0.1.0 / API 基址写死。
+- schema v3 / panel 0.1.0 / API 基址写死。
 - 建议：从 /health 或构建注入。
 
 #### B-19 升级连接无字节统计
@@ -298,15 +301,15 @@
 
 ## 5. 当前状态
 
-- 最新分支：feat/dashboard-auth
-- 最新提交：本次认证 + 缓存配置提交；CI 以 GitHub Actions 最新 run 为准
-- 测试：网关 33、dashboard 2（TOTP/JWT）、shared 10 + 2 集成；前端 format/lint/build 通过
-- 数据库：schema v2；测试数据已清理（users/websites/logs/stats = 0；首次启动会创建 admin）
+- 最新分支：feat/stats-maintenance（叠加在 test/realtime-protocols 之后）
+- 测试：网关 33、dashboard 2、shared 11 + 3 集成（含 stats 回填/分区回收）；前端 format/lint/build 通过
+- 数据库：schema v3；2026-11-19 联调临时数据已清理（见文末）
+- 实时协议：Nezha gRPC（h2c/TLS/双向流）与 MCSManager WS（101/鉴权/长连接）已用真实软件验证，见 `e2e-realtime.md`
 - 面板：TOTP + JWT 登录；默认缓存 16 MiB（可配）；Vite 代理 /api → 127.0.0.1:3000
 
 ## 6. 建议优先级
 
-1. B-01 / B-02：分区续建 + 统计补算（P0）
+1. ~~B-01 / B-02：分区续建 + 统计补算（P0）~~ ✅
 2. 面板 CRUD + 用户管理/RBAC/JWT 撤销（U-01/U-02）
 3. B-03 / B-04 / B-05 / B-06：WS TLS、h3 限制、优雅停机、日志可靠性
 4. U-11/U-13：h3 流式/Alt-Svc、h2 extended CONNECT

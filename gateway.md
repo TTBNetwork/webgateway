@@ -210,7 +210,7 @@ http3_ports = [443]
 
 ## 7. 已验证（beta 库）
 
-- NOTIFY：SQL UPDATE 增加 Host 后 1s 内生效；DELETE 后 1s 内返回 404；迁移 0002 已由主控应用（schema version 2）。
+- NOTIFY：SQL UPDATE 增加 Host 后 1s 内生效；DELETE 后 1s 内返回 404；迁移 0002 已由主控应用（当前 schema version 3）。
 - 站点 headers：回显上游确认 `x-custom: from-gateway.test`、`x-forwarded-for: 127.0.0.1`；
   未配置的 X-Real-IP / X-Forwarded-Proto 不再出现。
 - 节点 header：`cn-shanghai-18411588dcb04048`。

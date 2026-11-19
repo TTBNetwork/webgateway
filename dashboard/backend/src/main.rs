@@ -7,7 +7,6 @@
 mod auth;
 mod config;
 mod router;
-mod stats;
 
 use shared::database::{Database, schema_version};
 use tracing::{Level, event};
@@ -23,7 +22,7 @@ async fn main() -> anyhow::Result<()> {
     database.verify_schema().await?;
     auth::ensure_default_admin(&database).await?;
 
-    let stats_task = stats::spawn(database.clone());
+    let stats_task = shared::stats::spawn(database.clone());
 
     let address = std::net::SocketAddr::from(([0, 0, 0, 0], config.server.port));
     let listener = tokio::net::TcpListener::bind(address).await?;

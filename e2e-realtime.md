@@ -3,7 +3,7 @@
 > 目标：用真实软件验证网关的 gRPC 上游（HTTP/2 双向流 + trailers）与 WebSocket 升级/长连接，
 > 不再只依赖自建的 echo 服务。
 >
-> 环境：beta PostgreSQL（schema v2）、本地网关（18080 HTTP/h2c、18443 TLS/ALPN h2）、
+> 环境：beta PostgreSQL（测试开始时 schema v2，随后升级到 v3）、本地网关（18080 HTTP/h2c、18443 TLS/ALPN h2）、
 > Nezha Dashboard v2.6.2 + nezha-agent v2.4.0、MCSManager v10.22.1（daemon 4.19.3）。
 
 ## 1. 拓扑

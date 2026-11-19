@@ -152,6 +152,7 @@ loop:
 | 表 | 用途 | 更新? | NOTIFY |
 |---|---|---|---|
 | `schema_state` | 迁移版本 / 就绪标记（单行） | 是 | - |
+| `stats_state` | 统计聚合水位（单行） | 是 | - |
 | `configurations` | 控制面配置（JSONB key/value） | 是 | `configurations_updater` |
 | `users` | 控制面用户（TOTP/JWT/角色） | 是 | - |
 | `users_client_secrets` | 用户额外绑定的 TOTP secret | 否 | - |
@@ -460,9 +461,13 @@ $fn$ LANGUAGE plpgsql;
 | `wg_ensure_weekly_partition(parent text, week_start date)` | 建单周分区（`<parent>_<IYYY>_w<IW>`），内部 advisory xact lock 防并发重复建 |
 | `wg_ensure_upcoming_weeks(ahead int DEFAULT 2)` | 为四张父表预建「上一周 ~ 未来 N 周」分区 |
 | `wg_drop_partitions_older_than(days int) RETURNS int` | 整周回收：只 DROP 整周都早于截止日的分区，`days < 90` 直接 RAISE |
+| `wg_drop_expired_weekly_partitions(days int DEFAULT 7) RETURNS int` | 按访问日志保留期回收：只 DROP 整周都早于截止日的分区，`days < 7` 直接 RAISE |
 
-- 主控在第一版迁移末尾调用 `wg_ensure_upcoming_weeks(2)`。
-- 网关后续每小时调用预建/回收（本步只建函数，不写调度）。
+- 迁移 0001 末尾调用 `wg_ensure_upcoming_weeks(2)`，迁移 0003 调用 `wg_ensure_upcoming_weeks(3)`。
+- 主控 stats 任务在启动后的第一个 tick（以及随后每小时）调用 `wg_ensure_upcoming_weeks(3)` 与
+  `wg_drop_expired_weekly_partitions(7)`：前者保证当前周 + 未来 3 周始终存在，后者整周 DROP
+  已完全过期的分区，避免逐行 DELETE 扫描死分区。`wg_drop_partitions_older_than` 保留（>= 90 天
+  安全阈值），当前代码不使用。
 - 时区统一 `UTC+0`：sqlx 连接与会话都是 UTC，数据库级默认也设为 UTC；周分区按 **UTC 周**（周一起）对齐，
   `access_stats_*` 的日期也按 UTC。实测分区边界例如 `2026-11-16 08:00+08`（= UTC 周一 00:00）。
   面板根据用户时区展示（前端换算），服务端不做本地时区换算。
@@ -488,20 +493,30 @@ $fn$;
 
 | 表 | 粒度 | 保留 | 写入 |
 |---|---|---|---|
-| `access_stats_second` | 秒 | 最近 1 小时 | 主控 stats 任务每 10s 重算最近 90s（2s lag） |
-| `access_stats_minute` | 分钟 | 最近 1 天 | 超过 1 小时的完整分钟从秒级行原子归并并删除 |
+| `access_stats_second` | 秒 | 最近 1 小时 | 每 10s 重算 `max(水位, now-90s)` ~ `now-2s` |
+| `access_stats_minute` | 分钟 | 最近 1 天 | 超过 1 小时的秒行原子归并；水位缺口里超过 1 小时的部分直接从原始日志回填 |
 | `access_stats_daily` | 天 | 长期 | 跨天后从分钟级行原子归并并删除分钟行 |
 
-- 归并任务实现在 `dashboard/backend/src/stats.rs`：每 10s 一个事务，`pg_try_advisory_xact_lock` 保证多主控只有一个执行。
-- 秒级窗口可重放（UPSERT 覆盖），延迟到达的日志会被后续窗口重新计入。
-- 原始访问日志保留 **7 天**，主控每小时清理一次；聚合表只保留聚合值。
+- 归并任务实现在 `crates/shared/src/stats.rs`（主控启动）：每 10s 一个事务，
+  `pg_try_advisory_xact_lock` 保证多主控只有一个执行。
+- **水位（`stats_state.last_aggregated_at`）**：每轮读取上次水位，窗口从
+  `LEAST(水位, now-90s)` 开始，但总是至少重算最近 90s（延迟日志批次仍可重放，UPSERT 覆盖）。
+  水位缺口超过 1 小时的部分直接按分钟从原始日志回填，最近 1 小时写入秒表，随后正常做
+  秒→分→日归并；所有语句与水位推进在**同一个事务**内提交，失败不会丢水位。
+  主控停机多久都能在启动后的第一轮补齐（上限为原始日志保留期 7 天）。
+- 原始访问日志保留 **7 天**；每小时维护会整周 DROP 完全过期的分区，并对仍跨越窗口边界的
+  分区做逐行 DELETE；聚合表只保留聚合值。
+- 实测（beta 库 2026-11-19）：把水位回拨 3 小时后，2 小时前的原始日志被回填为
+  `access_stats_minute` 的 1 请求 / 1 响应 / 11、22 字节；重启主控后 8 周前的旧分区被整周 DROP，
+  当前周 + 未来 3 周分区存在。集成测试 `crates/shared/tests/stats_rollup.rs` 覆盖同样场景。
 - `total_ips` 为每站点每秒 `COUNT(DISTINCT remote_addr)` 后再求和（跨秒会重复计数）；
   `backend_error_requests` 以 502/504 计。
 - 面板查询：最近 1 小时读秒级表，1 小时内读分钟级表，超过 1 天读日级表。
 
 ## 6. 迁移方案
 
-- 使用 **sqlx 迁移文件**（`crates/shared/migrations/0001_initial_schema.sql`、`0002_notify_deletes.sql`），
+- 使用 **sqlx 迁移文件**（`crates/shared/migrations/0001_initial_schema.sql`、`0002_notify_deletes.sql`、
+  `0003_stats_maintenance.sql`），
   编译期通过 `sqlx::migrate!("./migrations")` 嵌入二进制；部署只需可执行文件，不依赖运行目录下的 SQL 文件。
 - 选择理由：
   1. 迁移有版本记录（`_sqlx_migrations`）与 checksum，历史清晰、不会重复执行；
@@ -525,10 +540,12 @@ $fn$;
   9. `access_stats_daily` + 触发器
   10. `SELECT wg_mark_schema_version(1);`
 - 0002 迁移：`wg_notify_delete()` + 四张配置表的 `AFTER DELETE` 触发器 + `SELECT wg_mark_schema_version(2);`。
+- 0003 迁移：`stats_state` 单行水位表 + `updated_at` 触发器、`wg_drop_expired_weekly_partitions()`、
+  `wg_ensure_upcoming_weeks(3)` + `SELECT wg_mark_schema_version(3);`。
 - `verify_schema()`（主控迁移后、网关就绪后各跑一次，纯只读）：
   - `schema_state.version >= 期望版本`；
   - 必需表存在：`schema_state`、`configurations`、`users`、`users_client_secrets`、`web_log`、
-    `dns_providers`、`certificates`、`websites`、四张访问日志表、`access_stats_daily`；
+    `dns_providers`、`certificates`、`websites`、四张访问日志表、`access_stats_daily`、`stats_state`；
   - 必需扩展已安装：`SELECT extname FROM pg_extension WHERE extname IN ('uint128','btree_gin')` 返回 2 行；
   - 关键列存在：`users.role`、`certificates.signing_started_at`、`access_request_logs.remote_addr`。
 
@@ -613,16 +630,19 @@ pub async fn wait_for_master_schema(cfg: &DatabaseConfig) -> anyhow::Result<Data
   - `access_response_logs.status` 没有 RFC 范围 CHECK（上游可能返回非标准状态码）；
   - 每张表 DDL 都包含 `created_at`；可更新表都有 `updated_at` 触发器；
   - 访问日志表都是分区表、主键含分区键、无外键；
-  - `gateways`、`access_stats_second`、`access_stats_minute`、`access_stats_daily` 存在；
+  - `gateways`、`access_stats_second`、`access_stats_minute`、`access_stats_daily`、`stats_state` 存在；
+  - 迁移 0003 含水位列与分区回收函数，且以 `wg_mark_schema_version(3)` 结尾；
   - `DatabaseConfig` 默认值（网关等待 300s、锁超时 60s）与 URL 密码脱敏。
 - **集成测试（设置 `DATABASE_URL` 才跑，否则自动跳过）**：
   1. 连接服务器，创建临时数据库 `webgateway_it_<随机>`（用完 `DROP DATABASE ... WITH (FORCE)`，beta 库不受影响）；
   2. 未初始化时网关等待：`wait_timeout_secs=2` 以 `timed out` 失败；
-  3. 主控 `initialize_master`：`schema_state.version` 等于当前迁移最大版本（当前 2），
+  3. 主控 `initialize_master`：`schema_state.version` 等于当前迁移最大版本（当前 3），
      扩展 `uint128`/`btree_gin` 已安装，`gateways` 表存在，四张日志表的周分区已预建；
   4. 再次执行 `initialize_master`：幂等（sqlx 跳过已应用迁移）；
   5. 网关等待：立即成功并通过 `verify_schema`；
   6. 清理临时库。
+  7. `crates/shared/tests/stats_rollup.rs`：回拨水位 3 天 → 分钟/日级回填、最近 10s 进秒表、
+     重复执行不重复计数、8 周前分区整周 DROP、当前周 + 未来 3 周存在。
 - **人工验证**：在 `webgateway_beta_v2` 上启动主控完成建表，请求 `GET /health`，并用只读 SQL 核对表、触发器、分区。
 - **CI**：Rust job 已随 workspace 落地自动启用；GitHub Runner 访问不到内网 beta 库，集成测试因无
   `DATABASE_URL` 自动跳过，CI 只跑 fmt / clippy / 单元测试 / 构建。
