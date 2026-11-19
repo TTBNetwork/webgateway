@@ -1,0 +1,18 @@
+# Copy to config.toml (ignored by git) or provide the same values through
+# environment variables. Environment values win.
+
+[database]
+url = "postgres://user:password@host:5432/webgateway_beta_v2"
+max_connections = 10
+connect_timeout_secs = 10
+wait_timeout_secs = 300
+
+[node]
+# name = "edge-1"
+country = "CN"
+city = "Shanghai"
+# address = "203.0.113.10"
+
+[server]
+bind = "0.0.0.0"
+ports = [80, 443]

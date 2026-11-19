@@ -2,6 +2,7 @@
 members = [
     "crates/shared",
     "dashboard/backend",
+    "gateway",
 ]
 resolver = "3"
 
