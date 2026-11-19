@@ -18,6 +18,8 @@ bind = "0.0.0.0"
 ports = [80, 443]
 # HTTP/3 over QUIC; empty disables the UDP listener.
 # http3_ports = [443]
+# Global in-memory cache limit (default 16 MiB).
+# cache_max_size_bytes = 16777216
 
 [upstream_tls]
 # Extra PEM CA certificates for https backends (webpki roots are always trusted).

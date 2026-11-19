@@ -87,6 +87,7 @@ impl AppState {
         certs: Arc<RwLock<Arc<CertStore>>>,
         logs: mpsc::Sender<AccessEvent>,
         upstream_ca_file: Option<&Path>,
+        cache_max_size_bytes: u64,
     ) -> anyhow::Result<Self> {
         let tls_acceptor = crate::tls::acceptor(certs.clone())?;
         let connector = upstream_connector(upstream_ca_file)?;
@@ -105,7 +106,7 @@ impl AppState {
             client,
             grpc_client,
             buffered_client,
-            cache: Cache::new(64 * 1024 * 1024),
+            cache: Cache::new(cache_max_size_bytes),
             logs,
             node,
         })

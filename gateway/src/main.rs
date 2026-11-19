@@ -81,6 +81,7 @@ async fn run() -> anyhow::Result<()> {
         certs,
         log_sender,
         upstream_ca_file,
+        config.server.cache_max_size_bytes,
     )?);
 
     let bind: IpAddr = config

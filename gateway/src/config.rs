@@ -38,6 +38,8 @@ pub struct ServerConfig {
     pub ports: Vec<u16>,
     /// UDP ports for HTTP/3; empty disables the QUIC listener.
     pub http3_ports: Vec<u16>,
+    /// Global in-memory cache limit in bytes.
+    pub cache_max_size_bytes: u64,
 }
 
 impl Default for ServerConfig {
@@ -46,6 +48,7 @@ impl Default for ServerConfig {
             bind: "0.0.0.0".to_string(),
             ports: vec![80, 443],
             http3_ports: Vec::new(),
+            cache_max_size_bytes: 16 * 1024 * 1024,
         }
     }
 }
@@ -82,6 +85,12 @@ impl Config {
                 .split(',')
                 .filter_map(|item| item.trim().parse().ok())
                 .collect();
+        }
+        if let Ok(raw) = std::env::var("GATEWAY_CACHE_MAX_SIZE")
+            && let Ok(bytes) = raw.parse::<u64>()
+            && bytes > 0
+        {
+            config.server.cache_max_size_bytes = bytes;
         }
 
         if config.database.url.trim().is_empty() {
