@@ -381,7 +381,7 @@ FROM users;
 | `created_at` / `updated_at` | `TIMESTAMPTZ` | NOT NULL `DEFAULT now()` | |
 
 - PK `(second_at, website_id)`；索引 `(website_id, second_at DESC)`；触发器 `access_stats_second_updated_at`。
-- 只保留最近 1 小时；更早的数据归并进 `access_stats_minute` 后删除（归并任务在日志任务中实现）。
+- 只保留最近 1 小时；更早的数据由主控 stats 任务归并进 `access_stats_minute` 后删除。
 
 #### access_stats_minute（超过 1 小时）
 
@@ -488,13 +488,16 @@ $fn$;
 
 | 表 | 粒度 | 保留 | 写入 |
 |---|---|---|---|
-| `access_stats_second` | 秒 | 最近 1 小时 | 日志写入侧实时聚合 |
-| `access_stats_minute` | 分钟 | 1 小时以外的数据（保留期后续按配置） | 定时把超过 1 小时的秒级行归并进来并删除秒级行 |
-| `access_stats_daily` | 天 | 长期 | 由分钟级汇总 |
+| `access_stats_second` | 秒 | 最近 1 小时 | 主控 stats 任务每 10s 重算最近 90s（2s lag） |
+| `access_stats_minute` | 分钟 | 最近 1 天 | 超过 1 小时的完整分钟从秒级行原子归并并删除 |
+| `access_stats_daily` | 天 | 长期 | 跨天后从分钟级行原子归并并删除分钟行 |
 
-- 面板查询：最近 1 小时读秒级表，超过 1 小时读分钟级表，超过 1 天读日级表。
-- 原始访问日志仍按 `access_log_retention` 保留（v1 默认 180 天），用于明细/审计；聚合表只用于加速。
-- 归并/清理任务属于后续日志任务，本迁移只建表。
+- 归并任务实现在 `dashboard/backend/src/stats.rs`：每 10s 一个事务，`pg_try_advisory_xact_lock` 保证多主控只有一个执行。
+- 秒级窗口可重放（UPSERT 覆盖），延迟到达的日志会被后续窗口重新计入。
+- 原始访问日志保留 **7 天**，主控每小时清理一次；聚合表只保留聚合值。
+- `total_ips` 为每站点每秒 `COUNT(DISTINCT remote_addr)` 后再求和（跨秒会重复计数）；
+  `backend_error_requests` 以 502/504 计。
+- 面板查询：最近 1 小时读秒级表，1 小时内读分钟级表，超过 1 天读日级表。
 
 ## 6. 迁移方案
 

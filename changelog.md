@@ -86,3 +86,9 @@
 - E2E：aioquic 客户端 GET `/h3` → 200 `http3-upstream-ok`。
 - 限制：无流式、单连接串行、WebSocket/gRPC over h3 未做、未调 0-RTT/连接迁移。
 - 网关单测 28 个。
+### 统计聚合与保留期（分支 `feat/stats-rollup`）
+- 主控新增 stats 任务：每 10s、事务级 advisory lock；重算最近 90s（2s lag）秒级统计，UPSERT 幂等。
+- 秒 → 分（超过 1 小时）、分 → 日（跨天）用 `DELETE ... RETURNING` 原子归并并删除旧粒度。
+- 原始访问日志保留 7 天，主控每小时清理；聚合秒表保留 1 小时、分钟表保留 1 天、日表长期。
+- E2E：最近日志秒级 30/150 字节；旧秒归并分钟 70/700；旧分归并日 90/900。
+- 说明：`total_ips` 为每秒去重后求和；`backend_error_requests` 以 502/504 计。

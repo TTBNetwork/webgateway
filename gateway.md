@@ -1,7 +1,7 @@
 # WebGateway v2 网关（数据面）
 
 > 网关只读取数据库、不执行任何 DDL；主控初始化完成之前网关会等待。
-> 访问统计聚合、缓存、IP-UA 拦截尚未实现，见文末。
+> 缓存、IP-UA 拦截尚未实现，见文末。
 
 ## 1. 启动与生命周期
 
@@ -139,7 +139,7 @@ http3_ports = [443]
   `website_id`、status、响应字节（Content-Length）。
 - 网关自己生成的 404/502/504 也会记录（body_length 为固定错误文本长度）。
 - 限制：正文长度取 Content-Length，chunked/未知请求为 0、响应为 NULL；writer 关闭时直接 abort，
-  最后一批可能丢；`access_stats_*` 的秒/分/日聚合与保留期尚未实现。
+  最后一批可能丢。统计聚合由主控 stats 任务负责（见 database.md 5.4）；原始日志保留 7 天。
 
 ### 5.2 WebSocket 与 CONNECT
 
@@ -181,12 +181,12 @@ http3_ports = [443]
 - WebSocket：Python WS echo 经网关回显 `hello-websocket`（101）。
 - CONNECT：`CONNECT localhost:9500` 返回 200，`ping-through-connect` 原样回显。
 - HTTP/3：aioquic 客户端 GET `/h3` → 200，body `http3-upstream-ok`；访问日志 `HTTP/3.0`。
+- 统计：3 条合成日志 → 秒级 30/150 字节；旧秒归并分钟 70/700；旧分归并日 90/900。
 - HTTP 200、HTTPS HTTP/2 200、未知 Host 404、心跳更新、SIGTERM offline。
 - 网关单测 28 个；shared 迁移/单测、fmt、clippy 全通过。
 
 ## 8. 尚未实现（下一步）
 
-- 访问统计聚合（`access_stats_second/minute/daily`）与保留期清理。
 - 网关缓存（主控下发：大小、文件类型、ETag、TTL 等，细节待定）。
 - IP / User-Agent 拦截（优先级低）。
 - 上游传输扩展：
