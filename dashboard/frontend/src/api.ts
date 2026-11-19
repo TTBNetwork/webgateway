@@ -31,14 +31,45 @@ export interface Website {
   updated_at: string
 }
 
+export type CertificateStatus = 'pending' | 'valid' | 'expiring' | 'expired'
+
 export interface Certificate {
   id: string
   name: string | null
   hostnames: string[]
   email: string | null
   dns_provider_id: string | null
+  auto_renew: boolean
+  dns_zone: string | null
+  last_error: string | null
+  status: CertificateStatus
+  signing_started_at: string | null
   expires_at: string | null
   created_at: string
+}
+
+export interface DnsProvider {
+  id: string
+  name: string | null
+  domains: string[]
+  kind: string
+  from_env: boolean
+}
+
+export interface UploadCertificatePayload {
+  name?: string
+  hostnames?: string[]
+  fullchain: string
+  private_key: string
+  email?: string
+}
+
+export interface IssueCertificatePayload {
+  name?: string
+  hostnames: string[]
+  email?: string
+  dns_provider_id?: string
+  dns_zone?: string
 }
 
 export interface Gateway {
@@ -84,13 +115,16 @@ async function errorText(response: Response): Promise<string> {
   }
 }
 
-async function request<T>(path: string): Promise<T> {
+async function send<T>(path: string, method: string, body?: unknown): Promise<T> {
   const headers: Record<string, string> = {}
   if (session.token) headers.Authorization = 'Bearer ' + session.token
+  if (body !== undefined) headers['Content-Type'] = 'application/json'
 
   const response = await fetch('/api/' + path, {
+    method,
     headers,
     cache: 'no-store',
+    body: body === undefined ? undefined : JSON.stringify(body),
   })
 
   if (response.status === 401) {
@@ -103,6 +137,10 @@ async function request<T>(path: string): Promise<T> {
   }
 
   return (await response.json()) as T
+}
+
+async function request<T>(path: string): Promise<T> {
+  return send<T>(path, 'GET')
 }
 
 async function login(username: string, code: string): Promise<LoginResponse> {
@@ -123,6 +161,18 @@ export const api = {
   summary: () => request<Summary>('summary'),
   websites: () => request<Items<Website>>('websites').then((value) => value.items),
   certificates: () => request<Items<Certificate>>('certificates').then((value) => value.items),
+  uploadCertificate: (payload: UploadCertificatePayload) =>
+    send<{ id: string; hostnames: string[] }>('certificates', 'POST', payload),
+  issueCertificate: (payload: IssueCertificatePayload) =>
+    send<{ id: string; status: string }>('certificates/issue', 'POST', payload),
+  reissueCertificate: (id: string) =>
+    send<{ id: string; status: string }>(
+      'certificates/' + encodeURIComponent(id) + '/issue',
+      'POST',
+    ),
+  deleteCertificate: (id: string) =>
+    send<{ deleted: boolean }>('certificates/' + encodeURIComponent(id), 'DELETE'),
+  dnsProviders: () => request<Items<DnsProvider>>('dns-providers').then((value) => value.items),
   gateways: () => request<Items<Gateway>>('gateways').then((value) => value.items),
   logs: (limit: number) =>
     request<Items<AccessLog>>('logs?limit=' + String(limit)).then((value) => value.items),
