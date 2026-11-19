@@ -9,6 +9,7 @@ use anyhow::Context;
 use tracing::{Level, event};
 use url::Url;
 
+use crate::cache::CacheConfig;
 use crate::state::{
     AppState, Backend, CertStore, ClientIpMode, MatchRules, ProxyHeaders, Routing, Site,
 };
@@ -39,6 +40,8 @@ struct WebsiteConfigRow {
     headers: Option<HeaderConfigRow>,
     #[serde(default)]
     get_request_ip: ClientIpMode,
+    #[serde(default)]
+    cache: CacheConfig,
 }
 
 #[derive(Debug, serde::Deserialize, Default)]
@@ -174,6 +177,7 @@ pub async fn sync_once(
             backends,
             headers,
             config.get_request_ip,
+            config.cache,
         ));
         event!(
             Level::DEBUG,

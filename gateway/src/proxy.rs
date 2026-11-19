@@ -12,6 +12,7 @@ use hyper::body::Incoming;
 use tracing::{Level, event};
 
 use crate::access;
+use crate::cache::{CacheConfig, CachedResponse};
 use crate::state::{AppState, Backend, MatchContext};
 
 pub type ProxyBody = BoxBody<Bytes, Box<dyn Error + Send + Sync>>;
@@ -97,6 +98,28 @@ pub async fn handle(
         .resolve(peer, proxy_source, request.headers());
     request_log.remote_addr = client_ip.to_string();
     request_log.website_id = Some(site.id.clone());
+
+    let cache_lookup_key = cache_key_for(&raw_host, request.uri());
+    let request_cacheable = method_label == "GET"
+        && site.cache.enabled
+        && site.cache.ttl_secs > 0
+        && !request.headers().contains_key(header::AUTHORIZATION)
+        && !request.headers().contains_key(header::COOKIE)
+        && request
+            .headers()
+            .get(header::CACHE_CONTROL)
+            .and_then(|value| value.to_str().ok())
+            .is_none_or(|value| !value.to_ascii_lowercase().contains("no-cache"));
+
+    if request_cacheable && let Some(cached) = state.cache.get(&cache_lookup_key) {
+        return cache_hit_response(
+            &state,
+            &request_log,
+            cached,
+            request.headers(),
+            request_version,
+        );
+    }
 
     let match_context = crate::state::MatchContext {
         path: &path,
@@ -231,25 +254,79 @@ pub async fn handle(
 
     let status = upstream_response.status();
     let version = upstream_response.version();
-    let response_length = upstream_response
-        .headers()
+    let mut response_headers = upstream_response.headers().clone();
+    remove_hop_by_hop(&mut response_headers);
+    response_headers.insert(header::SERVER, HeaderValue::from_static("WebGateway"));
+    if let Ok(value) = HeaderValue::from_str(&state.node.header_label()) {
+        response_headers.insert(HeaderName::from_static("x-webgateway-node"), value);
+    }
+
+    let cacheable = request_cacheable
+        && status == StatusCode::OK
+        && response_cacheable(&response_headers, &site.cache);
+
+    if cacheable {
+        let bytes = match upstream_response.into_body().collect().await {
+            Ok(body) => body.to_bytes(),
+            Err(error) => {
+                event!(Level::WARN, %error, "failed to read the cacheable upstream body");
+                log_event(
+                    &state,
+                    &request_log,
+                    StatusCode::BAD_GATEWAY,
+                    &HeaderMap::new(),
+                    Some(11),
+                    request_version,
+                );
+                return text_response(StatusCode::BAD_GATEWAY, "Bad Gateway", &state);
+            }
+        };
+
+        if bytes.len() as u64 <= site.cache.max_entry_size {
+            let etag = response_headers
+                .get(header::ETAG)
+                .and_then(|value| value.to_str().ok())
+                .map(str::to_string)
+                .unwrap_or_else(|| weak_etag(&bytes));
+            if let Ok(value) = HeaderValue::from_str(&etag) {
+                response_headers.insert(header::ETAG, value);
+            }
+
+            state.cache.insert(
+                cache_lookup_key,
+                CachedResponse {
+                    status,
+                    headers: response_headers.clone(),
+                    body: bytes.clone(),
+                    etag: Some(etag),
+                },
+                cache_ttl(&site.cache, &response_headers),
+            );
+        }
+
+        response_headers.insert(cache_header(), HeaderValue::from_static("MISS"));
+        log_event(
+            &state,
+            &request_log,
+            status,
+            &response_headers,
+            Some(bytes.len() as u64),
+            version,
+        );
+        return full_response(status, version, response_headers, bytes);
+    }
+
+    let response_length = response_headers
         .get(header::CONTENT_LENGTH)
-        .map(|_| crate::access::content_length(upstream_response.headers()));
+        .map(|_| crate::access::content_length(&response_headers));
     log_event(
         &state,
         &request_log,
         status,
-        upstream_response.headers(),
+        &response_headers,
         response_length,
         version,
     );
-
-    let mut headers = upstream_response.headers().clone();
-    remove_hop_by_hop(&mut headers);
-    headers.insert(header::SERVER, HeaderValue::from_static("WebGateway"));
-    if let Ok(value) = HeaderValue::from_str(&state.node.header_label()) {
-        headers.insert(HeaderName::from_static("x-webgateway-node"), value);
-    }
 
     let body = upstream_response
         .into_body()
@@ -259,7 +336,7 @@ pub async fn handle(
     let mut response = Response::new(body);
     *response.status_mut() = status;
     *response.version_mut() = version;
-    *response.headers_mut() = headers;
+    *response.headers_mut() = response_headers;
     response
 }
 
@@ -479,6 +556,138 @@ fn buffered_error(
     if let Ok(value) = HeaderValue::from_str(&state.node.header_label()) {
         headers.insert(HeaderName::from_static("x-webgateway-node"), value);
     }
+    response
+}
+
+fn cache_key_for(host: &str, uri: &Uri) -> String {
+    format!(
+        "{}|{}",
+        host.to_ascii_lowercase(),
+        uri.path_and_query()
+            .map(|value| value.as_str())
+            .unwrap_or("/")
+    )
+}
+
+fn cache_header() -> HeaderName {
+    HeaderName::from_static("x-webgateway-cache")
+}
+
+fn cache_hit_response(
+    state: &AppState,
+    request: &crate::access::RequestLog,
+    mut cached: CachedResponse,
+    request_headers: &HeaderMap,
+    version: Version,
+) -> Response<ProxyBody> {
+    let not_modified = not_modified(request_headers, cached.etag.as_deref());
+    let status = if not_modified {
+        StatusCode::NOT_MODIFIED
+    } else {
+        cached.status
+    };
+
+    if not_modified {
+        cached.headers.remove(header::CONTENT_LENGTH);
+        cached.headers.remove(header::CONTENT_TYPE);
+        cached.body = Bytes::new();
+    }
+
+    cached
+        .headers
+        .insert(cache_header(), HeaderValue::from_static("HIT"));
+    log_event(
+        state,
+        request,
+        status,
+        &cached.headers,
+        Some(cached.body.len() as u64),
+        version,
+    );
+    full_response(status, version, cached.headers, cached.body)
+}
+
+fn not_modified(headers: &HeaderMap, etag: Option<&str>) -> bool {
+    let Some(etag) = etag else {
+        return false;
+    };
+    let etag = etag.trim_start_matches("W/");
+
+    headers
+        .get(header::IF_NONE_MATCH)
+        .and_then(|value| value.to_str().ok())
+        .is_some_and(|value| {
+            value
+                .split(',')
+                .any(|candidate| candidate.trim().trim_start_matches("W/") == etag)
+        })
+}
+
+fn response_cacheable(headers: &HeaderMap, config: &CacheConfig) -> bool {
+    if headers.contains_key(header::SET_COOKIE) || headers.contains_key(header::VARY) {
+        return false;
+    }
+
+    if let Some(value) = headers
+        .get(header::CACHE_CONTROL)
+        .and_then(|value| value.to_str().ok())
+    {
+        let value = value.to_ascii_lowercase();
+        if value.contains("no-store") || value.contains("private") || value.contains("no-cache") {
+            return false;
+        }
+    }
+
+    config.allows_content_type(
+        headers
+            .get(header::CONTENT_TYPE)
+            .and_then(|value| value.to_str().ok()),
+    )
+}
+
+fn cache_ttl(config: &CacheConfig, headers: &HeaderMap) -> Duration {
+    let mut ttl = config.ttl_secs;
+    if let Some(value) = headers
+        .get(header::CACHE_CONTROL)
+        .and_then(|value| value.to_str().ok())
+    {
+        for directive in value.split(',') {
+            let directive = directive.trim();
+            let seconds = directive
+                .strip_prefix("s-maxage=")
+                .or_else(|| directive.strip_prefix("max-age="));
+            if let Some(seconds) = seconds
+                && let Ok(seconds) = seconds.parse::<u64>()
+            {
+                ttl = ttl.min(seconds);
+            }
+        }
+    }
+    Duration::from_secs(ttl)
+}
+
+fn weak_etag(body: &[u8]) -> String {
+    use std::hash::{Hash, Hasher};
+
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    body.hash(&mut hasher);
+    format!("W/\"{:016x}\"", hasher.finish())
+}
+
+fn full_response(
+    status: StatusCode,
+    version: Version,
+    headers: HeaderMap,
+    body: Bytes,
+) -> Response<ProxyBody> {
+    let body = Full::new(body)
+        .map_err(|never: Infallible| -> BoxError { match never {} })
+        .boxed();
+
+    let mut response = Response::new(body);
+    *response.status_mut() = status;
+    *response.version_mut() = version;
+    *response.headers_mut() = headers;
     response
 }
 

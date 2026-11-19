@@ -21,6 +21,7 @@ use tokio_rustls::TlsAcceptor;
 use url::Url;
 
 use crate::access::AccessEvent;
+use crate::cache::{Cache, CacheConfig};
 use crate::node::NodeInfo;
 
 pub type UpstreamClient = Client<HttpConnector, Incoming>;
@@ -34,6 +35,7 @@ pub struct AppState {
     pub grpc_client: UpstreamClient,
     /// HTTP/1.1 client with a buffered body, used by the HTTP/3 path.
     pub buffered_client: Client<HttpConnector, Full<Bytes>>,
+    pub cache: Cache,
     pub logs: mpsc::Sender<AccessEvent>,
     pub node: NodeInfo,
 }
@@ -61,6 +63,7 @@ impl AppState {
             client,
             grpc_client,
             buffered_client,
+            cache: Cache::new(64 * 1024 * 1024),
             logs,
             node,
         })
@@ -74,6 +77,7 @@ impl AppState {
     }
 
     pub fn apply_config(&self, routing: Arc<Routing>, certs: Arc<CertStore>) {
+        self.cache.clear();
         *self.routing.write().expect("routing lock poisoned") = routing;
         *self.certs.write().expect("certificate store lock poisoned") = certs;
     }
@@ -348,10 +352,12 @@ pub struct Site {
     pub backends: Vec<Backend>,
     pub headers: ProxyHeaders,
     pub client_ip: ClientIpMode,
+    pub cache: CacheConfig,
     selector: AtomicUsize,
 }
 
 impl Site {
+    #[allow(clippy::too_many_arguments)]
     pub fn new(
         id: String,
         name: Option<String>,
@@ -360,6 +366,7 @@ impl Site {
         backends: Vec<Backend>,
         headers: ProxyHeaders,
         client_ip: ClientIpMode,
+        cache: CacheConfig,
     ) -> Self {
         Self {
             id,
@@ -369,6 +376,7 @@ impl Site {
             backends,
             headers,
             client_ip,
+            cache,
             selector: AtomicUsize::new(0),
         }
     }
@@ -578,6 +586,7 @@ mod tests {
             backends,
             ProxyHeaders::defaults(),
             ClientIpMode::Raw,
+            CacheConfig::default(),
         ))
     }
 

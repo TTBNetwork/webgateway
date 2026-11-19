@@ -4,6 +4,7 @@
 //! itself online, then serves HTTP/HTTPS traffic from the websites it loads.
 
 mod access;
+mod cache;
 mod config;
 mod http3;
 mod listeners;
