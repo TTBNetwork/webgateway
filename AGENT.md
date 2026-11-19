@@ -12,6 +12,8 @@
 4. 识别用户 IP / User-Agent，命中拦截规则时直接拒绝，不再请求源站（优先级低）
 5. 网关上线/下线时在 PostgreSQL 的 `gateways` 表标记 online/offline，并定期更新心跳，供主控判断节点是否在线（优先级中等）
 6. 网关后端协议支持：WebSocket / gRPC / HTTP/3 / 一些特殊 RFC（分阶段实现）
+7. 支持 PROXY protocol v1/v2（站点级启用）与 CDN 来源的客户端 IP（X-Forwarded-For / X-Real-IP）；
+   按 path / User-Agent / query params 做路由分配；上游支持 HTTP/1.1 与 gRPC 传输
 
 ## 3. 技术要点
 1. 尽量参考 v1 ui 设计和代码风格（可以不尽量偏向我的代码风格）

@@ -8,6 +8,7 @@ mod listeners;
 mod node;
 mod notify;
 mod proxy;
+mod proxy_protocol;
 mod state;
 mod sync;
 mod tls;

@@ -54,3 +54,9 @@
 - schema version 2（beta 库已由主控应用）；shared 迁移测试与网关单测更新。
 - E2E：NOTIFY 增/删 1s 内生效、站点 headers 回显验证、节点哈希；测试数据已清理。
 - WebSocket / gRPC / HTTP3 / 特殊 RFC 列为下一阶段（gateway.md 有拆分说明）。
+### 网关客户端 IP / PROXY protocol（分支 `feat/gateway-proxy`）
+- 新增 PROXY protocol v1/v2 解析（在 TLS/HTTP 之前消费）；站点级 `get_request_ip`：
+  `raw` / `proxyProtocol` / `xForwardedFor` / `xRealIP`。
+- 解析出的客户端 IP 用于 `$remote_addr` 与上游 X-Real-IP / X-Forwarded-For；CDN 场景可用 XFF/X-Real-IP 模式。
+- 实测：无头 / v1 / v2 连接分别得到 127.0.0.1 / 198.51.100.7 / 203.0.113.9。
+- 网关单测 19 个；文档更新。gRPC（h2/h2c + trailers）上游传输、path/UA/params 路由列为下一阶段。

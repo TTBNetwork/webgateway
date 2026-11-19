@@ -79,9 +79,31 @@ ports = [80, 443]
 - 逐跳头（Connection、Transfer-Encoding、Upgrade 等）始终剔除；Host 默认保留原值，可在 `set` 中覆盖。
 - 非法头名/值会告警或跳过；配置在同步时解析。
 
+### 4.1 客户端 IP 与 PROXY protocol
+
+- 连接进入时先探测/消费 PROXY header（v1 文本 `PROXY TCP4 ...`、v2 二进制签名），再到 TLS/HTTP；
+  每站点通过 `websites.config.get_request_ip` 决定是否信任：
+
+  ```json
+  { "get_request_ip": { "type": "proxyProtocol" } }
+  ```
+
+  支持的模式（与 v1 命名兼容）：
+
+  | type | 说明 |
+  |---|---|
+  | `raw`（默认） | 使用 TCP 对端地址 |
+  | `proxyProtocol` | 使用 PROXY v1/v2 的源地址；没有头则回退对端 |
+  | `xForwardedFor` | `data` 为索引（0 = 最左/原始客户端，越界取最后一个） |
+  | `xRealIP` | 使用 `X-Real-IP` 头 |
+
+- CDN 场景：CDN 用 PROXY protocol 连接时站点启用 `proxyProtocol`；只加头时用 `xForwardedFor` / `xRealIP`。
+- 未启用 `proxyProtocol` 的站点即使连接带了 PROXY header 也会被消费，但仍使用对端地址（不信任）。
+- 实测：无头 → 127.0.0.1；v1 头 → 198.51.100.7；v2 头 → 203.0.113.9，并写入上游头。
+
 ## 5. 代理与响应
 
-- 上游固定 HTTP/1.1，60s 超时；超时 504、上游错误 502、未匹配站点 404。
+- 上游传输：当前固定 HTTP/1.1（gRPC/h2 在下一阶段）；60s 超时；超时 504、上游错误 502、未匹配站点 404。
 - 响应头：`Server: WebGateway`、`X-WebGateway-Node`。
 - `X-WebGateway-Node` 格式：`<location>-<16 hex>`，例如 `cn-shanghai-18411588dcb04048`。
   `location` = country-city 的 ASCII 小写形式；hash = FNV-1a64(`location + machine_id`)。
@@ -98,20 +120,37 @@ ports = [80, 443]
 - 站点 headers：回显上游确认 `x-custom: from-gateway.test`、`x-forwarded-for: 127.0.0.1`；
   未配置的 X-Real-IP / X-Forwarded-Proto 不再出现。
 - 节点 header：`cn-shanghai-18411588dcb04048`。
+- PROXY protocol：无头 / v1 / v2 三种连接分别解析出 127.0.0.1 / 198.51.100.7 / 203.0.113.9，并写入上游头。
 - HTTP 200、HTTPS HTTP/2 200、未知 Host 404、心跳更新、SIGTERM offline。
-- 网关单测 10 个；shared 迁移/单测、fmt、clippy 全通过。
+- 网关单测 19 个；shared 迁移/单测、fmt、clippy 全通过。
 
 ## 8. 尚未实现（下一步）
 
 - 访问日志写入（四张周分区表）、秒/分/日聚合与保留期。
 - 网关缓存（主控下发：大小、文件类型、ETag、TTL 等，细节待定）。
 - IP / User-Agent 拦截（优先级低）。
-- 后端协议扩展：
-  - **WebSocket**：服务端 `serve_connection_with_upgrades` + 原始上游握手 + upgrade 双向桥接；
+- 上游传输扩展：
+  - 当前：HTTP/1.1（已实现）；
   - **gRPC**：HTTP/2（h2/h2c）端到端 + trailers 透传，需要独立 h2 客户端/连接管理；
+  - **WebSocket**：服务端 `serve_connection_with_upgrades` + 原始上游握手 + upgrade 双向桥接；
   - **HTTP/3**：QUIC（quinn）UDP 监听与 0-RTT、连接迁移；
-  - **特殊 RFC**：PROXY protocol、CONNECT、以及按需的协议分发层。
-- 上游 TLS、站点 `config.get_request_ip`、后端权重/主备。
+  - **特殊 RFC**：CONNECT 等，按需协议分发层。
+- 路由分配：当前按 Host + `match_path`；下一步支持 path/UA/query/method 规则，例如：
+
+  ```json
+  {
+    "url": "http://api-backend:9000",
+    "match": {
+      "path": "/api/*",
+      "user_agent": "*Mobile*",
+      "query": { "version": "v2" },
+      "method": ["GET", "POST"]
+    }
+  }
+  ```
+
+  规则全部命中才选择该后端；多个命中按轮询；无命中回退全部后端。
+- 上游 TLS、后端权重/主备。
 
 ## 9. 运行
 

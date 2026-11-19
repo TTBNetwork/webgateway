@@ -32,6 +32,7 @@ pub async fn handle(
     request: Request<Incoming>,
     peer: SocketAddr,
     scheme: &'static str,
+    proxy_source: Option<SocketAddr>,
 ) -> Response<ProxyBody> {
     let raw_host = request_host(&request);
     let path = request.uri().path().to_string();
@@ -44,6 +45,10 @@ pub async fn handle(
     else {
         return text_response(StatusCode::NOT_FOUND, "Not Found", &state);
     };
+
+    let client_ip = site
+        .client_ip
+        .resolve(peer, proxy_source, request.headers());
 
     let Some(backend) = site.next_backend(&path) else {
         return text_response(StatusCode::BAD_GATEWAY, "Bad Gateway", &state);
@@ -66,7 +71,8 @@ pub async fn handle(
     {
         headers.insert(header::HOST, value);
     }
-    site.headers.apply(&mut headers, &raw_host, scheme, peer);
+    site.headers
+        .apply(&mut headers, &raw_host, scheme, client_ip);
 
     let method = request.method().clone();
     let body = request.into_body();

@@ -2,7 +2,7 @@
 
 use std::{
     collections::HashMap,
-    net::SocketAddr,
+    net::{IpAddr, SocketAddr},
     sync::{
         Arc, RwLock,
         atomic::{AtomicUsize, Ordering},
@@ -122,8 +122,8 @@ impl ProxyHeaders {
     }
 
     /// Apply the configured set/remove rules to outgoing upstream headers.
-    pub fn apply(&self, headers: &mut HeaderMap, host: &str, scheme: &str, peer: SocketAddr) {
-        let remote_addr = peer.ip().to_string();
+    pub fn apply(&self, headers: &mut HeaderMap, host: &str, scheme: &str, client_ip: IpAddr) {
+        let remote_addr = client_ip.to_string();
 
         for rule in &self.set {
             let value = rule
@@ -148,6 +148,59 @@ impl ProxyHeaders {
     }
 }
 
+/// How the real client IP is derived for a website.
+#[derive(Debug, Clone, Copy, Default, serde::Deserialize)]
+#[serde(tag = "type", content = "data")]
+pub enum ClientIpMode {
+    #[serde(rename = "raw", alias = "Raw")]
+    #[default]
+    Raw,
+    #[serde(rename = "proxyProtocol", alias = "proxy_protocol")]
+    ProxyProtocol,
+    #[serde(rename = "xForwardedFor", alias = "x-forwarded-for")]
+    XForwardedFor(Option<usize>),
+    #[serde(rename = "xRealIP", alias = "xRealIp", alias = "x-real-ip")]
+    XRealIP,
+}
+
+impl ClientIpMode {
+    pub fn resolve(
+        &self,
+        peer: SocketAddr,
+        proxy_source: Option<SocketAddr>,
+        headers: &HeaderMap,
+    ) -> IpAddr {
+        match self {
+            Self::Raw => peer.ip(),
+            Self::ProxyProtocol => proxy_source
+                .map(|source| source.ip())
+                .unwrap_or_else(|| peer.ip()),
+            Self::XForwardedFor(index) => {
+                forwarded_for(headers, *index).unwrap_or_else(|| peer.ip())
+            }
+            Self::XRealIP => header_ip(headers, "x-real-ip").unwrap_or_else(|| peer.ip()),
+        }
+    }
+}
+
+fn forwarded_for(headers: &HeaderMap, index: Option<usize>) -> Option<IpAddr> {
+    let value = headers.get("x-forwarded-for")?.to_str().ok()?;
+    let hops: Vec<&str> = value
+        .split(',')
+        .map(str::trim)
+        .filter(|hop| !hop.is_empty())
+        .collect();
+
+    let index = index.unwrap_or(0);
+    hops.get(index)
+        .or_else(|| hops.last())
+        .and_then(|hop| hop.parse().ok())
+}
+
+fn header_ip(headers: &HeaderMap, name: &str) -> Option<IpAddr> {
+    headers.get(name)?.to_str().ok()?.trim().parse().ok()
+}
+
 fn parse_header_name(name: &str) -> Option<HeaderName> {
     match HeaderName::from_bytes(name.to_ascii_lowercase().as_bytes()) {
         Ok(name) => Some(name),
@@ -166,6 +219,7 @@ pub struct Site {
     pub ports: Vec<u16>,
     pub backends: Vec<Backend>,
     pub headers: ProxyHeaders,
+    pub client_ip: ClientIpMode,
     selector: AtomicUsize,
 }
 
@@ -177,6 +231,7 @@ impl Site {
         ports: Vec<u16>,
         backends: Vec<Backend>,
         headers: ProxyHeaders,
+        client_ip: ClientIpMode,
     ) -> Self {
         Self {
             id,
@@ -185,6 +240,7 @@ impl Site {
             ports,
             backends,
             headers,
+            client_ip,
             selector: AtomicUsize::new(0),
         }
     }
@@ -380,6 +436,7 @@ mod tests {
             vec![80],
             backends,
             ProxyHeaders::defaults(),
+            ClientIpMode::Raw,
         ))
     }
 
@@ -447,7 +504,7 @@ mod tests {
     fn default_headers_are_rendered() {
         let peer: SocketAddr = "203.0.113.9:1234".parse().unwrap();
         let mut headers = HeaderMap::new();
-        ProxyHeaders::defaults().apply(&mut headers, "example.com", "https", peer);
+        ProxyHeaders::defaults().apply(&mut headers, "example.com", "https", peer.ip());
 
         assert_eq!(headers["x-real-ip"], "203.0.113.9");
         assert_eq!(headers["x-forwarded-for"], "203.0.113.9");
@@ -465,10 +522,39 @@ mod tests {
         let mut headers = HeaderMap::new();
         headers.insert("x-forwarded-for", HeaderValue::from_static("1.2.3.4"));
 
-        headers_config.apply(&mut headers, "example.com", "http", peer);
+        headers_config.apply(&mut headers, "example.com", "http", peer.ip());
 
         assert_eq!(headers["x-node"], "node=example.com");
         assert!(headers.get("x-forwarded-for").is_none());
         assert!(headers.get("x-forwarded-proto").is_none());
+    }
+
+    #[test]
+    fn resolves_client_ip_modes() {
+        let peer: SocketAddr = "10.0.0.1:1234".parse().unwrap();
+        let proxied: SocketAddr = "192.0.2.7:5555".parse().unwrap();
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            "x-forwarded-for",
+            HeaderValue::from_static("203.0.113.5, 10.0.0.1"),
+        );
+        headers.insert("x-real-ip", HeaderValue::from_static("198.51.100.9"));
+
+        assert_eq!(
+            ClientIpMode::Raw.resolve(peer, Some(proxied), &headers),
+            "10.0.0.1".parse::<IpAddr>().unwrap()
+        );
+        assert_eq!(
+            ClientIpMode::ProxyProtocol.resolve(peer, Some(proxied), &headers),
+            "192.0.2.7".parse::<IpAddr>().unwrap()
+        );
+        assert_eq!(
+            ClientIpMode::XForwardedFor(Some(0)).resolve(peer, None, &headers),
+            "203.0.113.5".parse::<IpAddr>().unwrap()
+        );
+        assert_eq!(
+            ClientIpMode::XRealIP.resolve(peer, None, &headers),
+            "198.51.100.9".parse::<IpAddr>().unwrap()
+        );
     }
 }

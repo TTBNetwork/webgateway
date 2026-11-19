@@ -9,7 +9,7 @@ use anyhow::Context;
 use tracing::{Level, event};
 use url::Url;
 
-use crate::state::{AppState, Backend, CertStore, ProxyHeaders, Routing, Site};
+use crate::state::{AppState, Backend, CertStore, ClientIpMode, ProxyHeaders, Routing, Site};
 use shared::database::Database;
 
 #[derive(Debug, sqlx::FromRow)]
@@ -33,6 +33,8 @@ struct BackendRow {
 struct WebsiteConfigRow {
     #[serde(default)]
     headers: Option<HeaderConfigRow>,
+    #[serde(default)]
+    get_request_ip: ClientIpMode,
 }
 
 #[derive(Debug, serde::Deserialize, Default)]
@@ -160,7 +162,13 @@ pub async fn sync_once(
         database_ports.extend(ports.iter().copied());
 
         let site = Arc::new(Site::new(
-            row.id, row.name, row.hosts, ports, backends, headers,
+            row.id,
+            row.name,
+            row.hosts,
+            ports,
+            backends,
+            headers,
+            config.get_request_ip,
         ));
         event!(
             Level::DEBUG,

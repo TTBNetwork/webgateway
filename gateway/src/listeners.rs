@@ -18,6 +18,7 @@ use tokio::{
 use tracing::{Level, event};
 
 use crate::proxy;
+use crate::proxy_protocol;
 use crate::state::AppState;
 
 pub struct Listeners {
@@ -108,9 +109,16 @@ async fn serve_port(bind: IpAddr, port: u16, state: Arc<AppState>) -> anyhow::Re
 
 async fn handle_connection(
     state: Arc<AppState>,
-    stream: TcpStream,
+    mut stream: TcpStream,
     peer: SocketAddr,
 ) -> anyhow::Result<()> {
+    let proxy = proxy_protocol::read_header(&mut stream)
+        .await
+        .context("failed to read the PROXY protocol header")?;
+    if proxy.present {
+        event!(Level::DEBUG, source = ?proxy.source, "PROXY protocol header received");
+    }
+
     let mut first_byte = [0u8; 1];
     let read = stream.peek(&mut first_byte).await?;
     if read == 0 {
@@ -123,9 +131,9 @@ async fn handle_connection(
             .accept(stream)
             .await
             .context("TLS handshake failed")?;
-        serve(state, stream, peer, "https").await
+        serve(state, stream, peer, "https", proxy.source).await
     } else {
-        serve(state, stream, peer, "http").await
+        serve(state, stream, peer, "http", proxy.source).await
     }
 }
 
@@ -134,6 +142,7 @@ async fn serve<S>(
     io: S,
     peer: SocketAddr,
     scheme: &'static str,
+    proxy_source: Option<SocketAddr>,
 ) -> anyhow::Result<()>
 where
     S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send + 'static,
@@ -141,7 +150,7 @@ where
     let service = service_fn(move |request| {
         let state = state.clone();
         async move {
-            let response = proxy::handle(state, request, peer, scheme).await;
+            let response = proxy::handle(state, request, peer, scheme, proxy_source).await;
             Ok::<_, Infallible>(response)
         }
     });
