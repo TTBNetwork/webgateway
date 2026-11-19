@@ -36,6 +36,14 @@ pub async fn handle(
 ) -> Response<ProxyBody> {
     let raw_host = request_host(&request);
     let path = request.uri().path().to_string();
+    let method_label = request.method().as_str().to_string();
+    let query = request.uri().query().map(str::to_string);
+    let user_agent = request
+        .headers()
+        .get(header::USER_AGENT)
+        .and_then(|value| value.to_str().ok())
+        .map(str::to_string);
+    let grpc = is_grpc(request.headers());
 
     let Some(site) = state
         .routing
@@ -50,7 +58,13 @@ pub async fn handle(
         .client_ip
         .resolve(peer, proxy_source, request.headers());
 
-    let Some(backend) = site.next_backend(&path) else {
+    let match_context = crate::state::MatchContext {
+        path: &path,
+        query: query.as_deref(),
+        method: &method_label,
+        user_agent: user_agent.as_deref(),
+    };
+    let Some(backend) = site.next_backend(&match_context) else {
         return text_response(StatusCode::BAD_GATEWAY, "Bad Gateway", &state);
     };
 
@@ -64,6 +78,10 @@ pub async fn handle(
 
     let mut headers = request.headers().clone();
     remove_hop_by_hop(&mut headers);
+    if grpc {
+        // gRPC requires TE: trailers, but TE is on the hop-by-hop list.
+        headers.insert(header::TE, HeaderValue::from_static("trailers"));
+    }
 
     // Keep the original Host unless the site proxy headers override it.
     if !raw_host.is_empty()
@@ -80,7 +98,11 @@ pub async fn handle(
     let mut upstream_request = match Request::builder()
         .method(method)
         .uri(upstream_uri)
-        .version(Version::HTTP_11)
+        .version(if grpc {
+            Version::HTTP_2
+        } else {
+            Version::HTTP_11
+        })
         .body(body)
     {
         Ok(request) => request,
@@ -91,20 +113,31 @@ pub async fn handle(
     };
     *upstream_request.headers_mut() = headers;
 
-    let upstream_response = match tokio::time::timeout(
-        Duration::from_secs(60),
-        state.client.request(upstream_request),
-    )
-    .await
-    {
-        Ok(Ok(response)) => response,
-        Ok(Err(error)) => {
-            event!(Level::WARN, %error, "upstream request failed");
-            return text_response(StatusCode::BAD_GATEWAY, "Bad Gateway", &state);
+    let upstream_response = if grpc {
+        // gRPC streams can be long-lived; do not apply the HTTP timeout here.
+        match state.grpc_client.request(upstream_request).await {
+            Ok(response) => response,
+            Err(error) => {
+                event!(Level::WARN, %error, "gRPC upstream request failed");
+                return text_response(StatusCode::BAD_GATEWAY, "Bad Gateway", &state);
+            }
         }
-        Err(_) => {
-            event!(Level::WARN, "upstream request timed out");
-            return text_response(StatusCode::GATEWAY_TIMEOUT, "Gateway Timeout", &state);
+    } else {
+        match tokio::time::timeout(
+            Duration::from_secs(60),
+            state.client.request(upstream_request),
+        )
+        .await
+        {
+            Ok(Ok(response)) => response,
+            Ok(Err(error)) => {
+                event!(Level::WARN, %error, "upstream request failed");
+                return text_response(StatusCode::BAD_GATEWAY, "Bad Gateway", &state);
+            }
+            Err(_) => {
+                event!(Level::WARN, "upstream request timed out");
+                return text_response(StatusCode::GATEWAY_TIMEOUT, "Gateway Timeout", &state);
+            }
         }
     };
 
@@ -128,6 +161,13 @@ pub async fn handle(
     *response.version_mut() = version;
     *response.headers_mut() = headers;
     response
+}
+
+fn is_grpc(headers: &HeaderMap) -> bool {
+    headers
+        .get(header::CONTENT_TYPE)
+        .and_then(|value| value.to_str().ok())
+        .is_some_and(|value| value.starts_with("application/grpc"))
 }
 
 pub(crate) fn request_host(request: &Request<Incoming>) -> String {
@@ -217,7 +257,24 @@ mod tests {
         Backend {
             url: url::Url::parse(url).unwrap(),
             match_path: None,
+            rules: crate::state::MatchRules::default(),
         }
+    }
+
+    #[test]
+    fn detects_grpc_requests_by_content_type() {
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            header::CONTENT_TYPE,
+            HeaderValue::from_static("application/grpc+proto"),
+        );
+        assert!(is_grpc(&headers));
+
+        headers.insert(
+            header::CONTENT_TYPE,
+            HeaderValue::from_static("application/json"),
+        );
+        assert!(!is_grpc(&headers));
     }
 
     #[test]

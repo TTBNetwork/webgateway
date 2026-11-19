@@ -26,6 +26,8 @@ pub struct AppState {
     pub certs: Arc<RwLock<Arc<CertStore>>>,
     pub tls_acceptor: TlsAcceptor,
     pub client: UpstreamClient,
+    /// HTTP/2-only client used for gRPC backends (h2c).
+    pub grpc_client: UpstreamClient,
     pub node: NodeInfo,
 }
 
@@ -35,11 +37,16 @@ impl AppState {
         let client =
             Client::builder(hyper_util::rt::TokioExecutor::new()).build(HttpConnector::new());
 
+        let mut grpc_builder = Client::builder(hyper_util::rt::TokioExecutor::new());
+        grpc_builder.http2_only(true);
+        let grpc_client = grpc_builder.build(HttpConnector::new());
+
         Ok(Self {
             routing: RwLock::new(Arc::new(Routing::default())),
             certs,
             tls_acceptor,
             client,
+            grpc_client,
             node,
         })
     }
@@ -60,7 +67,113 @@ impl AppState {
 #[derive(Debug, Clone)]
 pub struct Backend {
     pub url: Url,
+    /// Legacy prefix match. Kept for compatibility with existing rows.
     pub match_path: Option<String>,
+    pub rules: MatchRules,
+}
+
+/// Per-backend routing rules; all configured conditions must match.
+#[derive(Debug, Clone, Default, serde::Deserialize)]
+pub struct MatchRules {
+    #[serde(default)]
+    pub path: Option<String>,
+    #[serde(default)]
+    pub user_agent: Option<String>,
+    #[serde(default)]
+    pub query: HashMap<String, String>,
+    #[serde(default)]
+    pub method: Vec<String>,
+}
+
+impl MatchRules {
+    pub fn matches(&self, context: &MatchContext<'_>) -> bool {
+        if let Some(pattern) = &self.path
+            && !glob_match(pattern, context.path)
+        {
+            return false;
+        }
+
+        if let Some(pattern) = &self.user_agent {
+            let Some(user_agent) = context.user_agent else {
+                return false;
+            };
+            if !glob_match(
+                &pattern.to_ascii_lowercase(),
+                &user_agent.to_ascii_lowercase(),
+            ) {
+                return false;
+            }
+        }
+
+        if !self.query.is_empty() {
+            let pairs: Vec<(String, String)> = context
+                .query
+                .map(|query| {
+                    url::form_urlencoded::parse(query.as_bytes())
+                        .into_owned()
+                        .collect()
+                })
+                .unwrap_or_default();
+
+            for (key, expected) in &self.query {
+                let matched = pairs
+                    .iter()
+                    .any(|(name, value)| name == key && (expected.is_empty() || value == expected));
+                if !matched {
+                    return false;
+                }
+            }
+        }
+
+        self.method.is_empty()
+            || self
+                .method
+                .iter()
+                .any(|method| method.eq_ignore_ascii_case(context.method))
+    }
+}
+
+#[derive(Debug, Clone, Copy)]
+pub struct MatchContext<'a> {
+    pub path: &'a str,
+    pub query: Option<&'a str>,
+    pub method: &'a str,
+    pub user_agent: Option<&'a str>,
+}
+
+/// Minimal glob matcher: `*` matches any sequence, `?` matches one character.
+fn glob_match(pattern: &str, value: &str) -> bool {
+    let pattern: Vec<char> = pattern.chars().collect();
+    let value: Vec<char> = value.chars().collect();
+
+    let (mut pattern_index, mut value_index) = (0usize, 0usize);
+    let mut star: Option<usize> = None;
+    let mut star_value_index = 0usize;
+
+    while value_index < value.len() {
+        if pattern_index < pattern.len()
+            && (pattern[pattern_index] == '?' || pattern[pattern_index] == value[value_index])
+        {
+            pattern_index += 1;
+            value_index += 1;
+        } else if pattern_index < pattern.len() && pattern[pattern_index] == '*' {
+            star = Some(pattern_index);
+            star_value_index = value_index;
+            pattern_index += 1;
+        } else if let Some(star_index) = star {
+            pattern_index = star_index + 1;
+            star_value_index += 1;
+            value_index = star_value_index;
+        } else {
+            return false;
+        }
+    }
+
+    while pattern_index < pattern.len() && pattern[pattern_index] == '*' {
+        pattern_index += 1;
+    }
+
+    pattern_index == pattern.len()
 }
 
 #[derive(Debug, Clone)]
@@ -245,14 +358,17 @@ impl Site {
         }
     }
 
-    /// Pick the next backend in round-robin order, preferring path matches.
-    pub fn next_backend(&self, path: &str) -> Option<&Backend> {
+    /// Pick the next backend in round-robin order, preferring matching rules.
+    pub fn next_backend(&self, context: &MatchContext<'_>) -> Option<&Backend> {
         let matched: Vec<&Backend> = self
             .backends
             .iter()
-            .filter(|backend| match backend.match_path.as_deref() {
-                Some(prefix) if !prefix.is_empty() => path.starts_with(prefix),
-                _ => true,
+            .filter(|backend| {
+                let path_matches = match backend.match_path.as_deref() {
+                    Some(prefix) if !prefix.is_empty() => context.path.starts_with(prefix),
+                    _ => true,
+                };
+                path_matches && backend.rules.matches(context)
             })
             .collect();
 
@@ -425,6 +541,16 @@ mod tests {
         Backend {
             url: Url::parse(url).unwrap(),
             match_path: match_path.map(str::to_string),
+            rules: MatchRules::default(),
+        }
+    }
+
+    fn context<'a>(path: &'a str) -> MatchContext<'a> {
+        MatchContext {
+            path,
+            query: None,
+            method: "GET",
+            user_agent: None,
         }
     }
 
@@ -477,9 +603,78 @@ mod tests {
             ],
         );
 
-        let api = site.next_backend("/api/v1").unwrap();
+        let api = site.next_backend(&context("/api/v1")).unwrap();
         assert_eq!(api.url.port(), Some(9001));
-        let web = site.next_backend("/index.html").unwrap();
+        let web = site.next_backend(&context("/index.html")).unwrap();
+        assert_eq!(web.url.port(), Some(9002));
+    }
+
+    #[test]
+    fn matches_path_user_agent_query_and_method() {
+        let rules = MatchRules {
+            path: Some("/api/*".to_string()),
+            user_agent: Some("*mobile*".to_string()),
+            query: HashMap::from([("version".to_string(), "v2".to_string())]),
+            method: vec!["POST".to_string()],
+        };
+
+        let matching = MatchContext {
+            path: "/api/users",
+            query: Some("version=v2&x=1"),
+            method: "POST",
+            user_agent: Some("Mozilla/5.0 (Mobile)"),
+        };
+
+        assert!(rules.matches(&matching));
+        assert!(!rules.matches(&MatchContext {
+            path: "/web",
+            ..matching
+        }));
+        assert!(!rules.matches(&MatchContext {
+            query: Some("version=v1"),
+            ..matching
+        }));
+        assert!(!rules.matches(&MatchContext {
+            method: "GET",
+            ..matching
+        }));
+        assert!(!rules.matches(&MatchContext {
+            user_agent: Some("curl/8"),
+            ..matching
+        }));
+    }
+
+    #[test]
+    fn glob_matcher_supports_wildcards() {
+        assert!(glob_match("/api/*", "/api/v1/users"));
+        assert!(glob_match("*mobile*", "mozilla mobile safari"));
+        assert!(!glob_match("*mobile*", "Mozilla Mobile Safari"));
+        assert!(!glob_match("/api/*", "/web"));
+        assert!(glob_match("/v?", "/v2"));
+    }
+
+    #[test]
+    fn selects_backend_by_rules() {
+        let api_rules = MatchRules {
+            path: Some("/api/*".to_string()),
+            ..MatchRules::default()
+        };
+
+        let site = site(
+            &["example.com"],
+            vec![
+                Backend {
+                    url: Url::parse("http://127.0.0.1:9001").unwrap(),
+                    match_path: None,
+                    rules: api_rules,
+                },
+                backend("http://127.0.0.1:9002", None),
+            ],
+        );
+
+        let api = site.next_backend(&context("/api/v1")).unwrap();
+        assert_eq!(api.url.port(), Some(9001));
+        let web = site.next_backend(&context("/web")).unwrap();
         assert_eq!(web.url.port(), Some(9002));
     }
 

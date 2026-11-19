@@ -9,7 +9,9 @@ use anyhow::Context;
 use tracing::{Level, event};
 use url::Url;
 
-use crate::state::{AppState, Backend, CertStore, ClientIpMode, ProxyHeaders, Routing, Site};
+use crate::state::{
+    AppState, Backend, CertStore, ClientIpMode, MatchRules, ProxyHeaders, Routing, Site,
+};
 use shared::database::Database;
 
 #[derive(Debug, sqlx::FromRow)]
@@ -27,6 +29,8 @@ struct BackendRow {
     url: String,
     #[serde(default)]
     match_path: Option<String>,
+    #[serde(default, rename = "match")]
+    rules: MatchRules,
 }
 
 #[derive(Debug, serde::Deserialize, Default)]
@@ -138,6 +142,7 @@ pub async fn sync_once(
                     backends.push(Backend {
                         url,
                         match_path: spec.match_path,
+                        rules: spec.rules,
                     });
                 }
                 Ok(url) => {
