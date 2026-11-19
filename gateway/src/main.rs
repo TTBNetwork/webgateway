@@ -13,6 +13,7 @@ mod proxy_protocol;
 mod state;
 mod sync;
 mod tls;
+mod upgrade;
 
 use std::{
     net::IpAddr,

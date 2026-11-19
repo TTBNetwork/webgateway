@@ -156,7 +156,7 @@ where
     });
 
     hyper_util::server::conn::auto::Builder::new(TokioExecutor::new())
-        .serve_connection(TokioIo::new(io), service)
+        .serve_connection_with_upgrades(TokioIo::new(io), service)
         .await
         .map_err(|error| anyhow::anyhow!("HTTP connection failed: {error}"))?;
 

@@ -34,6 +34,13 @@ pub async fn handle(
     scheme: &'static str,
     proxy_source: Option<SocketAddr>,
 ) -> Response<ProxyBody> {
+    if request.method() == http::Method::CONNECT {
+        return crate::upgrade::handle_connect(state, request, peer, proxy_source).await;
+    }
+    if crate::upgrade::is_websocket(&request) {
+        return crate::upgrade::handle_websocket(state, request, peer, scheme, proxy_source).await;
+    }
+
     let raw_host = request_host(&request);
     let path = request.uri().path().to_string();
     let method_label = request.method().as_str().to_string();
@@ -245,7 +252,7 @@ pub async fn handle(
     response
 }
 
-fn log_event(
+pub(crate) fn log_event(
     state: &AppState,
     request: &crate::access::RequestLog,
     status: StatusCode,
@@ -332,7 +339,7 @@ fn remove_hop_by_hop(headers: &mut HeaderMap) {
     }
 }
 
-fn text_response(
+pub(crate) fn text_response(
     status: StatusCode,
     message: &'static str,
     state: &AppState,
