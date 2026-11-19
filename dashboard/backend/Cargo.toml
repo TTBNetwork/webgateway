@@ -13,6 +13,7 @@ axum.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 shared = { path = "../../crates/shared" }
+sqlx.workspace = true
 tokio.workspace = true
 toml.workspace = true
 tracing.workspace = true
