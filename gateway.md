@@ -1,7 +1,7 @@
 # WebGateway v2 网关（数据面）
 
 > 网关只读取数据库、不执行任何 DDL；主控初始化完成之前网关会等待。
-> 访问日志/统计、缓存、IP-UA 拦截、WebSocket/gRPC/HTTP3 尚未实现，见文末。
+> 访问日志/统计、缓存、IP-UA 拦截、WebSocket/HTTP3 尚未实现，见文末。
 
 ## 1. 启动与生命周期
 
@@ -50,9 +50,27 @@ ports = [80, 443]
 
 - Host 归一化：小写、去端口、去结尾点；支持 IPv6 字面量。
 - 精确匹配优先，然后通配符 `*.example.com`（单 label，最长后缀优先）。
-- `websites.backends` 为 JSONB 数组：`{ "url": "http://127.0.0.1:9001", "match_path": "/api" }`。
-  `match_path` 前缀匹配的后端按轮询选择；没有命中时在所有后端间轮询。
-- 当前只支持 `http://` 上游；`https://` 后端跳过并告警（上游 TLS 未实现）。
+- `websites.backends` 是 JSONB 数组，每项可带匹配规则：
+
+  ```json
+  {
+    "url": "http://api-backend:9000",
+    "match_path": "/api",
+    "match": {
+      "path": "/api/*",
+      "user_agent": "*Mobile*",
+      "query": { "version": "v2" },
+      "method": ["POST"]
+    }
+  }
+  ```
+
+  - `match_path`（旧字段）：路径前缀；`match.path`：支持 `*` / `?` 的 glob（区分大小写）；
+  - `match.user_agent`：大小写不敏感 glob；
+  - `match.query`：所有键都要匹配，空值表示只要求存在，请求值按 URL 解码；
+  - `match.method`：忽略大小写，空数组表示不限制；
+  - 所有配置条件 AND；命中后端轮询；没有任何后端命中时回退到所有后端。
+- 上游只支持 `http://`（含 gRPC h2c）；`https://` 后端跳过并告警（上游 TLS 未实现）。
 
 ## 4. 请求头（站点级配置）
 
@@ -103,7 +121,8 @@ ports = [80, 443]
 
 ## 5. 代理与响应
 
-- 上游传输：当前固定 HTTP/1.1（gRPC/h2 在下一阶段）；60s 超时；超时 504、上游错误 502、未匹配站点 404。
+- 上游传输：普通请求 HTTP/1.1（60s 超时）；`content-type: application/grpc*` 的请求走独立的 HTTP/2-only 客户端（h2c），
+  保留 `TE: trailers` 并透传 trailers，不套 60s 超时；超时 504、上游错误 502、未匹配站点 404。
 - 响应头：`Server: WebGateway`、`X-WebGateway-Node`。
 - `X-WebGateway-Node` 格式：`<location>-<16 hex>`，例如 `cn-shanghai-18411588dcb04048`。
   `location` = country-city 的 ASCII 小写形式；hash = FNV-1a64(`location + machine_id`)。
@@ -121,8 +140,9 @@ ports = [80, 443]
   未配置的 X-Real-IP / X-Forwarded-Proto 不再出现。
 - 节点 header：`cn-shanghai-18411588dcb04048`。
 - PROXY protocol：无头 / v1 / v2 三种连接分别解析出 127.0.0.1 / 198.51.100.7 / 203.0.113.9，并写入上游头。
+- 路由：POST `/api/x?version=v2` + curl UA → upstream-one；version/method/UA 任一不匹配 → upstream-two；`/web` → upstream-two。
 - HTTP 200、HTTPS HTTP/2 200、未知 Host 404、心跳更新、SIGTERM offline。
-- 网关单测 19 个；shared 迁移/单测、fmt、clippy 全通过。
+- 网关单测 23 个；shared 迁移/单测、fmt、clippy 全通过。
 
 ## 8. 尚未实现（下一步）
 
@@ -130,27 +150,10 @@ ports = [80, 443]
 - 网关缓存（主控下发：大小、文件类型、ETag、TTL 等，细节待定）。
 - IP / User-Agent 拦截（优先级低）。
 - 上游传输扩展：
-  - 当前：HTTP/1.1（已实现）；
-  - **gRPC**：HTTP/2（h2/h2c）端到端 + trailers 透传，需要独立 h2 客户端/连接管理；
   - **WebSocket**：服务端 `serve_connection_with_upgrades` + 原始上游握手 + upgrade 双向桥接；
   - **HTTP/3**：QUIC（quinn）UDP 监听与 0-RTT、连接迁移；
   - **特殊 RFC**：CONNECT 等，按需协议分发层。
-- 路由分配：当前按 Host + `match_path`；下一步支持 path/UA/query/method 规则，例如：
-
-  ```json
-  {
-    "url": "http://api-backend:9000",
-    "match": {
-      "path": "/api/*",
-      "user_agent": "*Mobile*",
-      "query": { "version": "v2" },
-      "method": ["GET", "POST"]
-    }
-  }
-  ```
-
-  规则全部命中才选择该后端；多个命中按轮询；无命中回退全部后端。
-- 上游 TLS、后端权重/主备。
+- 更复杂的路由（header / 正则）、上游 TLS、后端权重/主备。
 
 ## 9. 运行
 

@@ -60,3 +60,10 @@
 - 解析出的客户端 IP 用于 `$remote_addr` 与上游 X-Real-IP / X-Forwarded-For；CDN 场景可用 XFF/X-Real-IP 模式。
 - 实测：无头 / v1 / v2 连接分别得到 127.0.0.1 / 198.51.100.7 / 203.0.113.9。
 - 网关单测 19 个；文档更新。gRPC（h2/h2c + trailers）上游传输、path/UA/params 路由列为下一阶段。
+### 网关路由与 gRPC 传输（分支 `feat/gateway-routing`）
+- 后端匹配规则：`match.path` glob、`match.user_agent` glob、`match.query` map、`match.method`；
+  全部 AND，命中轮询，无命中回退全部。
+- gRPC：`content-type: application/grpc*` 使用 HTTP/2-only 客户端（h2c），保留 `TE: trailers` 并透传 trailers，
+  不套 60s 超时。
+- E2E：POST `/api/x?version=v2` + curl UA → upstream-one；version/method/UA 不匹配或 `/web` → upstream-two。
+- 单测 23 个；文档更新。WebSocket/HTTP3/特殊 RFC、访问日志/缓存/IP-UA 拦截仍待做。
