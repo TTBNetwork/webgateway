@@ -304,7 +304,7 @@
 
 - 最新分支：fix/gateway-websocket-tls（叠加在 feat/stats-maintenance 之后）
 - 测试：网关 34、dashboard 2、shared 11 + 3 集成（含 stats 回填/分区回收）；前端 format/lint/build 通过
-- 数据库：schema v3；2026-11-19 联调临时数据已清理（见文末）
+- 数据库：schema v3；2026-11-19 联调与统计验证的临时数据已全部清理（websites/gateways/users/logs/stats = 0）
 - 实时协议：Nezha gRPC（h2c/TLS/双向流）与 MCSManager WS（101/鉴权/长连接）已用真实软件验证，见 `e2e-realtime.md`
 - 面板：TOTP + JWT 登录；默认缓存 16 MiB（可配）；Vite 代理 /api → 127.0.0.1:3000
 
