@@ -2,6 +2,7 @@
 import { ref } from 'vue'
 import AppIcon from '../components/AppIcon.vue'
 import InfoTip from '../components/InfoTip.vue'
+import NavIcon from '../components/NavIcon.vue'
 import { api } from '../api'
 import { errorMessage } from '../format'
 import { t } from '../i18n'
@@ -71,7 +72,7 @@ function toggleLocale(): void {
 
       <section class="login-card">
         <div class="login-card-head">
-          <span class="brand-mark">WG</span>
+          <span class="brand-mark"><NavIcon name="shield" :size="20" /></span>
           <div>
             <h2>{{ t('login.title') }}</h2>
             <p>{{ t('login.subtitle') }}</p>
