@@ -48,6 +48,8 @@ pub struct ServerConfig {
     pub max_request_body_bytes: u64,
     /// Maximum response body buffered for caching or HTTP/3 delivery.
     pub max_response_body_bytes: u64,
+    /// Ports allowed as HTTP CONNECT tunnel targets.
+    pub connect_ports: Vec<u16>,
 }
 
 impl Default for ServerConfig {
@@ -61,6 +63,7 @@ impl Default for ServerConfig {
             max_header_bytes: 32 * 1024,
             max_request_body_bytes: 64 * 1024 * 1024,
             max_response_body_bytes: 64 * 1024 * 1024,
+            connect_ports: vec![443, 80],
         }
     }
 }
@@ -120,6 +123,12 @@ impl Config {
             "GATEWAY_MAX_RESPONSE_BODY",
             &mut config.server.max_response_body_bytes,
         );
+        if let Ok(raw) = std::env::var("GATEWAY_CONNECT_PORTS") {
+            config.server.connect_ports = raw
+                .split(',')
+                .filter_map(|item| item.trim().parse().ok())
+                .collect();
+        }
 
         // Keep values in a range the server/builder can actually use.
         config.server.max_connections = config.server.max_connections.max(1);

@@ -271,3 +271,21 @@
 - 限制：站点级覆盖/超时/HTTP/3 连接计数未做；h3 仍无流式与缓存；h3 在途请求不参与停机 drain。
 - 测试：gateway 36、dashboard 10、shared 14 + 3 集成；clippy/fmt 通过。
 - 文档：`gateway.md` 2.1 资源限制、5.3 HTTP/3；`issue.md` B-04/B-09/B-11、F-49/F-50。
+
+### CONNECT 审计/端口白名单 + HTTP/3 Alt-Svc（分支 `feat/connect-alt-svc`）
+- CONNECT 审计：`handle_connect` 在解析 authority 前创建访问日志；400（authority 缺失/非法）、
+  403（端口/站点不允许）、502/504（上游失败/超时）、200（隧道建立）全部落库；
+  200 行记录 website_id，失败行 website_id 为 NULL。
+- CONNECT 端口白名单：新增 `[server].connect_ports`（默认 `[443, 80]`），
+  `GATEWAY_CONNECT_PORTS` 覆盖；空列表拒绝全部 CONNECT。端口不在列表直接 403，不再任意端口可隧道。
+- HTTP/3 Alt-Svc：配置 `http3_ports` 时，TLS 的 h1/h2 响应自动插入
+  `Alt-Svc: h3=":<udp_port>"; ma=86400`（state 构建、listener 注入）；明文 HTTP 与 h3 自身不加。
+- `AppState::new` 参数收敛为 `StateLimits`，避免 clippy too_many_arguments。
+- 实测：
+  - CONNECT `127.0.0.1:18443`（白名单 + 站点）→ 200；
+  - `127.0.0.1:18082`（端口不允许）→ 403；
+  - `unknown.test:18443`（站点不存在）→ 403；
+  - 三条均写入访问日志（200/403/403，body_length 9）。
+  - Alt-Svc 单测覆盖值格式；TLS 场景未单独 E2E。
+- 测试：gateway 37、dashboard 10、shared 14 + 3 集成；clippy/fmt 通过。
+- 文档：`gateway.md` 2.1/5.2/5.3、`gateway/config.example.toml`、`issue.md` B-07/B-12、F-51/F-52。

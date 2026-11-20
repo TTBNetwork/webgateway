@@ -46,6 +46,8 @@ max_header_bytes = 32768
 max_request_body_bytes = 67108864
 # 缓存/HTTP/3 响应缓冲上限
 max_response_body_bytes = 67108864
+# CONNECT 目标端口白名单；空列表表示全部拒绝
+connect_ports = [443, 80]
 
 [upstream_tls]
 # 额外的 PEM CA，用于 https 后端；webpki 根证书始终受信
@@ -65,6 +67,7 @@ max_response_body_bytes = 67108864
 | `GATEWAY_MAX_HEADER_BYTES` | header 上限（最小 8192） |
 | `GATEWAY_MAX_REQUEST_BODY` | 请求体上限 |
 | `GATEWAY_MAX_RESPONSE_BODY` | 响应缓冲上限 |
+| `GATEWAY_CONNECT_PORTS` | 逗号分隔的 CONNECT 目标端口白名单 |
 
 ### 2.1 资源限制
 
@@ -185,8 +188,13 @@ max_response_body_bytes = 67108864
   - 到上游做原始 HTTP/1.1 握手，客户端连接启用 `.with_upgrades()`；
   - 上游返回 101 后双向桥接；非 101 按普通响应回传；
   - 访问日志记录 101。
-- **CONNECT**：仅允许 authority 的 host 命中已配置站点（否则 403），连接 `host:port` 后返回 200
-  并桥接原始 TCP；不是 TLS MITM，只做透传。访问日志记录 CONNECT + 200。
+- **CONNECT**：
+  - authority 的 host 必须命中已配置站点，否则 403；
+  - authority 的端口必须在 `[server].connect_ports`（默认 `[443, 80]`）中，否则 403；
+    空列表表示拒绝全部 CONNECT；
+  - 通过后连接 `host:port` 并返回 200，桥接原始 TCP；不是 TLS MITM，只做透传；
+  - 访问日志覆盖全部结果：400（authority 缺失/非法）、403（端口/站点不允许）、
+    502/504（上游失败/超时）、200（隧道建立），CONNECT 行记录 authority、状态与 website_id。
 - 上游支持 `http://` 与 `https://`：https 后端先用同一 TLS 配置（webpki 根 + 可选 ca_file）握手，
   ALPN 固定 `http/1.1`；后端 URL 的 base path 会拼到客户端 path 前（`/mc` + `/socket.io/...`）。
 - 限制：HTTP/2 extended CONNECT / WebSocket over h2 未实现；升级连接不计字节数（body_length 0）；
@@ -202,6 +210,8 @@ max_response_body_bytes = 67108864
 - 请求体完整缓冲后，通过内部 HTTP/1.1 buffered client 转发上游；响应体也完整缓冲后发送。
 - 请求体超过 `max_request_body_bytes` 返回 **413**（声明 Content-Length 或流式累计均检查）；
   响应超过 `max_response_body_bytes` 返回 502。
+- 启用 h3 时，TLS 的 HTTP/1.1 与 HTTP/2 响应自动带
+  `Alt-Svc: h3=":<udp_port>"; ma=86400`；明文 HTTP 与 h3 自身不返回该头。
 - 访问日志记录 `HTTP/3.0`；`get_request_ip` 的 raw/XFF 模式可用，PROXY protocol 不适用。
 - 限制：仍无流式请求/响应；h3 不走缓存；WebSocket / gRPC over h3 未实现；
   优雅停机不 drain h3 在途请求；未调 0-RTT / 连接迁移。
@@ -249,7 +259,7 @@ max_response_body_bytes = 67108864
 - 路由：POST `/api/x?version=v2` + curl UA → upstream-one；version/method/UA 任一不匹配 → upstream-two；`/web` → upstream-two。
 - 访问日志：GET/POST/404 分别产生 request/response 行；POST 5 字节、响应 12/9 字节，size 表按秒记录。
 - WebSocket：Python WS echo 经网关回显 `hello-websocket`（101）。
-- CONNECT：`CONNECT localhost:9500` 返回 200，`ping-through-connect` 原样回显。
+- CONNECT：白名单内端口返回 200 并桥接；端口/站点不允许返回 403，且 200/403 都写入访问日志。
 - HTTP/3：aioquic 客户端 GET `/h3` → 200，body `http3-upstream-ok`；访问日志 `HTTP/3.0`。
 - 统计：3 条合成日志 → 秒级 30/150 字节；旧秒归并分钟 70/700；旧分归并日 90/900。
 - 缓存：MISS count=1 → HIT count=1 → 304 → 配置更新后 MISS count=2。

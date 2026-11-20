@@ -287,12 +287,40 @@ pub async fn handle_connect(
                 .map(str::to_string)
         });
 
+    let log_target = authority
+        .clone()
+        .unwrap_or_else(|| proxy::request_host(&request));
+    let mut request_log = access::RequestLog {
+        id: access::next_id(),
+        host: log_target.clone(),
+        method: "CONNECT".to_string(),
+        path: log_target,
+        headers: access::headers_json(request.headers()),
+        http_version: access::version_label(request.version()),
+        remote_addr: peer.ip().to_string(),
+        body_length: 0,
+        website_id: None,
+    };
+
     let Some(authority) = authority else {
+        log_failure(&state, &request_log, StatusCode::BAD_REQUEST, 11);
         return proxy::text_response(StatusCode::BAD_REQUEST, "Bad Request", &state);
     };
     let Some((host, port)) = split_authority(&authority) else {
+        log_failure(&state, &request_log, StatusCode::BAD_REQUEST, 11);
         return proxy::text_response(StatusCode::BAD_REQUEST, "Bad Request", &state);
     };
+
+    if !state.connect_ports.contains(&port) {
+        event!(
+            Level::WARN,
+            authority = %authority,
+            port,
+            "CONNECT target port is not allowed"
+        );
+        log_failure(&state, &request_log, StatusCode::FORBIDDEN, 9);
+        return proxy::text_response(StatusCode::FORBIDDEN, "Forbidden", &state);
+    }
 
     let Some(site) = state
         .routing
@@ -300,23 +328,15 @@ pub async fn handle_connect(
         .expect("routing lock poisoned")
         .lookup(&host)
     else {
+        log_failure(&state, &request_log, StatusCode::FORBIDDEN, 9);
         return proxy::text_response(StatusCode::FORBIDDEN, "Forbidden", &state);
     };
 
     let client_ip = site
         .client_ip
         .resolve(peer, proxy_source, request.headers());
-    let request_log = access::RequestLog {
-        id: access::next_id(),
-        host: authority.clone(),
-        method: "CONNECT".to_string(),
-        path: authority.clone(),
-        headers: access::headers_json(request.headers()),
-        http_version: access::version_label(request.version()),
-        remote_addr: client_ip.to_string(),
-        body_length: 0,
-        website_id: Some(site.id.clone()),
-    };
+    request_log.remote_addr = client_ip.to_string();
+    request_log.website_id = Some(site.id.clone());
 
     let client_upgrade = hyper::upgrade::on(&mut request);
 

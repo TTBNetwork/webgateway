@@ -64,6 +64,12 @@ pub fn upstream_tls_config(ca_file: Option<&Path>) -> anyhow::Result<rustls::Cli
     Ok(tls)
 }
 
+/// Build the Alt-Svc value that advertises the HTTP/3 UDP port.
+pub fn alt_svc_value(port: u16) -> HeaderValue {
+    HeaderValue::from_str(&format!("h3=\":{port}\"; ma=86400"))
+        .expect("the Alt-Svc value is always valid")
+}
+
 /// Build the upstream connector used for both HTTP/1.1 and HTTP/2 backends.
 ///
 /// hyper-rustls configures ALPN itself; pre-setting it panics.
@@ -74,6 +80,15 @@ pub fn upstream_connector(tls: rustls::ClientConfig) -> UpstreamConnector {
         .enable_http1()
         .enable_http2()
         .build()
+}
+
+/// Runtime limits assembled from [server] configuration.
+pub struct StateLimits {
+    pub cache_max_size_bytes: u64,
+    pub max_request_body_bytes: u64,
+    pub max_response_body_bytes: u64,
+    pub connect_ports: Vec<u16>,
+    pub h3_port: Option<u16>,
 }
 
 pub struct AppState {
@@ -92,6 +107,10 @@ pub struct AppState {
     pub node: NodeInfo,
     pub max_request_body_bytes: u64,
     pub max_response_body_bytes: u64,
+    /// Ports allowed as HTTP CONNECT tunnel targets.
+    pub connect_ports: Arc<[u16]>,
+    /// Alt-Svc header advertised on TLS responses when HTTP/3 is enabled.
+    pub alt_svc: Option<HeaderValue>,
 }
 
 impl AppState {
@@ -100,10 +119,15 @@ impl AppState {
         certs: Arc<RwLock<Arc<CertStore>>>,
         logs: mpsc::Sender<AccessEvent>,
         upstream_ca_file: Option<&Path>,
-        cache_max_size_bytes: u64,
-        max_request_body_bytes: u64,
-        max_response_body_bytes: u64,
+        limits: StateLimits,
     ) -> anyhow::Result<Self> {
+        let StateLimits {
+            cache_max_size_bytes,
+            max_request_body_bytes,
+            max_response_body_bytes,
+            connect_ports,
+            h3_port,
+        } = limits;
         let tls_acceptor = crate::tls::acceptor(certs.clone())?;
         let upstream_tls = upstream_tls_config(upstream_ca_file)?;
         let connector = upstream_connector(upstream_tls.clone());
@@ -132,6 +156,8 @@ impl AppState {
             node,
             max_request_body_bytes,
             max_response_body_bytes,
+            connect_ports: connect_ports.into(),
+            alt_svc: h3_port.map(alt_svc_value),
         })
     }
 
@@ -657,6 +683,14 @@ pub fn normalize_host(host: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn formats_alt_svc_for_h3() {
+        assert_eq!(
+            alt_svc_value(8443).to_str().unwrap(),
+            "h3=\":8443\"; ma=86400"
+        );
+    }
 
     fn backend(url: &str, match_path: Option<&str>) -> Backend {
         Backend {

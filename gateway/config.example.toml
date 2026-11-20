@@ -28,6 +28,9 @@ ports = [80, 443]
 # max_request_body_bytes = 67108864
 # Cached / HTTP/3 buffered response cap (default 64 MiB).
 # max_response_body_bytes = 67108864
+# Ports allowed as HTTP CONNECT tunnel targets (default [443, 80]).
+# An empty list denies all CONNECT requests.
+# connect_ports = [443, 80]
 
 [upstream_tls]
 # Extra PEM CA certificates for https backends (webpki roots are always trusted).

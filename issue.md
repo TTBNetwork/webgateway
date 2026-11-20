@@ -73,7 +73,7 @@
 |---|---|---|---|
 | F-39 | 网关单测 | ✅ | 36 个；fmt/clippy 全通过 |
 | F-40 | shared 测试 | ✅ | 14 单测 + 3 集成（临时库，含 stats 回填/分区回收、schema v6） |
-| F-41 | 本地 E2E | ✅ | NOTIFY、headers、PROXY、路由、日志、统计、缓存、TLS、WS、CONNECT、h3、权重、TOTP/JWT；Nezha gRPC 与 MCSManager WS 联调；证书上传与 Let's Encrypt 真实签发；优雅停机 drain + TOTP 重放/限速；body/header/connection 上限 |
+| F-41 | 本地 E2E | ✅ | NOTIFY、headers、PROXY、路由、日志、统计、缓存、TLS、WS、CONNECT、h3、权重、TOTP/JWT；Nezha gRPC 与 MCSManager WS 联调；证书上传与 Let's Encrypt 真实签发；优雅停机 drain + TOTP 重放/限速；body/header/connection 上限；CONNECT 200/403 日志 |
 
 ### 1.6 证书管理
 
@@ -88,6 +88,8 @@
 | F-48 | 优雅停机 / 日志可靠性 | ✅ | SIGTERM 停止 accept → 10s drain in-flight（HTTP/TCP）→ flush access log → offline；批量写失败重试 3 次 + 丢弃计数 |
 | F-49 | 请求/响应/连接上限 | ✅ | max_connections / max_header_bytes / max_request_body_bytes / max_response_body_bytes；413/431/丢弃；缓存与 h3 共用响应上限 |
 | F-50 | 缓存收集前置检查 | ✅ | 仅 Content-Length 可解析且 ≤ 上限时缓存；chunked 不缓存；避免先 collect 再判断 |
+| F-51 | CONNECT 审计与端口白名单 | ✅ | 400/403/502/504/200 全写访问日志；`connect_ports` 默认 [443,80]，可 env 覆盖 |
+| F-52 | HTTP/3 Alt-Svc | ✅ | TLS h1/h2 响应带 `h3=":<udp_port>"; ma=86400`；h3/明文不加 |
 
 ---
 
@@ -95,10 +97,10 @@
 
 | ID | Feature | 限制 |
 |---|---|---|
-| P-01 | HTTP/3 | 请求/响应全缓冲，无流式；无 Alt-Svc；无 0-RTT/连接迁移；h3 不走缓存；WS/gRPC over h3 未实现；已有 body/response 上限 |
+| P-01 | HTTP/3 | 请求/响应全缓冲，无流式；无 0-RTT/连接迁移；h3 不走缓存；WS/gRPC over h3 未实现；已有 body/response 上限；TLS h1/h2 已广播 Alt-Svc |
 | P-02 | gRPC | 已在 Nezha 上验证；访问日志只记 HTTP 200，无法区分 grpc-status；无 gRPC-Web |
 | P-03 | WebSocket | 升级连接字节数记 0；无 mTLS / SNI 覆盖；wss 与后端 base path 已支持（2026-11-19） |
-| P-04 | CONNECT | 仅 h1；400/403 不写日志；已配置 host 的任意端口可隧道；无鉴权 |
+| P-04 | CONNECT | 仅 h1；已修复 400/403 日志与端口白名单；无鉴权 / mTLS；无 HTTP/2 extended CONNECT |
 | P-05 | 缓存 | 仅 h1/h2；配置同步清空全部；无持久化/Vary/HEAD/stale-while-revalidate/single-flight/命中率；max_entry_size 在完整收集后判断 |
 | P-06 | 访问日志 | body_length 取 Content-Length；chunked 请求 0、响应 NULL；WS/CONNECT 0；headers 重复键被覆盖；已修复 writer 退出 flush |
 | P-07 | 统计 | total_ips 跨秒重复；sizes 依赖日志 Content-Length；保留期（7 天）仍硬编码；整周过期分区已 DROP，边界分区仍逐行 DELETE |
@@ -212,11 +214,14 @@
 - 仍未做：落盘 spill、Prometheus /metrics、告警；重启前最后一批仍可能丢失。
 - 位置：gateway/src/proxy.rs（log_event）、gateway/src/access.rs
 
-#### B-07 CONNECT 400/403 不记日志 + 端口开放
-- 症状：authority 缺失/非法返回 400、站点不匹配返回 403，均无 access log；已配置 host 任意端口可隧道。
-- 影响：审计缺失；SSRF/滥用风险。
-- 建议：所有返回路径统一 log_failure；加端口白名单/鉴权。
-- 位置：gateway/src/upgrade.rs（handle_connect）
+#### B-07 CONNECT 400/403 不记日志 + 端口开放（已修复，2026-11-20）
+- 修复：handle_connect 在解析 authority 前创建 RequestLog；400/403/502/504/200 全部写访问日志；
+  新增 `[server].connect_ports`（默认 `[443, 80]`，`GATEWAY_CONNECT_PORTS` 覆盖），
+  端口不在白名单直接 403；空列表拒绝全部 CONNECT。
+- 实测：`127.0.0.1:18443`（允许+站点命中）→ 200；`:18082`（端口不允许）→ 403；
+  `unknown.test:18443`（站点不存在）→ 403；三条都有 CONNECT 访问日志（200/403/403）。
+- 仍未做：CONNECT 鉴权 / mTLS；HTTP/2 extended CONNECT。
+- 位置：gateway/src/upgrade.rs、gateway/src/config.rs、gateway/src/state.rs
 
 ### P2 — 行为 / 安全 / 统计偏差
 
@@ -248,9 +253,11 @@
 - 仍未做：站点级覆盖、连接/请求超时、HTTP/3 连接计数。
 - 位置：gateway/src/config.rs、gateway/src/listeners.rs、gateway/src/proxy.rs、gateway/src/http3.rs
 
-#### B-12 HTTP/3 无 Alt-Svc
-- h1/h2 响应不广播 h3，客户端不会自动升级，必须显式连接 UDP 端口。
-- 建议：在 TLS 响应加 Alt-Svc: h3=":443"; ma=86400。
+#### B-12 HTTP/3 无 Alt-Svc（已修复，2026-11-20）
+- 修复：配置 `http3_ports` 时，TLS 的 HTTP/1.1 与 HTTP/2 响应自动带
+  `Alt-Svc: h3="<udp_port>"; ma=86400`；明文 HTTP 与 h3 响应不加。
+- 单测覆盖值格式（`h3=":8443"; ma=86400`）；TLS 场景未单独 E2E。
+- 位置：gateway/src/state.rs、gateway/src/listeners.rs
 
 #### B-13 gRPC 真实 E2E（已解决，2026-11-19）
 - 已用 Nezha Dashboard v2.6.2 + agent v2.4.0 验证：h2c 与 TLS/ALPN h2 入口均注册成功，
@@ -319,9 +326,9 @@
 
 ## 5. 当前状态
 
-- 最新分支：feat/limits-hardening（叠加在 feat/reliability-hardening 之后）
-- 测试：网关 36、dashboard 10、shared 14 + 3 集成（含 stats 回填/分区回收）；前端 format/lint/type-check/build 通过
-- 数据库：schema v6；2026-11-19/20 联调/统计/证书/CRUD/可靠性/资源上限验证的临时数据已清理（websites/gateways/users/logs/stats = 0；测试证书已删除）
+- 最新分支：feat/connect-alt-svc（叠加在 feat/limits-hardening 之后）
+- 测试：网关 37、dashboard 10、shared 14 + 3 集成（含 stats 回填/分区回收）；前端 format/lint/type-check/build 通过
+- 数据库：schema v6；2026-11-20 联调/统计/证书/CRUD/可靠性/资源上限/CONNECT 验证的临时数据已清理（websites/gateways/users/logs/stats = 0；测试证书已删除）
 - 管理面：站点/网关/用户 CRUD + admin/user/view RBAC + token_version 撤销；面板站点/用户编辑页完成
 - 证书：手动上传 + ACME（Let's Encrypt 实测签发；ZeroSSL 需 EAB）→ 网关 SNI 加载验证通过，见 `certificates.md`
 - 实时协议：Nezha gRPC（h2c/TLS/双向流）与 MCSManager WS（101/鉴权/长连接）已用真实软件验证，见 `e2e-realtime.md`
@@ -331,7 +338,7 @@
 
 1. ~~B-01 / B-02：分区续建 + 统计补算（P0）~~ ✅
 2. ~~面板 CRUD + 用户管理/RBAC/JWT 撤销（U-01/U-02）~~ ✅（剩 refresh token/API key/服务令牌轮换）
-3. ~~B-03~~ ✅ / ~~B-05~~ ✅ / ~~B-06~~ ✅ / ~~B-11~~ ✅ / B-04：h3 限制（body 上限已完成，仍缺缓存/流式）
+3. ~~B-03~~ ✅ / ~~B-05~~ ✅ / ~~B-06~~ ✅ / ~~B-11~~ ✅ / ~~B-07~~ ✅ / ~~B-12~~ ✅ / B-04：h3 限制（body 上限已完成，仍缺缓存/流式）
 4. U-11/U-13：h3 流式/Alt-Svc、h2 extended CONNECT
 5. U-17/U-19/U-23：健康检查、metrics、缓存持久化
 6. B-21：合并分支、清理 PR 栈

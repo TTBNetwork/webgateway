@@ -248,10 +248,20 @@ async fn serve<S>(
 where
     S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send + 'static,
 {
+    let alt_svc = state.alt_svc.clone();
     let service = service_fn(move |request| {
         let state = state.clone();
+        let alt_svc = alt_svc.clone();
         async move {
-            let response = proxy::handle(state, request, peer, scheme, proxy_source).await;
+            let mut response = proxy::handle(state, request, peer, scheme, proxy_source).await;
+            // Only advertise h3 over TLS; HTTP/3 requires TLS 1.3.
+            if scheme == "https"
+                && let Some(value) = alt_svc
+            {
+                response
+                    .headers_mut()
+                    .insert(http::HeaderName::from_static("alt-svc"), value);
+            }
             Ok::<_, Infallible>(response)
         }
     });

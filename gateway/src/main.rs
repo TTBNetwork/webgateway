@@ -33,7 +33,7 @@ use crate::{
     listeners::Listeners,
     node::NodeInfo,
     notify::ConfigEvent,
-    state::{AppState, CertStore},
+    state::{AppState, CertStore, StateLimits},
     tls::default_certified_key,
 };
 
@@ -81,9 +81,13 @@ async fn run() -> anyhow::Result<()> {
         certs,
         log_sender,
         upstream_ca_file,
-        config.server.cache_max_size_bytes,
-        config.server.max_request_body_bytes,
-        config.server.max_response_body_bytes,
+        StateLimits {
+            cache_max_size_bytes: config.server.cache_max_size_bytes,
+            max_request_body_bytes: config.server.max_request_body_bytes,
+            max_response_body_bytes: config.server.max_response_body_bytes,
+            connect_ports: config.server.connect_ports.clone(),
+            h3_port: config.server.http3_ports.first().copied(),
+        },
     )?);
 
     let bind: IpAddr = config
