@@ -73,7 +73,7 @@
 |---|---|---|---|
 | F-39 | 网关单测 | ✅ | 36 个；fmt/clippy 全通过 |
 | F-40 | shared 测试 | ✅ | 14 单测 + 3 集成（临时库，含 stats 回填/分区回收、schema v6） |
-| F-41 | 本地 E2E | ✅ | NOTIFY、headers、PROXY、路由、日志、统计、缓存、TLS、WS、CONNECT、h3、权重、TOTP/JWT；Nezha gRPC 与 MCSManager WS 联调；证书上传与 Let's Encrypt 真实签发；优雅停机 drain + TOTP 重放/限速 |
+| F-41 | 本地 E2E | ✅ | NOTIFY、headers、PROXY、路由、日志、统计、缓存、TLS、WS、CONNECT、h3、权重、TOTP/JWT；Nezha gRPC 与 MCSManager WS 联调；证书上传与 Let's Encrypt 真实签发；优雅停机 drain + TOTP 重放/限速；body/header/connection 上限 |
 
 ### 1.6 证书管理
 
@@ -86,6 +86,8 @@
 | F-46 | 用户管理 / RBAC / 撤销 | ✅ | 用户列表/创建/角色/删除/TOTP 重置/会话撤销；token_version JWT 撤销；admin/user/view 路由级 RBAC；面板用户页 |
 | F-47 | TOTP 防重放 / 登录限速 | ✅ | users.last_totp_step 单调 step；用户/IP 失败计数，5 次/5 分钟锁 5 分钟；429 + retry_after |
 | F-48 | 优雅停机 / 日志可靠性 | ✅ | SIGTERM 停止 accept → 10s drain in-flight（HTTP/TCP）→ flush access log → offline；批量写失败重试 3 次 + 丢弃计数 |
+| F-49 | 请求/响应/连接上限 | ✅ | max_connections / max_header_bytes / max_request_body_bytes / max_response_body_bytes；413/431/丢弃；缓存与 h3 共用响应上限 |
+| F-50 | 缓存收集前置检查 | ✅ | 仅 Content-Length 可解析且 ≤ 上限时缓存；chunked 不缓存；避免先 collect 再判断 |
 
 ---
 
@@ -93,7 +95,7 @@
 
 | ID | Feature | 限制 |
 |---|---|---|
-| P-01 | HTTP/3 | 请求/响应全缓冲，无流式；无 Alt-Svc；无 0-RTT/连接迁移；h3 不走缓存；WS/gRPC over h3 未实现；无 body 上限 |
+| P-01 | HTTP/3 | 请求/响应全缓冲，无流式；无 Alt-Svc；无 0-RTT/连接迁移；h3 不走缓存；WS/gRPC over h3 未实现；已有 body/response 上限 |
 | P-02 | gRPC | 已在 Nezha 上验证；访问日志只记 HTTP 200，无法区分 grpc-status；无 gRPC-Web |
 | P-03 | WebSocket | 升级连接字节数记 0；无 mTLS / SNI 覆盖；wss 与后端 base path 已支持（2026-11-19） |
 | P-04 | CONNECT | 仅 h1；400/403 不写日志；已配置 host 的任意端口可隧道；无鉴权 |
@@ -190,10 +192,11 @@
   三种场景均完成 Socket.IO 握手/鉴权/`info/overview`/ping-pong；网关 34 个单测通过。
 - 位置：gateway/src/upgrade.rs、gateway/src/state.rs
 
-#### B-04 HTTP/3 绕过缓存 + 无 body 上限
-- 症状：h3 请求不查/写缓存；请求体 BytesMut 与响应 collect 无上限。
-- 影响：缓存命中率下降；大 body 可导致内存压力/DoS。
-- 建议：h3 接缓存或明确文档；加 max_request_body/max_response_body；流式化。
+#### B-04 HTTP/3 绕过缓存 + 无 body 上限（部分修复，2026-11-20）
+- 已修复：请求体声明/流式累计超过 `max_request_body_bytes` 返回 413；
+  `handle_buffered` 响应超过 `max_response_body_bytes` 返回 502；不再无界 collect。
+- 仍未做：h3 不查/写缓存；无流式请求/响应；h3 在途请求不参与优雅停机 drain。
+- 实测：HTTP/1.1 2 KB body（限制 1 KB）返回 413；1 KB 以内正常转发。
 - 位置：gateway/src/http3.rs、gateway/src/proxy.rs（handle_buffered）
 
 #### B-05 停机丢日志 / 丢在途请求（已修复，2026-11-19）
@@ -224,11 +227,12 @@
 - 原始日志只 DELETE 行，不 DROP 分区，磁盘膨胀。
 - 位置：dashboard/backend/src/stats.rs、database.md 5.4
 
-#### B-09 缓存行为限制
-- 任意配置/证书 NOTIFY 都会清空全部站点缓存（非按站点）。
-- 无 single-flight，热点过期时并发回源。
-- max_entry_size 在完整收集 body 后才判断。
-- 不支持 HEAD/If-Modified-Since/If-None-Match: */Vary/stale-while-revalidate。
+#### B-09 缓存行为限制（部分修复，2026-11-20）
+- 已修复：缓存只在响应带 `Content-Length` 且不超过
+  `min(cache.max_entry_size, max_response_body_bytes)` 时收集；chunked 响应流式转发、不缓存，
+  不再“先完整收集再判断”。
+- 仍存在：任意配置/证书 NOTIFY 清空全部缓存；无 single-flight；
+  不支持 HEAD/If-Modified-Since/If-None-Match: */Vary/stale-while-revalidate。
 - 位置：gateway/src/cache.rs、gateway/src/proxy.rs
 
 #### B-10 上游 TLS 信任范围
@@ -236,9 +240,13 @@
 - 无 mTLS、无 SNI 覆盖。
 - 位置：gateway/src/state.rs（upstream_connector）
 
-#### B-11 无请求体/头/连接数限制
-- 大 body、慢连接、大量并发可消耗资源；h3 更明显。
-- 建议：全局/站点级限制与超时。
+#### B-11 无请求体/头/连接数限制（已修复全局层，2026-11-20）
+- 修复：`max_connections`（TCP 全局信号量，超限丢连接）、`max_header_bytes`
+  （HTTP/1 `max_buf_size` / HTTP/2 `max_header_list_size`）、`max_request_body_bytes`
+  （Content-Length 超限 413 + `Limited` 流式包装）、`max_response_body_bytes`（缓存/h3 缓冲上限）。
+- 实测：2 KB body → 413；20 KB header → 431；max_connections=1 时第二个连接被丢弃，第一个正常 200。
+- 仍未做：站点级覆盖、连接/请求超时、HTTP/3 连接计数。
+- 位置：gateway/src/config.rs、gateway/src/listeners.rs、gateway/src/proxy.rs、gateway/src/http3.rs
 
 #### B-12 HTTP/3 无 Alt-Svc
 - h1/h2 响应不广播 h3，客户端不会自动升级，必须显式连接 UDP 端口。
@@ -311,9 +319,9 @@
 
 ## 5. 当前状态
 
-- 最新分支：feat/reliability-hardening（叠加在 feat/dashboard-rbac 之后）
+- 最新分支：feat/limits-hardening（叠加在 feat/reliability-hardening 之后）
 - 测试：网关 36、dashboard 10、shared 14 + 3 集成（含 stats 回填/分区回收）；前端 format/lint/type-check/build 通过
-- 数据库：schema v6；2026-11-19 联调/统计/证书/CRUD/可靠性验证的临时数据已清理（websites/gateways/users/logs/stats = 0；测试证书已删除）
+- 数据库：schema v6；2026-11-19/20 联调/统计/证书/CRUD/可靠性/资源上限验证的临时数据已清理（websites/gateways/users/logs/stats = 0；测试证书已删除）
 - 管理面：站点/网关/用户 CRUD + admin/user/view RBAC + token_version 撤销；面板站点/用户编辑页完成
 - 证书：手动上传 + ACME（Let's Encrypt 实测签发；ZeroSSL 需 EAB）→ 网关 SNI 加载验证通过，见 `certificates.md`
 - 实时协议：Nezha gRPC（h2c/TLS/双向流）与 MCSManager WS（101/鉴权/长连接）已用真实软件验证，见 `e2e-realtime.md`
@@ -323,7 +331,7 @@
 
 1. ~~B-01 / B-02：分区续建 + 统计补算（P0）~~ ✅
 2. ~~面板 CRUD + 用户管理/RBAC/JWT 撤销（U-01/U-02）~~ ✅（剩 refresh token/API key/服务令牌轮换）
-3. ~~B-03~~ ✅ / ~~B-05~~ ✅ / ~~B-06~~ ✅ / B-04：h3 限制（仍缺 body 上限/缓存）
+3. ~~B-03~~ ✅ / ~~B-05~~ ✅ / ~~B-06~~ ✅ / ~~B-11~~ ✅ / B-04：h3 限制（body 上限已完成，仍缺缓存/流式）
 4. U-11/U-13：h3 流式/Alt-Svc、h2 extended CONNECT
 5. U-17/U-19/U-23：健康检查、metrics、缓存持久化
 6. B-21：合并分支、清理 PR 栈

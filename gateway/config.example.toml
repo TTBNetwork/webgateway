@@ -20,6 +20,14 @@ ports = [80, 443]
 # http3_ports = [443]
 # Global in-memory cache limit (default 16 MiB).
 # cache_max_size_bytes = 16777216
+# Concurrent TCP connections across all listeners (default 4096).
+# max_connections = 4096
+# HTTP/1 buffer / HTTP/2 header-list limit (default 32 KiB, minimum 8 KiB).
+# max_header_bytes = 32768
+# Request body cap (default 64 MiB); larger Content-Length gets 413.
+# max_request_body_bytes = 67108864
+# Cached / HTTP/3 buffered response cap (default 64 MiB).
+# max_response_body_bytes = 67108864
 
 [upstream_tls]
 # Extra PEM CA certificates for https backends (webpki roots are always trusted).

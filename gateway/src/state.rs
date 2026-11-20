@@ -14,8 +14,7 @@ use std::{
 use anyhow::Context;
 use bytes::Bytes;
 use http::{HeaderMap, HeaderName, HeaderValue};
-use http_body_util::Full;
-use hyper::body::Incoming;
+use http_body_util::{Full, combinators::BoxBody};
 use hyper_rustls::{HttpsConnector, HttpsConnectorBuilder};
 use hyper_util::client::legacy::Client;
 use hyper_util::client::legacy::connect::HttpConnector;
@@ -29,7 +28,9 @@ use crate::cache::{Cache, CacheConfig};
 use crate::node::NodeInfo;
 
 pub type UpstreamConnector = HttpsConnector<HttpConnector>;
-pub type UpstreamClient = Client<UpstreamConnector, Incoming>;
+pub type BoxError = Box<dyn std::error::Error + Send + Sync>;
+pub type GatewayBody = BoxBody<Bytes, BoxError>;
+pub type UpstreamClient = Client<UpstreamConnector, GatewayBody>;
 pub type BufferedUpstreamClient = Client<UpstreamConnector, Full<Bytes>>;
 
 /// Build the upstream TLS client configuration (webpki roots + optional PEM CA).
@@ -89,6 +90,8 @@ pub struct AppState {
     pub cache: Cache,
     pub logs: mpsc::Sender<AccessEvent>,
     pub node: NodeInfo,
+    pub max_request_body_bytes: u64,
+    pub max_response_body_bytes: u64,
 }
 
 impl AppState {
@@ -98,18 +101,21 @@ impl AppState {
         logs: mpsc::Sender<AccessEvent>,
         upstream_ca_file: Option<&Path>,
         cache_max_size_bytes: u64,
+        max_request_body_bytes: u64,
+        max_response_body_bytes: u64,
     ) -> anyhow::Result<Self> {
         let tls_acceptor = crate::tls::acceptor(certs.clone())?;
         let upstream_tls = upstream_tls_config(upstream_ca_file)?;
         let connector = upstream_connector(upstream_tls.clone());
-        let client = Client::builder(hyper_util::rt::TokioExecutor::new()).build(connector.clone());
+        let client: UpstreamClient =
+            Client::builder(hyper_util::rt::TokioExecutor::new()).build(connector.clone());
 
         let mut websocket_tls = upstream_tls;
         websocket_tls.alpn_protocols = vec![b"http/1.1".to_vec()];
 
         let mut grpc_builder = Client::builder(hyper_util::rt::TokioExecutor::new());
         grpc_builder.http2_only(true);
-        let grpc_client = grpc_builder.build(connector.clone());
+        let grpc_client: UpstreamClient = grpc_builder.build(connector.clone());
         let buffered_client: BufferedUpstreamClient =
             Client::builder(hyper_util::rt::TokioExecutor::new()).build(connector);
 
@@ -124,6 +130,8 @@ impl AppState {
             cache: Cache::new(cache_max_size_bytes),
             logs,
             node,
+            max_request_body_bytes,
+            max_response_body_bytes,
         })
     }
 

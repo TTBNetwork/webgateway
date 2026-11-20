@@ -82,6 +82,8 @@ async fn run() -> anyhow::Result<()> {
         log_sender,
         upstream_ca_file,
         config.server.cache_max_size_bytes,
+        config.server.max_request_body_bytes,
+        config.server.max_response_body_bytes,
     )?);
 
     let bind: IpAddr = config
@@ -89,7 +91,11 @@ async fn run() -> anyhow::Result<()> {
         .bind
         .parse()
         .with_context(|| format!("invalid [server].bind address: {}", config.server.bind))?;
-    let mut listeners = Listeners::new(bind);
+    let mut listeners = Listeners::new(
+        bind,
+        config.server.max_connections,
+        config.server.max_header_bytes,
+    );
 
     let (mut ports, mut watermark) = sync::sync_once(&database, &state, &config.server.ports)
         .await

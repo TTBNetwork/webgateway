@@ -7,6 +7,7 @@ use std::{
 
 use anyhow::Context;
 use bytes::{Buf, Bytes, BytesMut};
+use http::StatusCode;
 use tokio::task::JoinHandle;
 use tracing::{Level, event};
 
@@ -81,6 +82,35 @@ async fn serve_connection(
     }
 }
 
+type H3Stream = h3::server::RequestStream<h3_quinn::BidiStream<Bytes>, Bytes>;
+
+async fn reject(
+    stream: &mut H3Stream,
+    status: StatusCode,
+    message: &'static str,
+) -> anyhow::Result<()> {
+    let body = Bytes::from_static(message.as_bytes());
+    let response = http::Response::builder()
+        .status(status)
+        .header(http::header::CONTENT_TYPE, "text/plain; charset=utf-8")
+        .header(http::header::CONTENT_LENGTH, body.len().to_string())
+        .body(())
+        .context("failed to build the HTTP/3 error response")?;
+    stream
+        .send_response(response)
+        .await
+        .context("failed to send the HTTP/3 error response")?;
+    stream
+        .send_data(body)
+        .await
+        .context("failed to send the HTTP/3 error body")?;
+    stream
+        .finish()
+        .await
+        .context("failed to finish the HTTP/3 error response")?;
+    Ok(())
+}
+
 async fn handle_request(
     resolver: h3::server::RequestResolver<h3_quinn::Connection, Bytes>,
     state: Arc<AppState>,
@@ -91,6 +121,27 @@ async fn handle_request(
         .await
         .context("HTTP/3 request failed")?;
 
+    let declared_length = request
+        .headers()
+        .get(http::header::CONTENT_LENGTH)
+        .and_then(|value| value.to_str().ok())
+        .and_then(|value| value.parse::<u64>().ok());
+    if declared_length.is_some_and(|length| length > state.max_request_body_bytes) {
+        event!(
+            Level::WARN,
+            length = ?declared_length,
+            limit = state.max_request_body_bytes,
+            "rejecting oversized HTTP/3 request body"
+        );
+        reject(
+            &mut stream,
+            StatusCode::PAYLOAD_TOO_LARGE,
+            "Payload Too Large",
+        )
+        .await?;
+        return Ok(());
+    }
+
     let mut body = BytesMut::new();
     while let Some(mut chunk) = stream
         .recv_data()
@@ -98,6 +149,20 @@ async fn handle_request(
         .context("failed to read the HTTP/3 request body")?
     {
         let length = chunk.remaining();
+        if (body.len() as u64).saturating_add(length as u64) > state.max_request_body_bytes {
+            event!(
+                Level::WARN,
+                limit = state.max_request_body_bytes,
+                "rejecting streamed HTTP/3 request body over the limit"
+            );
+            reject(
+                &mut stream,
+                StatusCode::PAYLOAD_TOO_LARGE,
+                "Payload Too Large",
+            )
+            .await?;
+            return Ok(());
+        }
         let data = chunk.copy_to_bytes(length);
         body.extend_from_slice(&data);
     }

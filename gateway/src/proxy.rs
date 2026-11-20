@@ -1,22 +1,21 @@
 //! HTTP reverse proxy.
 
-use std::{convert::Infallible, error::Error, net::SocketAddr, sync::Arc, time::Duration};
+use std::{convert::Infallible, net::SocketAddr, sync::Arc, time::Duration};
 
 use anyhow::Context;
 use bytes::Bytes;
 use http::{
     HeaderMap, HeaderName, HeaderValue, Request, Response, StatusCode, Uri, Version, header,
 };
-use http_body_util::{BodyExt, Full, combinators::BoxBody};
+use http_body_util::{BodyExt, Full, Limited};
 use hyper::body::Incoming;
 use tracing::{Level, event};
 
 use crate::access;
 use crate::cache::{CacheConfig, CachedResponse};
-use crate::state::{AppState, Backend, MatchContext};
+use crate::state::{AppState, Backend, BoxError, GatewayBody, MatchContext};
 
-pub type ProxyBody = BoxBody<Bytes, Box<dyn Error + Send + Sync>>;
-type BoxError = Box<dyn Error + Send + Sync>;
+pub type ProxyBody = GatewayBody;
 
 /// A fully buffered request, used by the HTTP/3 path.
 pub struct BufferedRequest {
@@ -99,6 +98,30 @@ pub async fn handle(
     request_log.remote_addr = client_ip.to_string();
     request_log.website_id = Some(site.id.clone());
 
+    if let Some(length) = request
+        .headers()
+        .get(header::CONTENT_LENGTH)
+        .and_then(|value| value.to_str().ok())
+        .and_then(|value| value.parse::<u64>().ok())
+        && length > state.max_request_body_bytes
+    {
+        event!(
+            Level::WARN,
+            length,
+            limit = state.max_request_body_bytes,
+            "request body exceeds the configured limit"
+        );
+        log_event(
+            &state,
+            &request_log,
+            StatusCode::PAYLOAD_TOO_LARGE,
+            &HeaderMap::new(),
+            Some(15),
+            request_version,
+        );
+        return text_response(StatusCode::PAYLOAD_TOO_LARGE, "Payload Too Large", &state);
+    }
+
     let cache_lookup_key = cache_key_for(&raw_host, request.uri());
     let request_cacheable = method_label == "GET"
         && site.cache.enabled
@@ -172,7 +195,8 @@ pub async fn handle(
         .apply(&mut headers, &raw_host, scheme, client_ip);
 
     let method = request.method().clone();
-    let body = request.into_body();
+    let body_limit = usize::try_from(state.max_request_body_bytes).unwrap_or(usize::MAX);
+    let body = Limited::new(request.into_body(), body_limit).boxed();
 
     let mut upstream_request = match Request::builder()
         .method(method)
@@ -261,12 +285,25 @@ pub async fn handle(
         response_headers.insert(HeaderName::from_static("x-webgateway-node"), value);
     }
 
+    // Only buffer responses whose declared size fits the cache and the global
+    // response limit. Chunked (unknown-length) responses stream uncached, which
+    // also fixes the previous "collect first, check later" behaviour.
+    let declared_length = response_headers
+        .get(header::CONTENT_LENGTH)
+        .and_then(|value| value.to_str().ok())
+        .and_then(|value| value.parse::<u64>().ok());
+    let response_limit = site.cache.max_entry_size.min(state.max_response_body_bytes);
     let cacheable = request_cacheable
         && status == StatusCode::OK
-        && response_cacheable(&response_headers, &site.cache);
+        && response_cacheable(&response_headers, &site.cache)
+        && declared_length.is_some_and(|length| length <= response_limit);
 
     if cacheable {
-        let bytes = match upstream_response.into_body().collect().await {
+        let limit = usize::try_from(response_limit).unwrap_or(usize::MAX);
+        let bytes = match Limited::new(upstream_response.into_body(), limit)
+            .collect()
+            .await
+        {
             Ok(body) => body.to_bytes(),
             Err(error) => {
                 event!(Level::WARN, %error, "failed to read the cacheable upstream body");
@@ -282,7 +319,7 @@ pub async fn handle(
             }
         };
 
-        if bytes.len() as u64 <= site.cache.max_entry_size {
+        if bytes.len() as u64 <= response_limit {
             let etag = response_headers
                 .get(header::ETAG)
                 .and_then(|value| value.to_str().ok())
@@ -489,10 +526,19 @@ pub async fn handle_buffered(
         response_headers.insert(HeaderName::from_static("x-webgateway-node"), value);
     }
 
-    let response_body = match upstream_response.into_body().collect().await {
+    let response_limit = usize::try_from(state.max_response_body_bytes).unwrap_or(usize::MAX);
+    let response_body = match Limited::new(upstream_response.into_body(), response_limit)
+        .collect()
+        .await
+    {
         Ok(body) => body.to_bytes(),
         Err(error) => {
-            event!(Level::WARN, %error, "failed to read the buffered upstream body");
+            event!(
+                Level::WARN,
+                %error,
+                limit = state.max_response_body_bytes,
+                "buffered upstream body exceeds the limit or failed to read"
+            );
             return buffered_error(
                 &state,
                 &request_log,

@@ -247,3 +247,27 @@
   登录限速为单实例内存计数。
 - 测试：gateway 36、dashboard 10、shared 14 + 3 集成；clippy/fmt 通过。
 - 文档：`database.md` schema v6、`issue.md` B-05/B-06/B-29 更新、F-47/F-48 新增。
+
+### 资源上限：请求体 / header / 连接数（分支 `feat/limits-hardening`）
+- 配置新增（`gateway/config.example.toml`）：
+  - `max_connections`（默认 4096）：TCP 监听共享信号量，超限直接关闭新连接并 WARN；
+  - `max_header_bytes`（默认 32 KiB，最小 8 KiB）：HTTP/1 `max_buf_size` +
+    HTTP/2 `max_header_list_size`；
+  - `max_request_body_bytes`（默认 64 MiB）：Content-Length 超限转发前 413，
+    chunked/无长度用 `Limited` 包装；
+  - `max_response_body_bytes`（默认 64 MiB）：缓存与 HTTP/3 缓冲上限。
+  - 均支持环境变量 `GATEWAY_MAX_*`。
+- 上游 client body 类型改为 boxed body，使请求体可被 `Limited` 包装（不再只能接受 `Incoming`）。
+- 缓存修复：仅在响应带 `Content-Length` 且不超过
+  `min(cache.max_entry_size, max_response_body_bytes)` 时收集；chunked 响应流式转发、不缓存
+  （不再先完整 collect 再判断）。
+- HTTP/3：请求体超过上限返回 413（声明/流式累计均检查）；`handle_buffered` 响应超过上限返回 502；
+  h3 仍不接入缓存。
+- 实测（max_connections=1，max_header_bytes=8192，max_request_body=1024）：
+  - 2 KB body → **413 Payload Too Large**；512 B body 正常转发到后端（后端返回 501 属预期）；
+  - 20 KB header → **431**；
+  - 并发两个请求时第二个被丢弃（curl exit 56），第一个 3 s 慢请求正常 200；
+  - 开启站点缓存后首次 MISS（3.0 s），第二次 HIT（0.001 s）→ 缓存未被破坏。
+- 限制：站点级覆盖/超时/HTTP/3 连接计数未做；h3 仍无流式与缓存；h3 在途请求不参与停机 drain。
+- 测试：gateway 36、dashboard 10、shared 14 + 3 集成；clippy/fmt 通过。
+- 文档：`gateway.md` 2.1 资源限制、5.3 HTTP/3；`issue.md` B-04/B-09/B-11、F-49/F-50。

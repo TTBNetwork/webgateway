@@ -38,6 +38,14 @@ bind = "0.0.0.0"
 ports = [80, 443]
 # UDP；为空不启动 HTTP/3
 http3_ports = [443]
+# 所有监听端口共享的并发连接上限
+max_connections = 4096
+# HTTP/1 读缓冲 / HTTP/2 header list 上限
+max_header_bytes = 32768
+# 请求体上限（声明 Content-Length 或流式累计）
+max_request_body_bytes = 67108864
+# 缓存/HTTP/3 响应缓冲上限
+max_response_body_bytes = 67108864
 
 [upstream_tls]
 # 额外的 PEM CA，用于 https 后端；webpki 根证书始终受信
@@ -53,6 +61,24 @@ http3_ports = [443]
 | `GATEWAY_HTTP3_PORTS` | 逗号分隔的 UDP 端口（HTTP/3） |
 | `GATEWAY_UPSTREAM_CA_FILE` | https 后端的额外 CA PEM |
 | `GATEWAY_BIND` | 监听地址 |
+| `GATEWAY_MAX_CONNECTIONS` | 并发连接上限 |
+| `GATEWAY_MAX_HEADER_BYTES` | header 上限（最小 8192） |
+| `GATEWAY_MAX_REQUEST_BODY` | 请求体上限 |
+| `GATEWAY_MAX_RESPONSE_BODY` | 响应缓冲上限 |
+
+### 2.1 资源限制
+
+- **连接数**：TCP 监听共享一个 `max_connections` 信号量；超出时新连接被直接关闭并 WARN，
+  不进入 TLS/HTTP 处理。HTTP/3 连接暂未计入。
+- **Header**：HTTP/1 使用 hyper `max_buf_size`，HTTP/2 使用 `max_header_list_size`；
+  超限由 hyper 返回 431 或断开。HTTP/3 header 未单独限制。
+- **请求体**：有 `Content-Length` 且超过 `max_request_body_bytes` 时，网关在转发前返回
+  **413 Payload Too Large**；chunked/无长度请求用 `Limited` 包装，达到上限后上游请求失败
+  （客户端看到 502/连接错误），不会无限缓冲。
+- **响应体**：缓存只在响应带 `Content-Length` 且不超过
+  `min(cache.max_entry_size, max_response_body_bytes)` 时启用；chunked 响应直接流式转发、不缓存。
+  HTTP/3 的响应仍完整缓冲，超过 `max_response_body_bytes` 返回 502。
+- **缓存**：HTTP/3 仍不接入缓存（请求走 `handle_buffered`）；HTTP/1/2 缓存行为不变。
 
 ## 3. 路由
 
@@ -174,9 +200,11 @@ http3_ports = [443]
 - 需要显式开启：`[server].http3_ports` 或 `GATEWAY_HTTP3_PORTS`（UDP）；为空不启动。
 - QUIC 使用 TLS 1.3 + ALPN `h3`，证书复用 TLS 的 SNI 存储（含默认自签证书）。
 - 请求体完整缓冲后，通过内部 HTTP/1.1 buffered client 转发上游；响应体也完整缓冲后发送。
+- 请求体超过 `max_request_body_bytes` 返回 **413**（声明 Content-Length 或流式累计均检查）；
+  响应超过 `max_response_body_bytes` 返回 502。
 - 访问日志记录 `HTTP/3.0`；`get_request_ip` 的 raw/XFF 模式可用，PROXY protocol 不适用。
-- 限制：无流式请求/响应（大 body 占内存）；每个请求独立 spawn、可并发处理；
-  WebSocket / gRPC over h3 未实现；未调 0-RTT / 连接迁移。
+- 限制：仍无流式请求/响应；h3 不走缓存；WebSocket / gRPC over h3 未实现；
+  优雅停机不 drain h3 在途请求；未调 0-RTT / 连接迁移。
 
 ### 5.4 缓存
 

@@ -40,6 +40,14 @@ pub struct ServerConfig {
     pub http3_ports: Vec<u16>,
     /// Global in-memory cache limit in bytes.
     pub cache_max_size_bytes: u64,
+    /// Maximum concurrently served TCP connections across all listeners.
+    pub max_connections: usize,
+    /// Maximum HTTP/1 header buffer and HTTP/2 header-list size.
+    pub max_header_bytes: usize,
+    /// Maximum declared/streamed request body size.
+    pub max_request_body_bytes: u64,
+    /// Maximum response body buffered for caching or HTTP/3 delivery.
+    pub max_response_body_bytes: u64,
 }
 
 impl Default for ServerConfig {
@@ -49,6 +57,10 @@ impl Default for ServerConfig {
             ports: vec![80, 443],
             http3_ports: Vec::new(),
             cache_max_size_bytes: 16 * 1024 * 1024,
+            max_connections: 4096,
+            max_header_bytes: 32 * 1024,
+            max_request_body_bytes: 64 * 1024 * 1024,
+            max_response_body_bytes: 64 * 1024 * 1024,
         }
     }
 }
@@ -92,6 +104,28 @@ impl Config {
         {
             config.server.cache_max_size_bytes = bytes;
         }
+        overlay_usize(
+            "GATEWAY_MAX_CONNECTIONS",
+            &mut config.server.max_connections,
+        );
+        overlay_usize(
+            "GATEWAY_MAX_HEADER_BYTES",
+            &mut config.server.max_header_bytes,
+        );
+        overlay_u64(
+            "GATEWAY_MAX_REQUEST_BODY",
+            &mut config.server.max_request_body_bytes,
+        );
+        overlay_u64(
+            "GATEWAY_MAX_RESPONSE_BODY",
+            &mut config.server.max_response_body_bytes,
+        );
+
+        // Keep values in a range the server/builder can actually use.
+        config.server.max_connections = config.server.max_connections.max(1);
+        config.server.max_header_bytes = config.server.max_header_bytes.max(8192);
+        config.server.max_request_body_bytes = config.server.max_request_body_bytes.max(1024);
+        config.server.max_response_body_bytes = config.server.max_response_body_bytes.max(1024);
 
         if config.database.url.trim().is_empty() {
             bail!(
@@ -106,5 +140,21 @@ impl Config {
 fn overlay_string(key: &str, target: &mut Option<String>) {
     if let Ok(value) = std::env::var(key) {
         *target = Some(value);
+    }
+}
+
+fn overlay_usize(key: &str, target: &mut usize) {
+    if let Ok(raw) = std::env::var(key)
+        && let Ok(value) = raw.trim().parse::<usize>()
+    {
+        *target = value;
+    }
+}
+
+fn overlay_u64(key: &str, target: &mut u64) {
+    if let Ok(raw) = std::env::var(key)
+        && let Ok(value) = raw.trim().parse::<u64>()
+    {
+        *target = value;
     }
 }

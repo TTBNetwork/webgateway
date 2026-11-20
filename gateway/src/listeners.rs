@@ -16,7 +16,7 @@ use hyper::service::service_fn;
 use hyper_util::rt::{TokioExecutor, TokioIo};
 use tokio::{
     net::{TcpListener, TcpStream},
-    sync::watch,
+    sync::{Semaphore, watch},
     task::JoinHandle,
 };
 use tracing::{Level, event};
@@ -68,16 +68,20 @@ pub struct Listeners {
     tasks: HashMap<u16, JoinHandle<()>>,
     shutdown: watch::Sender<bool>,
     inflight: Inflight,
+    connections: Arc<Semaphore>,
+    max_header_bytes: usize,
 }
 
 impl Listeners {
-    pub fn new(bind: IpAddr) -> Self {
+    pub fn new(bind: IpAddr, max_connections: usize, max_header_bytes: usize) -> Self {
         let (shutdown, _) = watch::channel(false);
         Self {
             bind,
             tasks: HashMap::new(),
             shutdown,
             inflight: Inflight::default(),
+            connections: Arc::new(Semaphore::new(max_connections.max(1))),
+            max_header_bytes,
         }
     }
 
@@ -102,8 +106,20 @@ impl Listeners {
             let port = *port;
             let shutdown = self.shutdown.subscribe();
             let inflight = self.inflight.clone();
+            let connections = self.connections.clone();
+            let max_header_bytes = self.max_header_bytes;
             let handle = tokio::spawn(async move {
-                if let Err(error) = serve_port(bind, port, state, shutdown, inflight).await {
+                if let Err(error) = serve_port(
+                    bind,
+                    port,
+                    state,
+                    shutdown,
+                    inflight,
+                    connections,
+                    max_header_bytes,
+                )
+                .await
+                {
                     event!(Level::ERROR, port, %error, "listener stopped");
                 }
             });
@@ -141,6 +157,8 @@ async fn serve_port(
     state: Arc<AppState>,
     mut shutdown: watch::Receiver<bool>,
     inflight: Inflight,
+    connections: Arc<Semaphore>,
+    max_header_bytes: usize,
 ) -> anyhow::Result<()> {
     let listener = TcpListener::bind(SocketAddr::new(bind, port))
         .await
@@ -163,11 +181,25 @@ async fn serve_port(
             }
         };
 
+        let permit = match connections.clone().try_acquire_owned() {
+            Ok(permit) => permit,
+            Err(_) => {
+                event!(
+                    Level::WARN,
+                    port,
+                    "connection limit reached; dropping new connection"
+                );
+                drop(stream);
+                continue;
+            }
+        };
+
         let state = state.clone();
         let guard = inflight.enter();
         tokio::spawn(async move {
+            let _permit = permit;
             let _guard = guard;
-            if let Err(error) = handle_connection(state, stream, peer).await {
+            if let Err(error) = handle_connection(state, stream, peer, max_header_bytes).await {
                 event!(Level::DEBUG, %peer, %error, "connection closed with an error");
             }
         });
@@ -178,6 +210,7 @@ async fn handle_connection(
     state: Arc<AppState>,
     mut stream: TcpStream,
     peer: SocketAddr,
+    max_header_bytes: usize,
 ) -> anyhow::Result<()> {
     let proxy = proxy_protocol::read_header(&mut stream)
         .await
@@ -198,9 +231,9 @@ async fn handle_connection(
             .accept(stream)
             .await
             .context("TLS handshake failed")?;
-        serve(state, stream, peer, "https", proxy.source).await
+        serve(state, stream, peer, "https", proxy.source, max_header_bytes).await
     } else {
-        serve(state, stream, peer, "http", proxy.source).await
+        serve(state, stream, peer, "http", proxy.source, max_header_bytes).await
     }
 }
 
@@ -210,6 +243,7 @@ async fn serve<S>(
     peer: SocketAddr,
     scheme: &'static str,
     proxy_source: Option<SocketAddr>,
+    max_header_bytes: usize,
 ) -> anyhow::Result<()>
 where
     S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send + 'static,
@@ -222,7 +256,12 @@ where
         }
     });
 
-    hyper_util::server::conn::auto::Builder::new(TokioExecutor::new())
+    let mut builder = hyper_util::server::conn::auto::Builder::new(TokioExecutor::new());
+    builder.http1().max_buf_size(max_header_bytes);
+    builder
+        .http2()
+        .max_header_list_size(u32::try_from(max_header_bytes).unwrap_or(u32::MAX));
+    builder
         .serve_connection_with_upgrades(TokioIo::new(io), service)
         .await
         .map_err(|error| anyhow::anyhow!("HTTP connection failed: {error}"))?;
