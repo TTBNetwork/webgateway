@@ -49,7 +49,7 @@ const zh = {
   'login.submit': '进入控制台',
   'login.submitting': '验证中…',
   'login.hint':
-    '首次启动时主控会创建默认管理员并把 TOTP secret 打印到日志；在验证器中添加后输入 6 位码。JWT 仅保存在当前浏览器。',
+    '首次启动时主控会创建默认管理员并把 TOTP secret 打印到日志；在验证器中添加后输入 6 位码。会话保存在 HttpOnly Cookie 中，脚本无法读取。',
   'login.required': '请输入用户名和 TOTP 验证码。',
   'login.invalid': '登录失败：',
 
@@ -193,15 +193,16 @@ const zh = {
   'logs.readonly': '实时明细来自 access_request_logs / access_response_logs。',
 
   'settings.title': '设置',
-  'settings.subtitle': '本地外观、令牌与实例信息。',
+  'settings.subtitle': '本地外观、会话与实例信息。',
   'settings.appearance': '外观',
   'settings.language': '语言',
   'settings.theme': '主题',
   'settings.security': '账号与会话',
   'settings.account': '账号',
   'settings.role': '角色',
-  'settings.token': '本地会话',
-  'settings.tokenHint': '登录使用用户名 + TOTP；JWT 仅保存在当前浏览器。退出会清除本地会话。',
+  'settings.token': '会话存储',
+  'settings.tokenHint':
+    '登录使用用户名 + TOTP；JWT 只保存在 HttpOnly、SameSite=Strict 的 Cookie 中，脚本无法读取。退出会同时在服务端撤销会话。',
   'settings.saveToken': '保存令牌',
   'settings.tokenSaved': '令牌已更新。',
   'settings.signOut': '退出登录',
@@ -210,8 +211,8 @@ const zh = {
   'settings.schema': '数据库 schema',
   'settings.version': '面板版本',
   'settings.api': 'API 基址',
-  'settings.tokenStored': '已配置本地令牌',
-  'settings.tokenMissing': '未配置本地令牌',
+  'settings.tokenStored': 'HttpOnly Cookie（脚本不可读）',
+  'settings.tokenMissing': '未登录',
 
   'notFound.title': '页面不存在',
   'notFound.message': '这个地址没有对应的控制台页面。',
@@ -269,7 +270,7 @@ const en: Record<MessageKey, string> = {
   'login.submit': 'Open console',
   'login.submitting': 'Verifying…',
   'login.hint':
-    'On first start the master creates a default admin and prints its TOTP secret in the logs. Add it to an authenticator, then enter the 6-digit code. The JWT stays in this browser.',
+    'On first start the master creates a default admin and prints its TOTP secret in the logs. Add it to an authenticator, then enter the 6-digit code. The session is kept in an HttpOnly cookie that scripts cannot read.',
   'login.required': 'Enter a username and TOTP code.',
   'login.invalid': 'Sign-in failed: ',
 
@@ -417,16 +418,16 @@ const en: Record<MessageKey, string> = {
   'logs.readonly': 'Live records come from access_request_logs / access_response_logs.',
 
   'settings.title': 'Settings',
-  'settings.subtitle': 'Local appearance, token and instance info.',
+  'settings.subtitle': 'Local appearance, session and instance info.',
   'settings.appearance': 'Appearance',
   'settings.language': 'Language',
   'settings.theme': 'Theme',
   'settings.security': 'Account & session',
   'settings.account': 'Account',
   'settings.role': 'Role',
-  'settings.token': 'Local session',
+  'settings.token': 'Session storage',
   'settings.tokenHint':
-    'Sign-in uses a username + TOTP; the JWT stays in this browser. Signing out clears the local session.',
+    'Sign-in uses a username + TOTP. The JWT only travels in an HttpOnly, SameSite=Strict cookie that scripts cannot read; signing out also revokes it server-side.',
   'settings.saveToken': 'Save token',
   'settings.tokenSaved': 'Token updated.',
   'settings.signOut': 'Sign out',
@@ -435,8 +436,8 @@ const en: Record<MessageKey, string> = {
   'settings.schema': 'Database schema',
   'settings.version': 'Panel version',
   'settings.api': 'API base',
-  'settings.tokenStored': 'Local token configured',
-  'settings.tokenMissing': 'No local token',
+  'settings.tokenStored': 'HttpOnly cookie (not readable by scripts)',
+  'settings.tokenMissing': 'Not signed in',
 
   'notFound.title': 'Page not found',
   'notFound.message': 'This address does not map to a console page.',

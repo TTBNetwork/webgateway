@@ -6,58 +6,22 @@ export interface SessionUser {
   role: string
 }
 
-const TOKEN_KEY = 'wg.token'
-const USER_KEY = 'wg.user'
-
-function readToken(): string {
-  try {
-    return localStorage.getItem(TOKEN_KEY) ?? ''
-  } catch {
-    return ''
-  }
-}
-
-function readUser(): SessionUser | null {
-  try {
-    const raw = localStorage.getItem(USER_KEY)
-    if (!raw) return null
-    const parsed = JSON.parse(raw) as Partial<SessionUser>
-    if (
-      typeof parsed.id === 'string' &&
-      typeof parsed.username === 'string' &&
-      typeof parsed.role === 'string'
-    ) {
-      return { id: parsed.id, username: parsed.username, role: parsed.role }
-    }
-    return null
-  } catch {
-    return null
-  }
-}
-
-export const session = reactive<{ token: string; user: SessionUser | null }>({
-  token: readToken(),
-  user: readUser(),
+/**
+ * The session JWT is stored in an HttpOnly cookie by the API, so scripts cannot
+ * read it. The panel only keeps the authenticated user in memory and restores
+ * it with GET /api/auth/me on boot.
+ */
+export const session = reactive<{ user: SessionUser | null; ready: boolean }>({
+  user: null,
+  ready: false,
 })
 
-export function setSession(token: string, user: SessionUser): void {
-  session.token = token
+export function setSession(user: SessionUser): void {
   session.user = user
-  try {
-    localStorage.setItem(TOKEN_KEY, token)
-    localStorage.setItem(USER_KEY, JSON.stringify(user))
-  } catch {
-    // Storage can be unavailable in private mode; the in-memory session still works.
-  }
+  session.ready = true
 }
 
-export function clearToken(): void {
-  session.token = ''
+export function clearSession(): void {
   session.user = null
-  try {
-    localStorage.removeItem(TOKEN_KEY)
-    localStorage.removeItem(USER_KEY)
-  } catch {
-    // Ignore storage errors.
-  }
+  session.ready = true
 }

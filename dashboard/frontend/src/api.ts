@@ -1,4 +1,4 @@
-import { clearToken, session, type SessionUser } from './session'
+import { clearSession, type SessionUser } from './session'
 import { navigate } from './router'
 
 export interface TrafficPoint {
@@ -121,8 +121,8 @@ export interface AccessLog {
 }
 
 export interface LoginResponse {
-  token: string
   user: SessionUser
+  expires_in: number
 }
 
 interface Items<T> {
@@ -140,18 +140,20 @@ async function errorText(response: Response): Promise<string> {
 
 async function send<T>(path: string, method: string, body?: unknown): Promise<T> {
   const headers: Record<string, string> = {}
-  if (session.token) headers.Authorization = 'Bearer ' + session.token
   if (body !== undefined) headers['Content-Type'] = 'application/json'
 
+  // The session travels in an HttpOnly cookie, which the browser attaches to
+  // same-origin requests automatically; no token is kept in JavaScript.
   const response = await fetch('/api/' + path, {
     method,
     headers,
+    credentials: 'same-origin',
     cache: 'no-store',
     body: body === undefined ? undefined : JSON.stringify(body),
   })
 
   if (response.status === 401) {
-    clearToken()
+    clearSession()
     navigate('/login')
     throw new Error('Unauthorized')
   }
@@ -170,6 +172,7 @@ async function login(username: string, code: string): Promise<LoginResponse> {
   const response = await fetch('/api/auth/login', {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
+    credentials: 'same-origin',
     body: JSON.stringify({ username, code }),
   })
   if (!response.ok) {

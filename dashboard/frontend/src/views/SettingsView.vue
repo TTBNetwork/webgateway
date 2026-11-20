@@ -3,10 +3,10 @@ import AppIcon from '../components/AppIcon.vue'
 import { t } from '../i18n'
 import { prefs } from '../prefs'
 import { navigate } from '../router'
-import { clearToken, session } from '../session'
+import { clearSession, session } from '../session'
 
 function signOut(): void {
-  clearToken()
+  clearSession()
   navigate('/login')
 }
 
@@ -135,7 +135,7 @@ function setLocale(locale: 'zh' | 'en'): void {
           </div>
           <div>
             <dt>{{ t('settings.token') }}</dt>
-            <dd>{{ session.token ? t('settings.tokenStored') : t('settings.tokenMissing') }}</dd>
+            <dd>{{ session.user ? t('settings.tokenStored') : t('settings.tokenMissing') }}</dd>
           </div>
         </dl>
       </section>

@@ -13,7 +13,7 @@ import { api } from '../api'
 import { t, type MessageKey } from '../i18n'
 import { prefs } from '../prefs'
 import { navigate, route } from '../router'
-import { clearToken, session } from '../session'
+import { clearSession, session } from '../session'
 
 interface NavItem {
   path: string
@@ -67,9 +67,9 @@ async function logout(): Promise<void> {
   try {
     await api.logout()
   } catch {
-    // The token may already be invalid; clearing the local session is enough.
+    // The session may already be invalid; dropping the local state is enough.
   }
-  clearToken()
+  clearSession()
   navigate('/login')
 }
 </script>

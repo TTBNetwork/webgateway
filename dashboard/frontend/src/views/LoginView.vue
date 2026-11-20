@@ -23,7 +23,7 @@ async function submit(): Promise<void> {
   error.value = ''
   try {
     const result = await api.login(username.value.trim(), code.value.trim())
-    setSession(result.token, result.user)
+    setSession(result.user)
     navigate('/')
   } catch (reason) {
     error.value = t('login.invalid') + ' ' + errorMessage(reason)

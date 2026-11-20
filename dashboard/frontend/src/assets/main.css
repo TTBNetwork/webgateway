@@ -1403,6 +1403,13 @@ tbody tr:hover {
   }
 }
 
+.boot-screen {
+  display: grid;
+  place-items: center;
+  min-height: 100vh;
+  background: var(--bg);
+}
+
 @media (prefers-reduced-motion: reduce) {
   *,
   *::before,
