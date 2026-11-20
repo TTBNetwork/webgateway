@@ -4,18 +4,16 @@ import AppIcon from '../components/AppIcon.vue'
 import EmptyState from '../components/EmptyState.vue'
 import GeoMap from '../components/GeoMap.vue'
 import QpsPanel from '../components/QpsPanel.vue'
-import StatCard from '../components/StatCard.vue'
 import TrafficChart from '../components/TrafficChart.vue'
 import { api, type GeoSummary, type Summary } from '../api'
 import { errorMessage, formatBytes, formatNumber } from '../format'
 import { t } from '../i18n'
 
-interface Card {
+interface Metric {
   label: string
   value: string
-  hint: string
-  icon: string
-  tone: 'default' | 'accent' | 'success' | 'warning' | 'danger'
+  hint?: string
+  tone?: 'warning' | 'danger'
 }
 
 const summary = ref<Summary | null>(null)
@@ -23,55 +21,87 @@ const geo = ref<GeoSummary | null>(null)
 const loading = ref(false)
 const error = ref('')
 
-const cards = computed<Card[]>(() => {
+const rates = computed(() => {
+  const data = summary.value
+  if (!data) return { backend: 0, e4xx: 0, e5xx: 0 }
+  const total = data.requests_today
+  const percent = (count: number) => (total > 0 ? (count / total) * 100 : 0)
+  return {
+    backend: percent(data.backend_errors_today),
+    e4xx: percent(data.e4xx_today),
+    e5xx: percent(data.e5xx_today),
+  }
+})
+
+// v1's statistics page groups two numbers per panel and uses total requests as
+// the denominator for all error rates.
+const metricGroups = computed<Metric[][]>(() => {
   const data = summary.value
   if (!data) return []
-  const rate4 = data.responses_today > 0 ? (data.e4xx_today / data.responses_today) * 100 : 0
-  const rate5 = data.responses_today > 0 ? (data.e5xx_today / data.responses_today) * 100 : 0
-
   return [
-    {
-      label: t('dashboard.requestCount'),
-      value: formatNumber(data.requests_today),
-      hint: t('dashboard.today'),
-      icon: 'logs',
-      tone: 'default' as const,
-    },
-    {
-      label: t('dashboard.pv'),
-      value: formatNumber(data.responses_today),
-      hint: t('dashboard.pvHint'),
-      icon: 'websites',
-      tone: 'default' as const,
-    },
-    {
-      label: t('dashboard.uv'),
-      value: formatNumber(data.uv_today),
-      hint: t('dashboard.uvHint'),
-      icon: 'users',
-      tone: 'default' as const,
-    },
-    {
-      label: t('dashboard.uniqueIPs'),
-      value: formatNumber(data.unique_ips_today),
-      hint: t('dashboard.ipHint'),
-      icon: 'gateways',
-      tone: 'default' as const,
-    },
-    {
-      label: t('dashboard.e4xxCount'),
-      value: formatNumber(data.e4xx_today),
-      hint: t('dashboard.errorRateHint', { rate: rate4.toFixed(2) + '%' }),
-      icon: 'alert',
-      tone: data.e4xx_today > 0 ? ('warning' as const) : ('success' as const),
-    },
-    {
-      label: t('dashboard.e5xxCount'),
-      value: formatNumber(data.e5xx_today),
-      hint: t('dashboard.errorRateHint', { rate: rate5.toFixed(2) + '%' }),
-      icon: 'alert',
-      tone: data.e5xx_today > 0 ? ('danger' as const) : ('success' as const),
-    },
+    [
+      {
+        label: t('dashboard.requestCount'),
+        value: formatNumber(data.requests_today),
+        hint: t('dashboard.today'),
+      },
+      {
+        label: t('dashboard.uniqueIPs'),
+        value: formatNumber(data.unique_ips_today),
+        hint: t('dashboard.ipHint'),
+      },
+    ],
+    [
+      {
+        label: t('dashboard.backendErrors'),
+        value: formatNumber(data.backend_errors_today),
+        hint: t('dashboard.backendErrorHint'),
+        tone: data.backend_errors_today > 0 ? 'danger' : undefined,
+      },
+      {
+        label: t('dashboard.backendErrorRate'),
+        value: rates.value.backend.toFixed(2) + '%',
+        hint: t('dashboard.rateOfRequests'),
+        tone: rates.value.backend > 0 ? 'danger' : undefined,
+      },
+    ],
+    [
+      {
+        label: t('dashboard.e4xxCount'),
+        value: formatNumber(data.e4xx_today),
+        hint: t('dashboard.rateOfRequests'),
+        tone: data.e4xx_today > 0 ? 'warning' : undefined,
+      },
+      {
+        label: t('dashboard.e4xxRate'),
+        value: rates.value.e4xx.toFixed(2) + '%',
+        hint: t('dashboard.rateOfRequests'),
+        tone: rates.value.e4xx > 0 ? 'warning' : undefined,
+      },
+    ],
+    [
+      {
+        label: t('dashboard.e5xxCount'),
+        value: formatNumber(data.e5xx_today),
+        hint: t('dashboard.rateOfRequests'),
+        tone: data.e5xx_today > 0 ? 'danger' : undefined,
+      },
+      {
+        label: t('dashboard.e5xxRate'),
+        value: rates.value.e5xx.toFixed(2) + '%',
+        hint: t('dashboard.rateOfRequests'),
+        tone: rates.value.e5xx > 0 ? 'danger' : undefined,
+      },
+    ],
+  ]
+})
+
+const byteCards = computed<Metric[]>(() => {
+  const data = summary.value
+  if (!data) return []
+  return [
+    { label: t('dashboard.requestSize'), value: formatBytes(data.requests_size_today) },
+    { label: t('dashboard.responseSize'), value: formatBytes(data.response_size_today) },
   ]
 })
 
@@ -124,16 +154,31 @@ onMounted(() => {
     <div v-if="!summary && loading" class="loading">{{ t('common.loading') }}…</div>
 
     <template v-if="summary">
-      <section class="stat-grid">
-        <StatCard
-          v-for="card in cards"
-          :key="card.label"
-          :label="card.label"
-          :value="card.value"
-          :hint="card.hint"
-          :icon="card.icon"
-          :tone="card.tone"
-        />
+      <section class="v1-metrics">
+        <div class="v1-metric-grid">
+          <article
+            v-for="(group, groupIndex) in metricGroups"
+            :key="groupIndex"
+            class="v1-metric-card"
+          >
+            <div v-for="metric in group" :key="metric.label" class="v1-metric-cell">
+              <span class="stat-label">{{ metric.label }}</span>
+              <strong class="v1-metric-value" :class="metric.tone ? 'text-' + metric.tone : ''">
+                {{ metric.value }}
+              </strong>
+              <span v-if="metric.hint" class="stat-hint">{{ metric.hint }}</span>
+            </div>
+          </article>
+        </div>
+
+        <div class="v1-byte-stack">
+          <article v-for="metric in byteCards" :key="metric.label" class="v1-metric-card single">
+            <div class="v1-metric-cell">
+              <span class="stat-label">{{ metric.label }}</span>
+              <strong class="v1-metric-value">{{ metric.value }}</strong>
+            </div>
+          </article>
+        </div>
       </section>
 
       <section class="dashboard-map-grid">

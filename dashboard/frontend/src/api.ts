@@ -44,7 +44,7 @@ export interface Summary {
   responses_today: number
   e4xx_today: number
   e5xx_today: number
-  uv_today: number
+  backend_errors_today: number
   unique_ips_today: number
   requests_size_today: string
   response_size_today: string
