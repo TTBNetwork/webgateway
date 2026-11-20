@@ -1,6 +1,7 @@
 <script setup lang="ts">
 import { computed, ref, watch } from 'vue'
 import AppIcon from '../components/AppIcon.vue'
+import NavIcon from '../components/NavIcon.vue'
 import CertificatesView from '../views/CertificatesView.vue'
 import DashboardView from '../views/DashboardView.vue'
 import DnsProvidersView from '../views/DnsProvidersView.vue'
@@ -151,7 +152,7 @@ async function logout(): Promise<void> {
   <div class="app-shell">
     <aside class="sidebar" :class="{ 'is-open': menuOpen }">
       <button class="brand" type="button" @click="go('/')">
-        <span class="brand-mark">WG</span>
+        <span class="brand-mark"><NavIcon name="shield" :size="20" /></span>
         <span class="brand-text">
           <strong>{{ t('app.name') }}</strong>
           <small>{{ t('app.tagline') }}</small>
@@ -168,7 +169,7 @@ async function logout(): Promise<void> {
             :aria-current="route.path === firstItem(group).path ? 'page' : undefined"
             @click="go(firstItem(group).path)"
           >
-            <AppIcon :name="group.icon" :size="19" />
+            <NavIcon :name="group.icon" :size="18" />
             <span>{{ t(group.key) }}</span>
           </button>
 
@@ -180,7 +181,7 @@ async function logout(): Promise<void> {
               :aria-expanded="openMenu === group.key"
               @click="toggleGroup(group.key)"
             >
-              <AppIcon :name="group.icon" :size="19" />
+              <NavIcon :name="group.icon" :size="18" />
               <span>{{ t(group.key) }}</span>
               <AppIcon class="nav-caret" name="chevron" :size="14" />
             </button>
@@ -226,8 +227,11 @@ async function logout(): Promise<void> {
         </button>
 
         <div class="topbar-title">
-          <p class="eyebrow">{{ t('app.name') }}</p>
-          <h1>{{ activeGroup ? t(activeGroup) : t('app.name') }}</h1>
+          <p class="breadcrumb">
+            <span class="breadcrumb-root">{{ t('app.name') }}</span>
+            <span class="breadcrumb-sep">/</span>
+            <strong>{{ activeGroup ? t(activeGroup) : t('app.name') }}</strong>
+          </p>
         </div>
 
         <div class="topbar-actions">

@@ -549,3 +549,13 @@
 - 校验：Rust 27/53/19+3 测试通过，clippy/fmt 通过；前端 format/lint/type-check/build 通过；
   目标机新面板加载、from_env 拒绝、无 provider/跨 zone 错误、流式日志大小、Proxmox 200 均已实测。
 
+### Chaitin SafeLine 风格主题与布局（2026-11-20）
+- 参考 https://demo.waf-ce.chaitin.cn:9443/ 的视觉：近黑背景、暖米色主色、细线图标、扁平卡片、
+  左侧填充式选中菜单、顶部面包屑。
+- 主题：主色改为 #f4d1b4 / #ebbb97；按钮、选中菜单、Segment 改为米色填充 + 深色文字；
+  卡片改为无模糊、细边框的扁平表面；登录页光晕同步改为暖色/青色。
+- 图标：新增 NavIcon 细线图标集（统计/站点/证书/节点/DNS/日志/用户/设置/盾牌），侧栏与 KPI 卡片使用。
+- 布局：KPI 改为 3 列 × 2 行紧凑卡；顶栏改为面包屑（WebGateway / 分区），页面标题只在内容区出现；
+  侧栏 228px、菜单项更紧凑；移动端 KPI 单列、顶部栏与内容内边距收紧。
+- 验证：Headless Chromium 截图检查登录、概览、站点、证书、DNS、日志、设置和移动端；
+  前端 format/lint/type-check/build 通过。

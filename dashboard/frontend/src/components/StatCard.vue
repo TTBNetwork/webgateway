@@ -1,5 +1,5 @@
 <script setup lang="ts">
-import AppIcon from './AppIcon.vue'
+import NavIcon from './NavIcon.vue'
 
 const props = withDefaults(
   defineProps<{
@@ -15,13 +15,11 @@ const props = withDefaults(
 
 <template>
   <section class="stat-card" :class="'tone-' + props.tone">
-    <div class="stat-icon">
-      <AppIcon :name="props.icon" :size="20" />
+    <div class="stat-top">
+      <span class="stat-label">{{ props.label }}</span>
+      <span class="stat-icon"><NavIcon :name="props.icon" :size="15" /></span>
     </div>
-    <div class="stat-body">
-      <p class="stat-label">{{ props.label }}</p>
-      <p class="stat-value">{{ props.value }}</p>
-      <p v-if="props.hint" class="stat-hint">{{ props.hint }}</p>
-    </div>
+    <p class="stat-value">{{ props.value }}</p>
+    <p v-if="props.hint" class="stat-hint">{{ props.hint }}</p>
   </section>
 </template>
