@@ -73,6 +73,7 @@
 | F-57 | 每 IP 限流 | ✅ | 令牌桶（rps + burst，16 分片、全局 IP 上限、过期清理、满表 fail-open）；按站点 client_ip 解析客户端 IP；HTTP/1/2/3/WS/CONNECT 统一；429 + Retry-After + 访问日志；指标 `rate_limited_total`/`rate_limit_tracked_ips` |
 | F-58 | 上游健康检查 | ✅ | 站点级 `config.health_check`：主动 GET 探测（interval/timeout/阈值）+ 被动失败标记；选择时优先健康后端、全不健康回退完整集合、priority 备用组自动生效；指标 `health_check_*`、`backends_unhealthy` |
 | F-59 | HTTP/3 流式响应与停机 drain | ✅ | h3 响应从上游流式转发（不再受 `max_response_body_bytes` 限制）；SIGTERM 先停止接受新 QUIC 连接，在途 h3 请求与 TCP 共享 Inflight 计数（最多 10s）；请求体仍缓冲、无 h3 缓存 |
+| F-60 | 缓存 Vary / HEAD / 304 | ✅ | 按 `Vary` 请求头保存多个变体（`*` 不缓存）；HEAD 从缓存 GET 返回（保留 Content-Length、无 body）；GET/HEAD `If-None-Match` 返回 304；LRU 按 (key, variant) 维护 |
 
 ### 1.5 测试
 
@@ -108,7 +109,7 @@
 | P-02 | gRPC | 已在 Nezha 上验证；访问日志只记 HTTP 200，无法区分 grpc-status；无 gRPC-Web |
 | P-03 | WebSocket | 升级连接字节数记 0；无 mTLS / SNI 覆盖；wss 与后端 base path 已支持（2026-11-19） |
 | P-04 | CONNECT | 仅 h1；已修复 400/403 日志与端口白名单；无鉴权 / mTLS；无 HTTP/2 extended CONNECT |
-| P-05 | 缓存 | 仅 h1/h2；配置同步清空全部；无持久化/Vary/HEAD/stale-while-revalidate/single-flight/命中率；max_entry_size 在完整收集后判断 |
+| P-05 | 缓存 | 仅 h1/h2；`Vary`/HEAD/`If-None-Match` 已支持；仍无持久化/single-flight/stale-while-revalidate/`If-Modified-Since`；配置同步清空全部 |
 | P-06 | 访问日志 | body_length 取 Content-Length；chunked 请求 0、响应 NULL；WS/CONNECT 0；headers 重复键被覆盖；已修复 writer 退出 flush |
 | P-07 | 统计 | total_ips 跨秒重复；sizes 依赖日志 Content-Length；保留期（7 天）仍硬编码；整周过期分区已 DROP，边界分区仍逐行 DELETE |
 | P-08 | 上游 TLS | 只信 webpki + ca_file，不读系统 native roots；无 mTLS/SNI 覆盖 |
@@ -241,12 +242,15 @@
 - 原始日志只 DELETE 行，不 DROP 分区，磁盘膨胀。
 - 位置：dashboard/backend/src/stats.rs、database.md 5.4
 
-#### B-09 缓存行为限制（部分修复，2026-11-20）
+#### B-09 缓存行为限制（大部分修复，2026-11-20）
 - 已修复：缓存只在响应带 `Content-Length` 且不超过
-  `min(cache.max_entry_size, max_response_body_bytes)` 时收集；chunked 响应流式转发、不缓存，
-  不再“先完整收集再判断”。
+  `min(cache.max_entry_size, max_response_body_bytes)` 时收集；chunked 响应流式转发、不缓存。
+- 已修复（本轮）：`Vary` 变体缓存（`Vary: *` 不缓存）；HEAD 从缓存的 GET 返回
+  （保留 Content-Length、无 body）；`If-None-Match` 对 GET/HEAD 返回 304。
 - 仍存在：任意配置/证书 NOTIFY 清空全部缓存；无 single-flight；
-  不支持 HEAD/If-Modified-Since/If-None-Match: */Vary/stale-while-revalidate。
+  不支持 `If-Modified-Since`/stale-while-revalidate/持久化。
+- 实测：gzip/br/无编码三个变体分别 MISS 并缓存各自 body，gzip 重复请求 HIT；
+  HEAD 命中返回 HIT + Content-Length=8 且无 body；GET/HEAD + If-None-Match 均 304。
 - 位置：gateway/src/cache.rs、gateway/src/proxy.rs
 
 #### B-10 上游 TLS 信任范围
@@ -350,14 +354,14 @@
 
 ## 5. 当前状态
 
-- 最新分支：feat/h3-streaming（叠加在 feat/health-checks 之后）
-- 测试：网关 51、dashboard 25、shared 18 + 3 集成（含 crypto、stats 回填/分区回收）；前端 format/lint/type-check/build 通过
+- 最新分支：feat/cache-vary（叠加在 feat/h3-streaming 之后）
+- 测试：网关 53、dashboard 25、shared 18 + 3 集成（含 crypto、stats 回填/分区回收）；前端 format/lint/type-check/build 通过
 - 数据库：schema v6；2026-11-20 联调/统计/证书/CRUD/可靠性/资源上限/CONNECT/会话安全验证的临时数据已清理（websites/gateways/users/logs/stats = 0；测试证书已删除）
 - 管理面：站点/网关/用户 CRUD + admin/user/view RBAC + token_version 撤销；面板站点/用户编辑页完成；
   会话改为 HttpOnly Cookie + 安全响应头，服务令牌可多值轮换，内部错误统一脱敏；
   dashboard 可直接托管面板（SIGTERM 30s drain），控制面 secret 支持 AES-256-GCM 静态加密；
   dashboard/gateway 提供 Prometheus `/metrics`（默认回环）；gateway 支持每 IP 令牌桶限流、站点级上游健康检查、
-  HTTP/3 流式响应与停机 drain
+  HTTP/3 流式响应与停机 drain、缓存 Vary/HEAD/304
 - 证书：手动上传 + ACME（Let's Encrypt 实测签发；ZeroSSL 需 EAB）→ 网关 SNI 加载验证通过，见 `certificates.md`
 - 实时协议：Nezha gRPC（h2c/TLS/双向流）与 MCSManager WS（101/鉴权/长连接）已用真实软件验证，见 `e2e-realtime.md`
 - 面板：TOTP + JWT 登录；默认缓存 16 MiB（可配）；Vite 代理 /api → 127.0.0.1:3000

@@ -136,7 +136,7 @@ pub async fn handle(
     }
 
     let cache_lookup_key = cache_key_for(&raw_host, request.uri());
-    let request_cacheable = method_label == "GET"
+    let cache_lookup = (method_label == "GET" || method_label == "HEAD")
         && site.cache.enabled
         && site.cache.ttl_secs > 0
         && !request.headers().contains_key(header::AUTHORIZATION)
@@ -146,14 +146,19 @@ pub async fn handle(
             .get(header::CACHE_CONTROL)
             .and_then(|value| value.to_str().ok())
             .is_none_or(|value| !value.to_ascii_lowercase().contains("no-cache"));
+    // Only GET responses are stored; HEAD requests are answered from them.
+    let request_cacheable = cache_lookup && method_label == "GET";
+    let cache_request_headers = request.headers().clone();
 
-    if request_cacheable && let Some(cached) = state.cache.get(&cache_lookup_key) {
+    if cache_lookup && let Some(cached) = state.cache.get(&cache_lookup_key, &cache_request_headers)
+    {
         return cache_hit_response(
             &state,
             &request_log,
             cached,
             request.headers(),
             request_version,
+            method_label == "HEAD",
         );
     }
 
@@ -360,6 +365,7 @@ pub async fn handle(
                     etag: Some(etag),
                 },
                 cache_ttl(&site.cache, &response_headers),
+                &cache_request_headers,
             );
         }
 
@@ -656,6 +662,7 @@ fn cache_hit_response(
     mut cached: CachedResponse,
     request_headers: &HeaderMap,
     version: Version,
+    head: bool,
 ) -> Response<ProxyBody> {
     let not_modified = not_modified(request_headers, cached.etag.as_deref());
     let status = if not_modified {
@@ -667,6 +674,10 @@ fn cache_hit_response(
     if not_modified {
         cached.headers.remove(header::CONTENT_LENGTH);
         cached.headers.remove(header::CONTENT_TYPE);
+        cached.body = Bytes::new();
+    } else if head {
+        // HEAD keeps the cached GET headers (including Content-Length) but
+        // never sends a body.
         cached.body = Bytes::new();
     }
 
@@ -701,7 +712,7 @@ fn not_modified(headers: &HeaderMap, etag: Option<&str>) -> bool {
 }
 
 fn response_cacheable(headers: &HeaderMap, config: &CacheConfig) -> bool {
-    if headers.contains_key(header::SET_COOKIE) || headers.contains_key(header::VARY) {
+    if headers.contains_key(header::SET_COOKIE) {
         return false;
     }
 

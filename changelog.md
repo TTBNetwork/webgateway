@@ -449,3 +449,23 @@
 - 测试：gateway 51（现有 h3/代理/限流/健康检查单测全部通过）、dashboard 25、shared 18 + 3；
   fmt/clippy 通过。
 - 文档：`gateway.md` 5.3、`deployment.md` 限制表、`issue.md` P-01/B-04/F-59。
+
+### 缓存 Vary / HEAD / 304（分支 `feat/cache-vary`）
+- `gateway/src/cache.rs` 重构为按 `Vary` 变体存储：
+  - 条目携带响应 `Vary` 列出的请求头值（规范化为小写 HeaderName + 请求值），查找时逐项比较；
+  - 同一 key 可保存多个变体（gzip/br/无编码等），LRU 顺序按 `(key, token)` 维护；
+  - `Vary: *` 直接拒绝缓存（计入 `cache_rejected_total`）；替换/淘汰/清空/占用统计均按变体计数。
+- `proxy.rs`：
+  - GET 与 HEAD 都查缓存；仅 GET 响应写入缓存，HEAD 从缓存的 GET 返回（保留 Content-Length 等头、body 为空）；
+  - `If-None-Match` 对 GET 与 HEAD 都返回 304；
+  - 响应 `Vary` 不再整体禁止缓存（`Set-Cookie` 等规则不变）。
+- 实测（站点缓存 ttl=60）：
+  - gzip：首次 MISS body=enc=gzip，重复 HIT body 一致；
+  - br：MISS body=enc=br（未误用 gzip 变体）；无 Accept-Encoding：MISS body=enc=none；
+  - HEAD（Accept-Encoding: gzip）：HIT + Content-Length=8，响应无 body；
+  - /page 首次 200，带 If-None-Match 重复请求 304；HEAD + If-None-Match 也 304；
+  - 指标：hits 5、misses 4、stores 4、entries 4（3 个 /vary 变体 + 1 个 /page）。
+- 测试：gateway 51 → 53（新增 Vary 变体隔离、Vary:* 不缓存；现有缓存/代理测试更新签名）；
+  dashboard 25、shared 18 + 3；fmt/clippy 通过。
+- 限制：仍无 single-flight、`If-Modified-Since`、stale-while-revalidate、持久化；配置同步仍清空全部缓存。
+- 文档：`gateway.md` 5.4、`deployment.md` 限制表、`issue.md` P-05/B-09/F-60。

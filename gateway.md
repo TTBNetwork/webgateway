@@ -277,16 +277,21 @@ max_tracked_ips = 100000
 }
 ```
 
-- 仅缓存 GET + 200 + 无 `Set-Cookie` / `Vary` / `Cache-Control: no-store|private|no-cache` 的响应；
+- 仅缓存 GET + 200 + 无 `Set-Cookie` / `Cache-Control: no-store|private|no-cache` 的响应；
   请求带 `Authorization` 或 `Cookie` 时跳过缓存。
+- `Vary` 已支持：按响应 `Vary` 列出的请求头的值保存多个变体（如 gzip/br），
+  查找时逐项比较；`Vary: *` 不缓存。
 - `content_types` 为空表示所有类型；匹配忽略大小写，`image/` 这类以 `/` 结尾的按前缀匹配。
 - TTL 取站点 `ttl` 与上游 `s-maxage` / `max-age` 的较小值。
 - 全局内存上限默认 **16 MiB**（`[server].cache_max_size_bytes` / `GATEWAY_CACHE_MAX_SIZE`），LRU 淘汰；
   单条上限 `max_entry_size`；重启后缓存清空。
 - 命中：`X-WebGateway-Cache: HIT` + `Age`；未命中：`MISS`；`If-None-Match` 命中返回 304；
   上游无 ETag 时生成弱 ETag。
+- HEAD 不写入缓存，但会从缓存的 GET 响应返回：保留（GET 的）`Content-Length` 等响应头、无 body；
+  HEAD + `If-None-Match` 同样可返回 304。
 - 配置同步（NOTIFY）时清空缓存。
-- 限制：不缓存 HEAD/POST、不支持 `stale-while-revalidate`、不区分 Vary 维度、无持久化/多级缓存。
+- 限制：不缓存 POST、不支持 `stale-while-revalidate`/single-flight、无持久化/多级缓存；
+  `If-Modified-Since` 尚未处理。
 
 ### 5.5 上游健康检查
 

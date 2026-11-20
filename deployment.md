@@ -248,7 +248,7 @@ HTTP/TCP、flush 访问日志并标记 offline（HTTP/3 在途请求尚未 drain
 | P1 | 密钥依赖环境变量 | 未设置 `SECRET_ENCRYPTION_KEY` 时仍明文入库；密钥丢失不可恢复；无自动重加密（B-31/P-13） |
 | P1 | 告警需自建 | dashboard/gateway 已导出 Prometheus 指标，但未内置 Alertmanager/追踪；需按第 11 节接入（B-25 部分修复） |
 | P2 | HTTP/3 请求体仍缓冲 | 响应已流式、已参与停机 drain；请求体仍整体缓冲（上限 max_request_body_bytes），h3 无缓存（B-04/P-01 部分修复） |
-| P1 | 缓存正确性 | 无 `Vary`/single-flight/HEAD/If-None-Match: *（B-09） |
+| P2 | 缓存增强 | `Vary`/HEAD/`If-None-Match` 已支持；无 single-flight、stale-while-revalidate、持久化（B-09 部分修复） |
 | P1 | 健康状态为单节点 | 站点级主动探测 + 被动失败标记已实现；无跨节点健康状态、无熔断/半开（P-10/U-17 部分修复） |
 | P1 | 无 WAF/CC 规则 | 已有每客户端 IP 令牌桶限流（429 + Retry-After）；无 WAF/CC 规则与全局配额（U-07 部分修复） |
 | P2 | 统计偏差 | `total_ips` 跨秒重复、保留期硬编码、面板按 UTC 日（B-08/B-14） |
