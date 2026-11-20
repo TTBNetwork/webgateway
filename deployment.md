@@ -74,6 +74,8 @@ pg_dump -Fc --no-owner --dbname="$DATABASE_URL" -f webgateway-$(date -u +%Y%m%dT
 | `DASHBOARD_ADMIN_TOTP_SECRET` | 首次 | 空库创建默认管理员时使用；不设则随机生成并只打印一次 |
 | `DASHBOARD_ADMIN_USERNAME` | 否 | 默认管理员用户名，默认 `admin` |
 | `DASHBOARD_JWT_SECRET` | 否 | 默认管理员的 JWT 密钥；不设则随机生成后入库 |
+| `SECRET_ENCRYPTION_KEY` | 生产必填 | 32 字节密钥（64 hex 或 base64），加密数据库中的控制面 secret |
+| `SECRET_ENCRYPTION_KEY_PREVIOUS` | 轮换时 | 旧密钥，仅用于解密过渡 |
 | `ACME_EMAIL` | 否 | 证书申请联系邮箱的兜底值 |
 | `RUST_LOG` | 否 | 建议 `dashboard=info,shared=info` |
 
@@ -82,7 +84,21 @@ pg_dump -Fc --no-owner --dbname="$DATABASE_URL" -f webgateway-$(date -u +%Y%m%dT
 1. 空 `users` 表会创建默认管理员；TOTP secret 只在 WARN 日志中出现一次。
    生产建议先设置 `DASHBOARD_ADMIN_TOTP_SECRET`（base32）再启动，直接保存到密码管理器。
 2. `DASHBOARD_API_TOKENS` 请生成高熵随机值（例如 `openssl rand -hex 32`），不要复用开发令牌。
-3. 令牌与会话密钥目前**明文存储/环境变量**，见第 9 节限制。
+3. 密钥加密见 4.1；未设置 `SECRET_ENCRYPTION_KEY` 时 secret 仍会明文入库。
+
+### 4.1 密钥静态加密
+
+- 设置 `SECRET_ENCRYPTION_KEY` 后，以下字段以 AES-256-GCM 加密存储（`enc:v1:` 前缀）：
+  `users.totp_secret`、`users.jwt_secret`、`users_client_secrets.secret`、`certificates.private_key`、
+  `configurations` 中的 ACME account key、`dns_providers.provider` 的 `secret_id`/`secret_key`。
+  `certificates.fullchain` 是公开证书链，保持明文。
+- dashboard 每次启动会把仍是明文的存量数据加密（幂等，日志 `encrypted plaintext secrets count=N`）。
+- **上线/升级顺序**：先在 dashboard 和**所有 gateway** 配置同一个密钥，再重启 dashboard 触发加密。
+  gateway 没有密钥时会打印 `cannot decrypt the certificate key` 并跳过该证书，回落到默认自签证书。
+- **轮换**：新密钥放 `SECRET_ENCRYPTION_KEY`，旧密钥放 `SECRET_ENCRYPTION_KEY_PREVIOUS`；
+  旧密文仍可解密，但不会自动重加密（后续任务）。
+- 密钥只存在环境变量中，不写数据库/仓库；请纳入备份与密钥管理系统。密钥丢失会导致登录 500、
+  证书无法加载，且无法恢复。
 
 ## 5. TLS 与反向代理
 
@@ -196,6 +212,8 @@ HTTP/TCP、flush 访问日志并标记 offline（HTTP/3 在途请求尚未 drain
 | `GATEWAY_MAX_HEADER_BYTES` | 请求头上限，默认 32 KiB（最小 8 KiB） |
 | `GATEWAY_MAX_REQUEST_BODY` / `GATEWAY_MAX_RESPONSE_BODY` | 请求/响应体上限，默认 64 MiB |
 | `GATEWAY_UPSTREAM_CA_FILE` | 额外信任的上游 CA PEM |
+| `SECRET_ENCRYPTION_KEY` | 与 dashboard 相同的密钥；读取已加密的证书私钥时必须设置 |
+| `SECRET_ENCRYPTION_KEY_PREVIOUS` | 轮换期间用于解密旧密文 |
 | `RUST_LOG` | 建议 `gateway=info,shared=info` |
 
 同一台机器跑多个 gateway 时必须使用不同的 `machine_id`（不同用户/容器），否则会争用同一节点记录与端口。
@@ -203,21 +221,22 @@ HTTP/TCP、flush 访问日志并标记 offline（HTTP/3 在途请求尚未 drain
 ## 8. 首次上线检查表
 
 1. 数据库建库、扩展权限、`pg_dump` 基线备份。
-2. 部署 dashboard + `panel/`，配置 `DASHBOARD_STATIC_DIR`、`DASHBOARD_API_TOKENS`、TOTP secret。
-3. 启动 dashboard，`curl -fsS https://panel.example.com/health` 返回 `status=ok`、schema 版本符合预期。
-4. 浏览器登录面板（用户名 + TOTP），确认会话 Cookie 为 HttpOnly/Secure。
-5. 面板中创建 DNS provider、证书（手动上传或 ACME）、站点与上游。
-6. 启动 gateway，确认 `gateways.status = online` 且 10 秒内有心跳。
-7. 域名解析指向 gateway，验证 HTTPS 证书、路由、访问日志与统计入库。
-8. 打开站点缓存后验证 MISS→HIT；验证 413/431 等上限行为。
-9. 做一次 `systemctl restart webgateway-dashboard` 和 `kill -TERM` gateway，确认无异常退出。
+2. 生成 `SECRET_ENCRYPTION_KEY`（`openssl rand -hex 32`）并分发到 dashboard 与所有 gateway。
+3. 部署 dashboard + `panel/`，配置 `DASHBOARD_STATIC_DIR`、`DASHBOARD_API_TOKENS`、TOTP secret。
+4. 启动 dashboard，`curl -fsS https://panel.example.com/health` 返回 `status=ok`、schema 版本符合预期。
+5. 浏览器登录面板（用户名 + TOTP），确认会话 Cookie 为 HttpOnly/Secure。
+6. 面板中创建 DNS provider、证书（手动上传或 ACME）、站点与上游。
+7. 启动 gateway（同样的 `SECRET_ENCRYPTION_KEY`），确认 `gateways.status = online` 且 10 秒内有心跳。
+8. 域名解析指向 gateway，验证 HTTPS 证书、路由、访问日志与统计入库。
+9. 打开站点缓存后验证 MISS→HIT；验证 413/431 等上限行为。
+10. 做一次 `systemctl restart webgateway-dashboard` 和 `kill -TERM` gateway，确认无异常退出。
 
 ## 9. 已知生产限制（上线前必须评估）
 
 | 级别 | 限制 | 说明 |
 |---|---|---|
-| P0 | 密钥明文 | TOTP/JWT secret、ACME account key、证书私钥、DNS 凭据目前明文存库（B-31/P-13） |
 | P0 | 分支未合并 | 25 个堆叠分支、无主线集成（B-21），发布流程需先确定基线 |
+| P1 | 密钥依赖环境变量 | 未设置 `SECRET_ENCRYPTION_KEY` 时仍明文入库；密钥丢失不可恢复；无自动重加密（B-31/P-13） |
 | P1 | 无 metrics/告警 | 只有 `/health`；缓存命中、日志丢弃、上游错误不可观测（B-25） |
 | P1 | HTTP/3 全缓冲 | 大响应占内存、无缓存、停机不 drain（B-04/P-01） |
 | P1 | 缓存正确性 | 无 `Vary`/single-flight/HEAD/If-None-Match: *（B-09） |

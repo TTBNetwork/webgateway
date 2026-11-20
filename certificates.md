@@ -29,7 +29,8 @@ value = { "key_pem": "-----BEGIN PRIVATE KEY-----..." }
 ```
 
 这样重启/重试不会重复创建 Let's Encrypt 账户（newAccount 用同一把 key 会返回既有账户），
-也不会消耗 new-account 速率限制。**该私钥与其它控制面 secret 一样是明文存储**，后续应改为加密/KMS。
+也不会消耗 new-account 速率限制。配置 `SECRET_ENCRYPTION_KEY` 后，该私钥与其它控制面 secret
+会以 AES-256-GCM 加密存储（`enc:v1:` 前缀）；未配置密钥时保持明文。
 
 ## 2. API
 

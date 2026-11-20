@@ -189,6 +189,18 @@ async fn sign_certificate(database: &Database, certificate: SigningCertificate) 
     let id = certificate.id.clone();
     match sign_inner(database, &certificate).await {
         Ok((fullchain, private_key, expires_at)) => {
+            let sealed_private_key = match shared::crypto::seal(&private_key) {
+                Ok(sealed) => sealed,
+                Err(error) => {
+                    event!(
+                        Level::ERROR,
+                        certificate = %id,
+                        error = %format!("{error:#}"),
+                        "failed to encrypt the issued certificate key"
+                    );
+                    return;
+                }
+            };
             match sqlx::query(
                 "UPDATE certificates
                     SET fullchain = $2,
@@ -200,7 +212,7 @@ async fn sign_certificate(database: &Database, certificate: SigningCertificate) 
             )
             .bind(&id)
             .bind(&fullchain)
-            .bind(&private_key)
+            .bind(&sealed_private_key)
             .bind(expires_at as f64)
             .execute(database.pool())
             .await
@@ -339,20 +351,25 @@ async fn issue_with_ca(
             .await
             .context("failed to load the ACME account key")?;
     let key_pair = match stored {
-        Some(pem) => KeyPair::from_pem(&pem)
-            .map_err(|error| anyhow::anyhow!("invalid stored ACME account key: {error}"))?,
+        Some(pem) => {
+            let pem = shared::crypto::open(&pem)
+                .context("failed to decrypt the stored ACME account key")?;
+            KeyPair::from_pem(&pem)
+                .map_err(|error| anyhow::anyhow!("invalid stored ACME account key: {error}"))?
+        }
         None => {
             let key_pair = KeyPair::generate().map_err(|error| {
                 anyhow::anyhow!("failed to generate an ACME account key: {error}")
             })?;
             let pem = key_pair.serialize_pem();
+            let sealed_pem = shared::crypto::seal(&pem)?;
             sqlx::query(
                 "INSERT INTO configurations (key, value)
                  VALUES ($1, jsonb_build_object('key_pem', $2::text))
                  ON CONFLICT (key) DO UPDATE SET value = EXCLUDED.value",
             )
             .bind(&key_slot)
-            .bind(&pem)
+            .bind(&sealed_pem)
             .execute(database.pool())
             .await
             .context("failed to persist the ACME account key")?;
@@ -432,7 +449,12 @@ async fn resolve_dns(
         if !config.from_env
             && let (Some(secret_id), Some(secret_key)) = (config.secret_id, config.secret_key)
         {
-            explicit = Some((secret_id, secret_key));
+            explicit = Some((
+                shared::crypto::open(&secret_id)
+                    .context("failed to decrypt the DNS provider secret id")?,
+                shared::crypto::open(&secret_key)
+                    .context("failed to decrypt the DNS provider secret key")?,
+            ));
             source = String::from("dns_providers row");
         }
         provider_zone = domains.into_iter().next();
@@ -659,6 +681,7 @@ pub async fn upload_certificate(
     let name = name
         .filter(|value| !value.trim().is_empty())
         .unwrap_or_else(|| hostnames.join(", "));
+    let sealed_private_key = shared::crypto::seal(private_key.trim())?;
     sqlx::query(
         "INSERT INTO certificates
              (id, name, hostnames, fullchain, private_key, email, expires_at,
@@ -669,7 +692,7 @@ pub async fn upload_certificate(
     .bind(&name)
     .bind(&hostnames)
     .bind(fullchain.trim())
-    .bind(private_key.trim())
+    .bind(&sealed_private_key)
     .bind(email.filter(|value| !value.trim().is_empty()))
     .bind(parsed.expires_at as f64)
     .execute(database.pool())
@@ -849,8 +872,8 @@ pub async fn create_dns_provider(
             (Some(secret_id), Some(secret_key)) => serde_json::json!({
                 "kind": kind,
                 "from_env": false,
-                "secret_id": secret_id,
-                "secret_key": secret_key,
+                "secret_id": shared::crypto::seal(&secret_id)?,
+                "secret_key": shared::crypto::seal(&secret_key)?,
             }),
             _ => bail!("secret_id and secret_key are required when from_env is false"),
         }

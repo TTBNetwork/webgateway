@@ -340,3 +340,25 @@
 - 测试：dashboard 23（新增 3）；fmt/clippy 通过。
 - 文档：`issue.md` B-26/B-27/U-04、F-54；`dashboard/backend/config.example.toml`；
   `dashboard/frontend/README.md`。
+
+### 密钥静态加密 + 修复 dashboard 停机超时（分支 `feat/production-deploy`）
+- 新增 `shared::crypto`：AES-256-GCM（ring），存储格式 `enc:v1:<base64url(nonce||ciphertext)>`；
+  密钥来自 `SECRET_ENCRYPTION_KEY`（64 hex 或 base64 的 32 字节），`SECRET_ENCRYPTION_KEY_PREVIOUS`
+  仅用于解密过渡；未配置密钥时保持明文并 WARN。
+- 加密范围：`users.totp_secret` / `users.jwt_secret`、`users_client_secrets.secret`、
+  `certificates.private_key`（`fullchain` 公开不加密）、`configurations` 的 `acme_account:*` key_pem、
+  `dns_providers.provider` 的 `secret_id`/`secret_key`。
+- dashboard 启动执行幂等迁移 `secrets::encrypt_legacy_secrets`，把历史明文一次性加密
+  （日志 `encrypted plaintext secrets count=N`）；gateway 读取证书前解密，失败时跳过并告警。
+- 修复本轮 E2E 发现的回归：dashboard 的 30s 停机超时误包住了整个 serve 生命周期，
+  导致无信号时启动 30s 后必退；现在超时只作用于收到 SIGTERM 后的 drain。
+- 实测（beta DB）：
+  - 先以无密钥启动写入 2 用户 / 1 证书 / 1 DNS provider（全部明文），重启带密钥 → `count=4`，
+    DB 全部 `enc:v1:`，DNS JSON 中明文 secret_id 消失；admin 登录（TOTP/JWT 解密）200；
+  - gateway 带密钥启动 → `certificate_hosts=1`，`curl --resolve` 200，证书 `CN=secure-test.atxa.top`；
+  - gateway 无密钥 → `cannot decrypt the certificate key`，证书数 0，回落到 rcgen 自签；
+  - dashboard 无密钥访问已加密数据 → 登录 500 + error_id，日志 `failed to decrypt the TOTP secret`；
+  - 修复后 dashboard 持续运行超过 30s（旧实现会自行退出）。
+- 测试：shared 18（+4 crypto）、dashboard 23、gateway 37；fmt/clippy 通过。
+- 文档：`deployment.md` 4.1 密钥加密与迁移顺序/轮换、gateway 环境变量、首次上线检查表；
+  `issue.md` B-31/P-13、F-55；`certificates.md`、两个 `config.example.toml`。

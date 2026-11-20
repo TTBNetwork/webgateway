@@ -23,6 +23,12 @@ port = 3000
 #   DASHBOARD_TOKEN_EXPIRES (seconds, default 604800, clamped to 300..2592000)
 #   DASHBOARD_API_TOKENS (comma-separated; DASHBOARD_API_TOKEN also accepted)
 #
+# Encrypt secrets at rest with a 32-byte key (64 hex characters or base64).
+# Set the same value on the dashboard and every gateway. Data written before
+# the key was configured is encrypted on the next dashboard start.
+#   SECRET_ENCRYPTION_KEY (required in production)
+#   SECRET_ENCRYPTION_KEY_PREVIOUS (decrypt-only during rotation)
+#
 # Serve the built panel from this directory. Unknown paths fall back to
 # index.html (SPA history mode) while /api and /health keep their own routes.
 # static_dir = "dashboard/frontend/dist"

@@ -5,6 +5,8 @@ edition.workspace = true
 
 [dependencies]
 anyhow.workspace = true
+data-encoding = "2.11.1"
+ring = "0.17.14"
 serde.workspace = true
 sqlx.workspace = true
 tokio.workspace = true

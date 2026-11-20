@@ -8,9 +8,10 @@ mod auth;
 mod certificate;
 mod config;
 mod router;
+mod secrets;
 mod websites;
 
-use std::time::Duration;
+use std::{future::IntoFuture, time::Duration};
 
 use shared::database::{Database, schema_version};
 use tracing::{Level, event};
@@ -18,12 +19,15 @@ use tracing::{Level, event};
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
     shared::logger::init("dashboard=info,shared=info");
+    // Must run before any secret is read or written.
+    shared::crypto::init_from_env()?;
 
     let config = config::load()?;
 
     let database = Database::connect(&config.database).await?;
     database.initialize_master(&config.database).await?;
     database.verify_schema().await?;
+    secrets::encrypt_legacy_secrets(&database).await?;
     auth::ensure_default_admin(&database).await?;
 
     let stats_task = shared::stats::spawn(database.clone());
@@ -46,11 +50,24 @@ async fn main() -> anyhow::Result<()> {
         config.server.session_ttl_secs,
         config.server.static_dir.clone(),
     );
-    let server = axum::serve(listener, app).with_graceful_shutdown(shutdown_signal());
-    // Bound the drain so a stuck connection cannot block a redeploy forever.
-    match tokio::time::timeout(Duration::from_secs(30), server).await {
-        Ok(result) => result?,
-        Err(_) => event!(Level::WARN, "dashboard shutdown timed out after 30s"),
+    // The timeout only guards the drain after a signal: wrapping the whole
+    // server future would make the process exit 30s after startup.
+    let (cancel_tx, cancel_rx) = tokio::sync::oneshot::channel();
+    let server = axum::serve(listener, app)
+        .with_graceful_shutdown(async move {
+            shutdown_signal().await;
+            let _ = cancel_tx.send(());
+        })
+        .into_future();
+    tokio::pin!(server);
+    tokio::select! {
+        result = &mut server => result?,
+        _ = cancel_rx => {
+            match tokio::time::timeout(Duration::from_secs(30), &mut server).await {
+                Ok(result) => result?,
+                Err(_) => event!(Level::WARN, "dashboard shutdown timed out after 30s"),
+            }
+        }
     }
 
     stats_task.abort();

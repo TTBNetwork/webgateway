@@ -68,6 +68,7 @@
 | F-38 | 面板验证 | ✅ | Vite 代理 401/200 + 真实数据；format/lint/build 通过 |
 | F-53 | 面板会话与响应安全 | ✅ | HttpOnly Cookie 会话、安全响应头（CSP/HSTS/nosniff/DENY/no-store）、内部错误脱敏 + error_id、服务令牌恒时比较多值轮换 |
 | F-54 | 生产部署基础 | ✅ | dashboard 静态托管 + SPA 回退（`DASHBOARD_STATIC_DIR`）、路径穿越防护与资源缓存策略、SIGTERM/Ctrl-C 优雅停机（30s）、`deployment.md` 部署指南 |
+| F-55 | 密钥静态加密 | ✅ | AES-256-GCM + `enc:v1:` 前缀；`SECRET_ENCRYPTION_KEY`/`_PREVIOUS`；覆盖 TOTP/JWT/客户端 secret、证书私钥、ACME account key、DNS 凭据；启动幂等加密存量明文；gateway 读取时解密 |
 
 ### 1.5 测试
 
@@ -108,7 +109,7 @@
 | P-07 | 统计 | total_ips 跨秒重复；sizes 依赖日志 Content-Length；保留期（7 天）仍硬编码；整周过期分区已 DROP，边界分区仍逐行 DELETE |
 | P-08 | 上游 TLS | 只信 webpki + ca_file，不读系统 native roots；无 mTLS/SNI 覆盖 |
 | P-09 | 面板 | 站点/证书/用户已可写；网关只读列表+API 删除；JWT 已改为 HttpOnly Cookie；无 refresh token/每用户 API key；无服务端分页；无静态托管；无前端测试 |
-| P-13 | 证书 | 仅腾讯云 DNS-01；一张证书只能一个 DNS zone；ZeroSSL 必须配置 EAB；通配符未实测；ACME account key 明文入库 |
+| P-13 | 证书 | 仅腾讯云 DNS-01；一张证书只能一个 DNS zone；ZeroSSL 必须配置 EAB；通配符未实测；ACME account key 可加密存储（需配置 `SECRET_ENCRYPTION_KEY`，否则明文） |
 | P-10 | 负载均衡 | priority 为静态备用组；无健康检查/失败自动切换 |
 | P-11 | 管理面 | 无 CRUD、ACME/DNS、审计；有登录但无用户管理/RBAC 细分 |
 | P-12 | 可观测性 | 无 /metrics、无 tracing 导出；面板仅有基础统计 |
@@ -292,10 +293,14 @@
 - RBAC：admin（全部）、user（证书写）、view（只读）；路由分组 + 中间件强制。
 - 仍需：服务令牌过期/自动轮换（多令牌手工轮换已支持）；refresh token / 每用户 API Key。
 
-#### B-31 认证密钥暴露面
-- 默认管理员 TOTP secret 只在首次创建时打印 WARN 日志；日志集中后可能泄露。
-- users.totp_secret / jwt_secret 明文存库（沿用 v1）；JWT secret 未轮换。
-- 建议：一次性初始化流程/加密存储/密钥轮换。
+#### B-31 认证密钥暴露面（部分修复，2026-11-20）
+- 已修复：users.totp_secret / jwt_secret、users_client_secrets.secret、证书私钥、ACME account key、
+  DNS provider 凭据支持 AES-256-GCM 加密存储（`enc:v1:`，密钥来自 `SECRET_ENCRYPTION_KEY`）；
+  dashboard 启动幂等加密历史明文，`SECRET_ENCRYPTION_KEY_PREVIOUS` 支持轮换期间解密。
+- 仍未做：未设置密钥时保持明文；轮换后不自动重加密旧密文；默认管理员 TOTP secret 仍打印到
+  WARN 日志一次；JWT secret 无过期/轮换策略。
+- 位置：crates/shared/src/crypto.rs、dashboard/backend/src/secrets.rs、auth.rs、certificate.rs、
+  gateway/src/sync.rs
 
 #### B-16 面板 API 错误泄露（已修复，2026-11-20）
 - 修复：internal() 记录完整错误 + 随机 error_id，客户端只收到
@@ -336,10 +341,11 @@
 ## 5. 当前状态
 
 - 最新分支：feat/production-deploy（叠加在 feat/dashboard-session-security 之后）
-- 测试：网关 37、dashboard 23、shared 14 + 3 集成（含 stats 回填/分区回收）；前端 format/lint/type-check/build 通过
+- 测试：网关 37、dashboard 23、shared 18 + 3 集成（含 crypto、stats 回填/分区回收）；前端 format/lint/type-check/build 通过
 - 数据库：schema v6；2026-11-20 联调/统计/证书/CRUD/可靠性/资源上限/CONNECT/会话安全验证的临时数据已清理（websites/gateways/users/logs/stats = 0；测试证书已删除）
 - 管理面：站点/网关/用户 CRUD + admin/user/view RBAC + token_version 撤销；面板站点/用户编辑页完成；
-  会话改为 HttpOnly Cookie + 安全响应头，服务令牌可多值轮换，内部错误统一脱敏
+  会话改为 HttpOnly Cookie + 安全响应头，服务令牌可多值轮换，内部错误统一脱敏；
+  dashboard 可直接托管面板（SIGTERM 30s drain），控制面 secret 支持 AES-256-GCM 静态加密
 - 证书：手动上传 + ACME（Let's Encrypt 实测签发；ZeroSSL 需 EAB）→ 网关 SNI 加载验证通过，见 `certificates.md`
 - 实时协议：Nezha gRPC（h2c/TLS/双向流）与 MCSManager WS（101/鉴权/长连接）已用真实软件验证，见 `e2e-realtime.md`
 - 面板：TOTP + JWT 登录；默认缓存 16 MiB（可配）；Vite 代理 /api → 127.0.0.1:3000
@@ -347,8 +353,8 @@
 ## 6. 建议优先级
 
 1. ~~B-01 / B-02：分区续建 + 统计补算（P0）~~ ✅
-2. ~~面板 CRUD + 用户管理/RBAC/JWT 撤销（U-01/U-02）~~ ✅；~~B-15/B-16/B-27（Cookie 会话、安全头、错误脱敏）~~ ✅
-   （剩 refresh token / 每用户 API Key / 服务令牌过期）
+2. ~~面板 CRUD + 用户管理/RBAC/JWT 撤销（U-01/U-02）~~ ✅；~~B-15/B-16/B-27（Cookie 会话、安全头、错误脱敏）~~ ✅；
+   ~~B-31/P-13（密钥静态加密）~~ ✅（剩 refresh token / 每用户 API Key / 服务令牌过期 / 自动重加密）
 3. ~~B-03~~ ✅ / ~~B-05~~ ✅ / ~~B-06~~ ✅ / ~~B-11~~ ✅ / ~~B-07~~ ✅ / ~~B-12~~ ✅ / B-04：h3 限制（body 上限已完成，仍缺缓存/流式）
 4. U-11/U-13：h3 流式/Alt-Svc、h2 extended CONNECT
 5. U-17/U-19/U-23：健康检查、metrics、缓存持久化

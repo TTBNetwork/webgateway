@@ -108,14 +108,16 @@ pub async fn ensure_default_admin(database: &Database) -> anyhow::Result<()> {
     };
 
     let id = random_hex(12)?;
+    let sealed_totp = shared::crypto::seal(&totp_secret)?;
+    let sealed_jwt = shared::crypto::seal(&jwt_secret)?;
     sqlx::query(
         "INSERT INTO users (id, username, totp_secret, jwt_secret, role, addresses)
          VALUES ($1, $2, $3, $4, 'admin', ARRAY[]::text[])",
     )
     .bind(&id)
     .bind(&username)
-    .bind(&totp_secret)
-    .bind(&jwt_secret)
+    .bind(&sealed_totp)
+    .bind(&sealed_jwt)
     .execute(database.pool())
     .await
     .context("failed to create the default admin")?;
@@ -140,7 +142,19 @@ pub async fn authenticate(database: &Database, token: &str) -> Option<User> {
     .await
     .ok()??;
 
-    let jwt_secret: String = row.try_get("jwt_secret").ok()?;
+    let stored_jwt_secret: String = row.try_get("jwt_secret").ok()?;
+    let jwt_secret = match shared::crypto::open(&stored_jwt_secret) {
+        Ok(secret) => secret,
+        Err(error) => {
+            event!(
+                Level::ERROR,
+                error = %format!("{error:#}"),
+                user = %claims.sub,
+                "failed to decrypt the JWT secret"
+            );
+            return None;
+        }
+    };
     let validation = Validation::new(Algorithm::HS256);
     let key = DecodingKey::from_secret(jwt_secret.as_bytes()).ok()?;
     let decoded = decode::<Claims>(token, &key, &validation).ok()?;
@@ -186,14 +200,19 @@ pub async fn login(
     };
 
     let id: String = row.try_get("id")?;
-    let mut secrets: Vec<String> = vec![row.try_get("totp_secret")?];
+    let stored_totp: String = row.try_get("totp_secret")?;
+    let mut secrets: Vec<String> =
+        vec![shared::crypto::open(&stored_totp).context("failed to decrypt the TOTP secret")?];
     let extra: Vec<String> =
         sqlx::query_scalar("SELECT secret FROM users_client_secrets WHERE user_id = $1")
             .bind(&id)
             .fetch_all(database.pool())
             .await
             .unwrap_or_default();
-    secrets.extend(extra);
+    for secret in extra {
+        secrets
+            .push(shared::crypto::open(&secret).context("failed to decrypt a client TOTP secret")?);
+    }
 
     let matched_step = secrets
         .iter()
@@ -249,7 +268,9 @@ pub async fn login(
         iat: now,
         exp: now.saturating_add(expires),
     };
-    let jwt_secret: String = row.try_get("jwt_secret")?;
+    let stored_jwt_secret: String = row.try_get("jwt_secret")?;
+    let jwt_secret =
+        shared::crypto::open(&stored_jwt_secret).context("failed to decrypt the JWT secret")?;
     let key = EncodingKey::from_secret(jwt_secret.as_bytes())
         .map_err(|error| anyhow::anyhow!("failed to create the JWT key: {error}"))?;
     let token = encode(&Header::default(), &claims, &key).context("failed to sign the JWT")?;
@@ -342,14 +363,16 @@ pub async fn create_user(
     let id = random_hex(12)?;
     let totp_secret = new_totp_secret()?;
     let jwt_secret = random_hex(32)?;
+    let sealed_totp = shared::crypto::seal(&totp_secret)?;
+    let sealed_jwt = shared::crypto::seal(&jwt_secret)?;
     match sqlx::query(
         "INSERT INTO users (id, username, totp_secret, jwt_secret, role, addresses)
          VALUES ($1, $2, $3, $4, $5, ARRAY[]::text[])",
     )
     .bind(&id)
     .bind(username)
-    .bind(&totp_secret)
-    .bind(&jwt_secret)
+    .bind(&sealed_totp)
+    .bind(&sealed_jwt)
     .bind(role)
     .execute(database.pool())
     .await
@@ -425,13 +448,14 @@ pub async fn delete_user(database: &Database, id: &str) -> anyhow::Result<bool> 
 /// Replace a user's TOTP secret and invalidate existing sessions.
 pub async fn reset_totp(database: &Database, id: &str) -> anyhow::Result<Option<String>> {
     let secret = new_totp_secret()?;
+    let sealed_secret = shared::crypto::seal(&secret)?;
     let result = sqlx::query(
         "UPDATE users
             SET totp_secret = $2, token_version = token_version + 1
           WHERE id = $1",
     )
     .bind(id)
-    .bind(&secret)
+    .bind(&sealed_secret)
     .execute(database.pool())
     .await
     .context("failed to reset the TOTP secret")?;

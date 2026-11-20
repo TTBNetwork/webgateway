@@ -48,6 +48,8 @@ async fn main() {
 }
 
 async fn run() -> anyhow::Result<()> {
+    // Certificate private keys may be encrypted at rest by the dashboard.
+    shared::crypto::init_from_env()?;
     let config = Config::load()?;
 
     // The gateway never migrates: it waits until the master publishes the schema version.

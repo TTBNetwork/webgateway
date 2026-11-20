@@ -215,7 +215,19 @@ pub async fn sync_once(
 
     let mut entries = Vec::new();
     for row in certificates {
-        match crate::tls::certified_key_from_pem(&row.fullchain, &row.private_key) {
+        let private_key = match shared::crypto::open(&row.private_key) {
+            Ok(private_key) => private_key,
+            Err(error) => {
+                event!(
+                    Level::WARN,
+                    certificate = %row.id,
+                    error = %format!("{error:#}"),
+                    "cannot decrypt the certificate key; ignoring certificate"
+                );
+                continue;
+            }
+        };
+        match crate::tls::certified_key_from_pem(&row.fullchain, &private_key) {
             Ok(key) => entries.push((row.hostnames, key)),
             Err(error) => {
                 event!(Level::WARN, certificate = %row.id, %error, "ignoring unusable certificate");

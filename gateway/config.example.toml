@@ -1,5 +1,9 @@
 # Copy to config.toml (ignored by git) or provide the same values through
 # environment variables. Environment values win.
+#
+# Set SECRET_ENCRYPTION_KEY to the same value as the dashboard when secrets are
+# encrypted at rest, otherwise certificate private keys cannot be decrypted and
+# those certificates are skipped (the default self-signed cert is served).
 
 [database]
 url = "postgres://user:password@host:5432/webgateway_beta_v2"
