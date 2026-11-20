@@ -1,32 +1,32 @@
 <script setup lang="ts">
 import { ref } from 'vue'
 import AppIcon from '../components/AppIcon.vue'
+import InfoTip from '../components/InfoTip.vue'
 import { api } from '../api'
 import { errorMessage } from '../format'
 import { t } from '../i18n'
 import { prefs } from '../prefs'
 import { navigate } from '../router'
 import { session, setSession } from '../session'
+import { notifyError } from '../toast'
 
 const username = ref(session.user?.username ?? 'admin')
 const code = ref('')
 const loading = ref(false)
-const error = ref('')
 
 async function submit(): Promise<void> {
   if (!username.value.trim() || !code.value.trim()) {
-    error.value = t('login.required')
+    notifyError(t('login.required'))
     return
   }
 
   loading.value = true
-  error.value = ''
   try {
     const result = await api.login(username.value.trim(), code.value.trim())
     setSession(result.user)
     navigate('/')
   } catch (reason) {
-    error.value = t('login.invalid') + ' ' + errorMessage(reason)
+    notifyError(t('login.invalid') + ' ' + errorMessage(reason))
   } finally {
     loading.value = false
   }
@@ -89,7 +89,10 @@ function toggleLocale(): void {
             :placeholder="t('login.usernamePlaceholder')"
           />
 
-          <label class="field-label" for="code">{{ t('login.code') }}</label>
+          <span class="label-with-tip">
+            <label class="field-label" for="code">{{ t('login.code') }}</label>
+            <InfoTip :text="t('login.hint')" />
+          </span>
           <input
             id="code"
             v-model="code"
@@ -101,15 +104,11 @@ function toggleLocale(): void {
             :placeholder="t('login.codePlaceholder')"
           />
 
-          <p v-if="error" class="form-error">{{ error }}</p>
-
           <button class="btn primary full" type="submit" :disabled="loading">
             <AppIcon name="arrow" :size="16" />
             {{ loading ? t('login.submitting') : t('login.submit') }}
           </button>
         </form>
-
-        <p class="login-hint">{{ t('login.hint') }}</p>
       </section>
     </div>
   </div>

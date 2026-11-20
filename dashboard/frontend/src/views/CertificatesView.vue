@@ -1,15 +1,19 @@
 <script setup lang="ts">
-import { onMounted, ref } from 'vue'
+import { computed, ref } from 'vue'
 import AppIcon from '../components/AppIcon.vue'
 import EmptyState from '../components/EmptyState.vue'
+import SelectField from '../components/SelectField.vue'
 import StatusBadge from '../components/StatusBadge.vue'
-import { api, type Certificate } from '../api'
+import { api, type Certificate, type DnsProvider } from '../api'
+import { usePolling } from '../composables/usePolling'
 import { daysUntil, errorMessage, formatDate } from '../format'
 import { t } from '../i18n'
+import { notifySuccess } from '../toast'
 
 type CertStatus = 'pending' | 'valid' | 'expiring' | 'expired' | 'unknown'
 
 const items = ref<Certificate[]>([])
+const providers = ref<DnsProvider[]>([])
 const loading = ref(false)
 const error = ref('')
 
@@ -19,11 +23,28 @@ const name = ref('')
 const hosts = ref('')
 const email = ref('')
 const zone = ref('')
+const dnsProviderId = ref('')
 const fullchain = ref('')
 const privateKey = ref('')
 const submitting = ref(false)
 const formError = ref('')
 const formSuccess = ref('')
+
+const providerOptions = computed(() => [
+  { value: '', label: t('certs.dnsProviderEnv') },
+  ...providers.value.map((provider) => ({
+    value: provider.id,
+    label: provider.name || provider.domains.join(', ') || provider.id,
+    hint: provider.domains.join(', '),
+  })),
+])
+
+function providerLabel(item: Certificate): string {
+  const provider = providers.value.find((value) => value.id === item.dns_provider_id)
+  return provider
+    ? provider.name || provider.domains.join(', ') || provider.id
+    : (item.dns_provider_id ?? '')
+}
 
 function certificateStatus(item: Certificate): CertStatus {
   if (item.status === 'pending') return 'pending'
@@ -64,6 +85,7 @@ function resetForm(): void {
   hosts.value = ''
   email.value = ''
   zone.value = ''
+  dnsProviderId.value = ''
   fullchain.value = ''
   privateKey.value = ''
   formError.value = ''
@@ -79,7 +101,9 @@ async function load(): Promise<void> {
   loading.value = true
   error.value = ''
   try {
-    items.value = await api.certificates()
+    const [certificates, dnsProviders] = await Promise.all([api.certificates(), api.dnsProviders()])
+    items.value = certificates
+    providers.value = dnsProviders
   } catch (reason) {
     error.value = errorMessage(reason)
   } finally {
@@ -101,9 +125,11 @@ async function submit(): Promise<void> {
         name: name.value.trim() || undefined,
         hostnames,
         email: email.value.trim() || undefined,
+        dns_provider_id: dnsProviderId.value || undefined,
         dns_zone: zone.value.trim() || undefined,
       })
       formSuccess.value = t('certs.queued')
+      notifySuccess(t('certs.queued'))
     } else {
       if (!fullchain.value.trim() || !privateKey.value.trim()) {
         throw new Error(t('certs.pemRequired'))
@@ -115,6 +141,7 @@ async function submit(): Promise<void> {
         private_key: privateKey.value,
       })
       formSuccess.value = t('certs.uploaded')
+      notifySuccess(t('certs.uploaded'))
     }
     fullchain.value = ''
     privateKey.value = ''
@@ -130,6 +157,7 @@ async function reissue(item: Certificate): Promise<void> {
   error.value = ''
   try {
     await api.reissueCertificate(item.id)
+    notifySuccess(t('certs.reissue'))
     await load()
   } catch (reason) {
     error.value = errorMessage(reason)
@@ -147,7 +175,7 @@ async function remove(item: Certificate): Promise<void> {
   }
 }
 
-onMounted(load)
+usePolling(load, 20_000)
 </script>
 
 <template>
@@ -163,17 +191,13 @@ onMounted(load)
           <AppIcon name="certificates" :size="16" />
           {{ t('certs.add') }}
         </button>
-        <button class="btn" type="button" :disabled="loading" @click="load">
-          <AppIcon name="refresh" :size="16" />
-          {{ t('common.refresh') }}
-        </button>
+        <span class="pill-note">{{ t('websites.autoRefresh') }}</span>
       </div>
     </header>
 
     <div v-if="error" class="error-banner">
       <AppIcon name="alert" :size="18" />
       <span>{{ error }}</span>
-      <button class="btn small" type="button" @click="load">{{ t('common.retry') }}</button>
     </div>
 
     <section v-if="showForm" class="card" style="display: grid; gap: 14px; margin-bottom: 18px">
@@ -215,9 +239,15 @@ onMounted(load)
           <input v-model="email" class="input" placeholder="admin@example.com" />
         </div>
         <div style="display: grid; gap: 6px">
+          <label class="field-label">{{ t('certs.dnsProvider') }}</label>
+          <SelectField v-model="dnsProviderId" :options="providerOptions" />
+          <small class="muted">{{ t('certs.dnsProviderHint') }}</small>
+        </div>
+        <div style="display: grid; gap: 6px">
           <label class="field-label">{{ t('certs.zone') }}</label>
           <input v-model="zone" class="input" :placeholder="t('certs.zoneHint')" />
         </div>
+        <p class="muted small-text">{{ t('certs.proxyHint') }}</p>
       </template>
 
       <template v-else>
@@ -284,6 +314,7 @@ onMounted(load)
                     <div class="muted small-text">
                       {{ item.auto_renew ? t('certs.auto') : t('certs.manual') }}
                       <span v-if="item.dns_zone"> · {{ item.dns_zone }}</span>
+                      <span v-if="providerLabel(item)"> · {{ providerLabel(item) }}</span>
                     </div>
                   </div>
                 </div>

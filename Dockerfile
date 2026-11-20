@@ -39,6 +39,6 @@ RUN chmod 755 /app/bin/dashboard /app/bin/gateway /app/bin/webgateway-mnt /usr/l
 ENV DASHBOARD_STATIC_DIR=/app/panel \
     MNT_SOCKET=/run/webgateway/mnt.sock
 USER webgateway
-EXPOSE 3000 8080
+EXPOSE 3000 80 443 8080
 ENTRYPOINT ["/usr/local/bin/webgateway-entrypoint"]
 CMD ["dashboard"]

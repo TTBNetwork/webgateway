@@ -20,6 +20,8 @@ pub struct AcmeConfig {
     pub terms_of_service_agreed: bool,
     /// Optional External Account Binding (required by ZeroSSL/Google CA).
     pub external_account_binding: Option<crate::account::ExternalAccountBinding>,
+    /// Optional HTTP(S) proxy for ACME directory/order requests.
+    pub proxy: Option<String>,
 }
 
 impl AcmeConfig {
@@ -30,6 +32,7 @@ impl AcmeConfig {
             contacts: Vec::new(),
             terms_of_service_agreed: false,
             external_account_binding: None,
+            proxy: None,
         }
     }
 
@@ -58,6 +61,12 @@ impl AcmeConfig {
         self
     }
 
+    /// Routes ACME HTTP requests through the given proxy URL.
+    pub fn with_proxy(mut self, proxy: impl Into<String>) -> Self {
+        self.proxy = Some(proxy.into());
+        self
+    }
+
     /// Returns a configuration for the Let's Encrypt staging directory.
     pub fn lets_encrypt_staging() -> Self {
         Self::new("https://acme-staging-v02.api.letsencrypt.org/directory")
@@ -67,6 +76,20 @@ impl AcmeConfig {
     pub fn lets_encrypt() -> Self {
         Self::new("https://acme-v02.api.letsencrypt.org/directory")
     }
+}
+
+fn http_client_with_proxy(proxy: Option<&str>) -> reqwest::Client {
+    let mut builder = reqwest::Client::builder();
+    if let Some(proxy) = proxy {
+        match reqwest::Proxy::all(proxy) {
+            Ok(proxy) => builder = builder.proxy(proxy),
+            Err(error) => tracing::warn!(%proxy, %error, "ignoring invalid ACME proxy URL"),
+        }
+    }
+    builder.build().unwrap_or_else(|error| {
+        tracing::warn!(%error, "failed to build the ACME HTTP client; using defaults");
+        reqwest::Client::new()
+    })
 }
 
 /// The primary high-level ACME client.
@@ -93,7 +116,7 @@ impl AcmeClient {
             "Creating new AcmeClient with directory: {}",
             config.directory_url
         );
-        let http_client = reqwest::Client::new();
+        let http_client = http_client_with_proxy(config.proxy.as_deref());
         let key_pair = Arc::new(KeyPair::generate()?);
 
         Ok(Self {
@@ -108,7 +131,7 @@ impl AcmeClient {
     /// Creates an ACME client with an existing key pair.
     pub fn with_key_pair(config: AcmeConfig, key_pair: KeyPair) -> Self {
         tracing::debug!("Creating AcmeClient with existing key pair");
-        let http_client = reqwest::Client::new();
+        let http_client = http_client_with_proxy(config.proxy.as_deref());
 
         Self {
             config,

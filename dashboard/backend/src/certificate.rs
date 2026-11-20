@@ -339,6 +339,9 @@ async fn issue_with_ca(
     if let Some((key_id, hmac_key)) = &candidate.eab {
         config = config.with_external_account_binding(key_id.clone(), hmac_key.clone());
     }
+    if let Some(proxy) = acme_proxy(database).await? {
+        config = config.with_proxy(proxy);
+    }
 
     // Reuse one ACME account key per CA. Creating a fresh key on every attempt
     // exhausts Let's Encrypt's new-account rate limit and loses the account
@@ -393,6 +396,22 @@ async fn issue_with_ca(
     // path already cleans up inside acmex.
     registry.cleanup_all().await;
     result.map_err(|error| anyhow::anyhow!("{error}"))
+}
+
+/// Optional HTTP(S) proxy for ACME CA requests, stored in configurations.
+///
+/// The URL is sealed like other control-plane secrets because a proxy may carry
+/// credentials. DNS provider API calls are not affected.
+async fn acme_proxy(database: &Database) -> anyhow::Result<Option<String>> {
+    let sealed: Option<String> = sqlx::query_scalar(
+        "SELECT value ->> 'url' FROM configurations WHERE key = 'acme_http_proxy'",
+    )
+    .fetch_optional(database.pool())
+    .await
+    .context("failed to load the ACME proxy setting")?;
+    sealed
+        .map(|value| shared::crypto::open(&value).context("failed to decrypt the ACME proxy URL"))
+        .transpose()
 }
 
 fn ca_candidates() -> Vec<CaCandidate> {

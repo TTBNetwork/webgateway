@@ -1,13 +1,13 @@
 <script setup lang="ts">
-import { computed, onMounted, onUnmounted, ref } from 'vue'
+import { computed, ref } from 'vue'
 import AppIcon from '../components/AppIcon.vue'
 import EmptyState from '../components/EmptyState.vue'
 import StatCard from '../components/StatCard.vue'
 import TrafficChart from '../components/TrafficChart.vue'
 import { api, type Summary } from '../api'
+import { usePolling } from '../composables/usePolling'
 import { errorMessage, formatBytes, formatNumber } from '../format'
 import { t } from '../i18n'
-import { navigate } from '../router'
 
 interface Card {
   label: string
@@ -20,7 +20,6 @@ interface Card {
 const summary = ref<Summary | null>(null)
 const loading = ref(false)
 const error = ref('')
-let timer: number | undefined
 
 const cards = computed<Card[]>(() => {
   const data = summary.value
@@ -88,20 +87,7 @@ async function load(): Promise<void> {
   }
 }
 
-function startTimer(): void {
-  timer = window.setInterval(() => {
-    if (document.visibilityState === 'visible') void load()
-  }, 15_000)
-}
-
-onMounted(() => {
-  void load()
-  startTimer()
-})
-
-onUnmounted(() => {
-  if (timer) window.clearInterval(timer)
-})
+usePolling(load)
 </script>
 
 <template>
@@ -112,16 +98,12 @@ onUnmounted(() => {
         <h2>{{ t('dashboard.title') }}</h2>
         <p class="page-subtitle">{{ t('dashboard.subtitle') }}</p>
       </div>
-      <button class="btn" type="button" :disabled="loading" @click="load">
-        <AppIcon name="refresh" :size="16" />
-        {{ t('common.refresh') }}
-      </button>
+      <span class="pill-note">{{ t('websites.autoRefresh') }}</span>
     </header>
 
     <div v-if="error" class="error-banner">
       <AppIcon name="alert" :size="18" />
       <span>{{ t('common.error') }}: {{ error }}</span>
-      <button class="btn small" type="button" @click="load">{{ t('common.retry') }}</button>
     </div>
 
     <div v-if="!summary && loading" class="loading">{{ t('common.loading') }}…</div>
@@ -184,37 +166,6 @@ onUnmounted(() => {
               <dd>{{ formatBytes(summary.response_size_today) }}</dd>
             </div>
           </dl>
-        </div>
-      </section>
-
-      <section class="card quick-card">
-        <div class="card-header">
-          <div>
-            <h3>{{ t('dashboard.quickLinks') }}</h3>
-            <p>{{ t('dashboard.cacheHint') }}</p>
-          </div>
-        </div>
-        <div class="quick-links">
-          <button class="quick-link" type="button" @click="navigate('/websites')">
-            <AppIcon name="websites" :size="18" />
-            <span>{{ t('nav.websites') }}</span>
-            <AppIcon name="arrow" :size="14" />
-          </button>
-          <button class="quick-link" type="button" @click="navigate('/certificates')">
-            <AppIcon name="certificates" :size="18" />
-            <span>{{ t('nav.certificates') }}</span>
-            <AppIcon name="arrow" :size="14" />
-          </button>
-          <button class="quick-link" type="button" @click="navigate('/gateways')">
-            <AppIcon name="gateways" :size="18" />
-            <span>{{ t('nav.gateways') }}</span>
-            <AppIcon name="arrow" :size="14" />
-          </button>
-          <button class="quick-link" type="button" @click="navigate('/logs')">
-            <AppIcon name="logs" :size="18" />
-            <span>{{ t('nav.logs') }}</span>
-            <AppIcon name="arrow" :size="14" />
-          </button>
         </div>
       </section>
     </template>

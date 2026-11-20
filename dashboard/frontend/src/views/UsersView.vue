@@ -1,12 +1,15 @@
 <script setup lang="ts">
-import { onMounted, ref } from 'vue'
+import { computed, ref } from 'vue'
 import AppIcon from '../components/AppIcon.vue'
 import EmptyState from '../components/EmptyState.vue'
+import SelectField from '../components/SelectField.vue'
 import StatusBadge from '../components/StatusBadge.vue'
 import { api, type UserSummary } from '../api'
+import { usePolling } from '../composables/usePolling'
 import { errorMessage, formatDate } from '../format'
 import { t } from '../i18n'
 import { session } from '../session'
+import { notifySuccess } from '../toast'
 
 const items = ref<UserSummary[]>([])
 const loading = ref(false)
@@ -21,6 +24,7 @@ const newSecret = ref('')
 const newSecretUser = ref('')
 
 const roles = ['admin', 'user', 'view']
+const roleOptions = computed(() => roles.map((role) => ({ value: role, label: role })))
 
 async function load(): Promise<void> {
   loading.value = true
@@ -51,17 +55,13 @@ async function create(): Promise<void> {
     newSecret.value = result.totp_secret
     newSecretUser.value = result.user.username
     showForm.value = false
+    notifySuccess(t('users.create'))
     await load()
   } catch (reason) {
     formError.value = errorMessage(reason)
   } finally {
     submitting.value = false
   }
-}
-
-function onRoleChange(user: UserSummary, event: Event): void {
-  const value = (event.target as HTMLSelectElement).value
-  void updateRole(user, value)
 }
 
 async function updateRole(user: UserSummary, role: string): Promise<void> {
@@ -83,6 +83,7 @@ async function resetTotp(user: UserSummary): Promise<void> {
     const result = await api.resetUserTotp(user.id)
     newSecret.value = result.totp_secret
     newSecretUser.value = user.username
+    notifySuccess(t('users.resetTotp'))
   } catch (reason) {
     error.value = errorMessage(reason)
   }
@@ -114,7 +115,7 @@ function isSelf(user: UserSummary): boolean {
   return session.user?.id === user.id
 }
 
-onMounted(load)
+usePolling(load, 30_000)
 </script>
 
 <template>
@@ -130,17 +131,13 @@ onMounted(load)
           <AppIcon name="plus" :size="16" />
           {{ t('users.add') }}
         </button>
-        <button class="btn" type="button" :disabled="loading" @click="load">
-          <AppIcon name="refresh" :size="16" />
-          {{ t('common.refresh') }}
-        </button>
+        <span class="pill-note">{{ t('websites.autoRefresh') }}</span>
       </div>
     </header>
 
     <div v-if="error" class="error-banner">
       <AppIcon name="alert" :size="18" />
       <span>{{ error }}</span>
-      <button class="btn small" type="button" @click="load">{{ t('common.retry') }}</button>
     </div>
 
     <div v-if="newSecret" class="card" style="margin-bottom: 18px">
@@ -162,9 +159,7 @@ onMounted(load)
       </div>
       <div style="display: grid; gap: 6px">
         <label class="field-label">{{ t('users.role') }}</label>
-        <select v-model="role" class="input">
-          <option v-for="item in roles" :key="item" :value="item">{{ item }}</option>
-        </select>
+        <SelectField v-model="role" :options="roleOptions" />
       </div>
       <div v-if="formError" class="form-error">{{ formError }}</div>
       <div class="button-row">
@@ -204,14 +199,12 @@ onMounted(load)
                 </div>
               </td>
               <td>
-                <select
-                  class="input"
-                  :value="user.role"
+                <SelectField
+                  :model-value="user.role"
+                  :options="roleOptions"
                   :disabled="isSelf(user)"
-                  @change="onRoleChange(user, $event)"
-                >
-                  <option v-for="item in roles" :key="item" :value="item">{{ item }}</option>
-                </select>
+                  @update:model-value="(value) => updateRole(user, String(value))"
+                />
                 <StatusBadge
                   :status="user.role === 'admin' ? 'online' : 'info'"
                   :label="user.role"

@@ -76,6 +76,9 @@
 | F-60 | 缓存 Vary / HEAD / 304 | ✅ | 按 `Vary` 请求头保存多个变体（`*` 不缓存）；HEAD 从缓存 GET 返回（保留 Content-Length、无 body）；GET/HEAD `If-None-Match` 返回 304；LRU 按 (key, variant) 维护 |
 | F-61 | 统计准确性与时区 | ✅ | 分钟/日 `total_ips` 从原始日志去重；原始日志保留期可配（7..90 天）；面板“今日”按浏览器时区从原始日志计算（`tz_offset_minutes`，-840..840，响应回显） |
 | F-62 | mnt 本地运维 CLI + Docker 打包 | ✅ | `webgateway-mnt` 经 Unix socket（0600）获取管理员 TOTP 验证码/secret；`Dockerfile` + `docker-compose.yml`（dashboard/gateway/mnt，外部 DB） |
+| F-63 | 面板 UX 批量改造 | ✅ | 登录 TOTP 提示改为 ? 悬浮、顶部居中 Toast、分组导航 + DNS 服务商页、结构化站点表单、访问日志详情弹窗、全页面自动刷新、自定义下拉 |
+| F-64 | 证书申请代理 | ✅ | 设置页保存加密的 ACME HTTP(S) 代理；ACME 客户端经代理，DNS API 直连 |
+| F-65 | 网关默认端口 | ✅ | 默认监听 80/443；systemd 使用 CAP_NET_BIND_SERVICE，Docker 用非 root 端口 sysctl |
 
 ### 1.5 测试
 
@@ -379,7 +382,9 @@
   dashboard/gateway 提供 Prometheus `/metrics`（默认回环）
 - 运维：`webgateway-mnt` 本地 Unix socket 获取管理员 TOTP（默认验证码，`--secret` 输出 secret+URI）；
   仓库提供 Dockerfile / docker-compose.yml / docker.env.example
-- 网关数据面：每 IP 令牌桶限流、站点级上游健康检查/失败摘除、HTTP/3 流式响应与停机 drain、
+- 面板：登录 TOTP 提示（? 悬浮）+ 顶部 Toast；分组导航；DNS 服务商页；站点结构化表单（cache/health/backends）；
+  访问日志详情弹窗；所有列表自动刷新；自定义 Select；设置页可配 ACME 代理。
+- 网关数据面：默认监听 80/443；每 IP 令牌桶限流、站点级上游健康检查/失败摘除、HTTP/3 流式响应与停机 drain、
   缓存 Vary/HEAD/304、资源上限（连接/header/body）、CONNECT 白名单与 Alt-Svc
 - 证书：手动上传 + ACME（Let's Encrypt 实测签发；ZeroSSL 需 EAB）→ 网关 SNI 加载验证通过，见 `certificates.md`
 - 实时协议：Nezha gRPC（h2c/TLS/双向流）与 MCSManager WS（101/鉴权/长连接）已用真实软件验证，见 `e2e-realtime.md`

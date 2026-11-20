@@ -3,6 +3,7 @@ import { computed, ref } from 'vue'
 import AppIcon from '../components/AppIcon.vue'
 import CertificatesView from '../views/CertificatesView.vue'
 import DashboardView from '../views/DashboardView.vue'
+import DnsProvidersView from '../views/DnsProvidersView.vue'
 import GatewaysView from '../views/GatewaysView.vue'
 import LogsView from '../views/LogsView.vue'
 import NotFoundView from '../views/NotFoundView.vue'
@@ -21,20 +22,43 @@ interface NavItem {
   icon: string
 }
 
-const allNavigation: NavItem[] = [
-  { path: '/', key: 'nav.dashboard', icon: 'dashboard' },
-  { path: '/websites', key: 'nav.websites', icon: 'websites' },
-  { path: '/certificates', key: 'nav.certificates', icon: 'certificates' },
-  { path: '/gateways', key: 'nav.gateways', icon: 'gateways' },
-  { path: '/logs', key: 'nav.logs', icon: 'logs' },
-  { path: '/users', key: 'nav.users', icon: 'users' },
-  { path: '/settings', key: 'nav.settings', icon: 'settings' },
+interface NavGroup {
+  key: MessageKey
+  items: NavItem[]
+}
+
+const allGroups: NavGroup[] = [
+  {
+    key: 'nav.groupOverview',
+    items: [{ path: '/', key: 'nav.dashboard', icon: 'dashboard' }],
+  },
+  {
+    key: 'nav.groupTraffic',
+    items: [
+      { path: '/websites', key: 'nav.websites', icon: 'websites' },
+      { path: '/certificates', key: 'nav.certificates', icon: 'certificates' },
+      { path: '/dns', key: 'nav.dns', icon: 'dns' },
+      { path: '/logs', key: 'nav.logs', icon: 'logs' },
+    ],
+  },
+  {
+    key: 'nav.groupInfra',
+    items: [{ path: '/gateways', key: 'nav.gateways', icon: 'gateways' }],
+  },
+  {
+    key: 'nav.groupSystem',
+    items: [
+      { path: '/users', key: 'nav.users', icon: 'users' },
+      { path: '/settings', key: 'nav.settings', icon: 'settings' },
+    ],
+  },
 ]
 
 const views = {
   '/': DashboardView,
   '/websites': WebsitesView,
   '/certificates': CertificatesView,
+  '/dns': DnsProvidersView,
   '/gateways': GatewaysView,
   '/logs': LogsView,
   '/users': UsersView,
@@ -43,9 +67,15 @@ const views = {
 
 const menuOpen = ref(false)
 const isAdmin = computed(() => ['admin', 'service'].includes(session.user?.role ?? ''))
-const navigation = computed(() =>
-  allNavigation.filter((item) => item.path !== '/users' || isAdmin.value),
+const groups = computed<NavGroup[]>(() =>
+  allGroups
+    .map((group) => ({
+      ...group,
+      items: group.items.filter((item) => item.path !== '/users' || isAdmin.value),
+    }))
+    .filter((group) => group.items.length > 0),
 )
+const navigation = computed(() => groups.value.flatMap((group) => group.items))
 const current = computed(() => navigation.value.find((item) => item.path === route.path))
 const title = computed(() => (current.value ? t(current.value.key) : t('notFound.title')))
 const activeView = computed(() => views[route.path as keyof typeof views] ?? NotFoundView)
@@ -86,18 +116,21 @@ async function logout(): Promise<void> {
       </button>
 
       <nav class="nav" aria-label="Main navigation">
-        <button
-          v-for="item in navigation"
-          :key="item.path"
-          type="button"
-          class="nav-item"
-          :class="{ active: route.path === item.path }"
-          :aria-current="route.path === item.path ? 'page' : undefined"
-          @click="go(item.path)"
-        >
-          <AppIcon :name="item.icon" :size="19" />
-          <span>{{ t(item.key) }}</span>
-        </button>
+        <div v-for="group in groups" :key="group.key" class="nav-group">
+          <p class="nav-group-label">{{ t(group.key) }}</p>
+          <button
+            v-for="item in group.items"
+            :key="item.path"
+            type="button"
+            class="nav-item"
+            :class="{ active: route.path === item.path }"
+            :aria-current="route.path === item.path ? 'page' : undefined"
+            @click="go(item.path)"
+          >
+            <AppIcon :name="item.icon" :size="19" />
+            <span>{{ t(item.key) }}</span>
+          </button>
+        </div>
       </nav>
 
       <div class="sidebar-footer">
@@ -150,7 +183,7 @@ async function logout(): Promise<void> {
 
       <footer class="footer">
         <span>{{ t('app.footer') }}</span>
-        <span>schema v5 · 3000/api</span>
+        <span>schema v6 · 3000/api</span>
       </footer>
     </div>
 

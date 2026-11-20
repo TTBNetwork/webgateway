@@ -91,6 +91,10 @@ pub fn router(
         .route("/api/users/{id}", patch(update_user).delete(delete_user))
         .route("/api/users/{id}/totp", post(reset_user_totp))
         .route("/api/users/{id}/revoke", post(revoke_user))
+        .route(
+            "/api/settings/acme-proxy",
+            get(get_acme_proxy).put(put_acme_proxy),
+        )
         .route_layer(middleware::from_fn(require_admin));
 
     let protected = read
@@ -1107,9 +1111,12 @@ async fn logs(
 
     let rows = sqlx::query(
         "SELECT r.id, r.host, r.method, r.path, r.remote_addr, r.http_version,
+                r.website_id,
+                r.headers::text AS request_headers,
                 r.body_length::text AS request_size,
                 to_char(r.requested_at, 'YYYY-MM-DD\"T\"HH24:MI:SS\"Z\"') AS requested_at,
                 s.status::int AS status,
+                s.headers::text AS response_headers,
                 s.body_length::text AS response_size
            FROM access_request_logs r
            LEFT JOIN access_response_logs s ON s.id = r.id
@@ -1131,6 +1138,17 @@ async fn logs(
                 "path": row.try_get::<String, _>("path").map_err(internal)?,
                 "remote_addr": row.try_get::<String, _>("remote_addr").map_err(internal)?,
                 "http_version": row.try_get::<String, _>("http_version").map_err(internal)?,
+                "website_id": row.try_get::<Option<String>, _>("website_id").map_err(internal)?,
+                "request_headers": row
+                    .try_get::<Option<String>, _>("request_headers")
+                    .map_err(internal)?
+                    .map(|raw| parse_json(&raw))
+                    .unwrap_or(Value::Null),
+                "response_headers": row
+                    .try_get::<Option<String>, _>("response_headers")
+                    .map_err(internal)?
+                    .map(|raw| parse_json(&raw))
+                    .unwrap_or(Value::Null),
                 "request_size": row.try_get::<String, _>("request_size").map_err(internal)?,
                 "response_size": row.try_get::<Option<String>, _>("response_size").map_err(internal)?,
                 "requested_at": row.try_get::<String, _>("requested_at").map_err(internal)?,
@@ -1140,6 +1158,62 @@ async fn logs(
         .collect::<Result<Vec<_>, ApiError>>()?;
 
     Ok(Json(json!({ "items": items })))
+}
+
+#[derive(Debug, Deserialize)]
+struct AcmeProxyRequest {
+    url: Option<String>,
+}
+
+async fn get_acme_proxy(State(state): State<AppState>) -> Result<Json<Value>, ApiError> {
+    let sealed: Option<String> = sqlx::query_scalar(
+        "SELECT value ->> 'url' FROM configurations WHERE key = 'acme_http_proxy'",
+    )
+    .fetch_optional(state.database.pool())
+    .await
+    .map_err(internal)?;
+    let url = match sealed {
+        Some(value) => Some(shared::crypto::open(&value).map_err(internal)?),
+        None => None,
+    };
+    Ok(Json(json!({ "url": url })))
+}
+
+async fn put_acme_proxy(
+    State(state): State<AppState>,
+    Json(payload): Json<AcmeProxyRequest>,
+) -> Result<Json<Value>, ApiError> {
+    let url = payload
+        .url
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty());
+    if let Some(value) = &url {
+        let parsed = url::Url::parse(value).map_err(bad_request)?;
+        if !matches!(parsed.scheme(), "http" | "https") || parsed.host_str().is_none() {
+            return Err(bad_request("proxy URL must be http(s) with a host"));
+        }
+    }
+    match &url {
+        Some(value) => {
+            let sealed = shared::crypto::seal(value).map_err(internal)?;
+            sqlx::query(
+                "INSERT INTO configurations (key, value)
+                 VALUES ('acme_http_proxy', jsonb_build_object('url', $1::text))
+                 ON CONFLICT (key) DO UPDATE SET value = EXCLUDED.value",
+            )
+            .bind(&sealed)
+            .execute(state.database.pool())
+            .await
+            .map_err(internal)?;
+        }
+        None => {
+            sqlx::query("DELETE FROM configurations WHERE key = 'acme_http_proxy'")
+                .execute(state.database.pool())
+                .await
+                .map_err(internal)?;
+        }
+    }
+    Ok(Json(json!({ "url": url })))
 }
 
 fn parse_json(raw: &str) -> Value {

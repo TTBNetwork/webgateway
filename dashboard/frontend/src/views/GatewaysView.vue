@@ -1,9 +1,10 @@
 <script setup lang="ts">
-import { onMounted, ref } from 'vue'
+import { ref } from 'vue'
 import AppIcon from '../components/AppIcon.vue'
 import EmptyState from '../components/EmptyState.vue'
 import StatusBadge from '../components/StatusBadge.vue'
 import { api, type Gateway } from '../api'
+import { usePolling } from '../composables/usePolling'
 import { errorMessage, formatDate, formatRelative } from '../format'
 import { t } from '../i18n'
 
@@ -27,7 +28,7 @@ async function load(): Promise<void> {
   }
 }
 
-onMounted(load)
+usePolling(load, 20_000)
 </script>
 
 <template>
@@ -38,16 +39,12 @@ onMounted(load)
         <h2>{{ t('gateways.title') }}</h2>
         <p class="page-subtitle">{{ t('gateways.subtitle') }}</p>
       </div>
-      <button class="btn" type="button" :disabled="loading" @click="load">
-        <AppIcon name="refresh" :size="16" />
-        {{ t('common.refresh') }}
-      </button>
+      <span class="pill-note">{{ t('websites.autoRefresh') }}</span>
     </header>
 
     <div v-if="error" class="error-banner">
       <AppIcon name="alert" :size="18" />
       <span>{{ error }}</span>
-      <button class="btn small" type="button" @click="load">{{ t('common.retry') }}</button>
     </div>
 
     <div v-if="loading && items.length === 0" class="loading">{{ t('common.loading') }}…</div>

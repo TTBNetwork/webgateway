@@ -1,5 +1,6 @@
 import { clearSession, type SessionUser } from './session'
 import { navigate } from './router'
+import { notifyError } from './toast'
 
 export interface TrafficPoint {
   bucket: string
@@ -115,10 +116,26 @@ export interface AccessLog {
   path: string
   remote_addr: string
   http_version: string
+  website_id: string | null
+  request_headers: Record<string, unknown> | null
+  response_headers: Record<string, unknown> | null
   request_size: string
   response_size: string | null
   requested_at: string
   status: number | null
+}
+
+export interface DnsProviderInput {
+  name?: string
+  domains: string[]
+  kind?: string
+  from_env: boolean
+  secret_id?: string
+  secret_key?: string
+}
+
+export interface AcmeProxy {
+  url: string | null
 }
 
 export interface LoginResponse {
@@ -159,7 +176,9 @@ async function send<T>(path: string, method: string, body?: unknown): Promise<T>
     throw new Error('Unauthorized')
   }
   if (!response.ok) {
-    throw new Error(await errorText(response))
+    const message = await errorText(response)
+    notifyError(message)
+    throw new Error(message)
   }
 
   return (await response.json()) as T
@@ -204,6 +223,12 @@ export const api = {
   deleteCertificate: (id: string) =>
     send<{ deleted: boolean }>('certificates/' + encodeURIComponent(id), 'DELETE'),
   dnsProviders: () => request<Items<DnsProvider>>('dns-providers').then((value) => value.items),
+  createDnsProvider: (payload: DnsProviderInput) =>
+    send<{ id: string }>('dns-providers', 'POST', payload),
+  deleteDnsProvider: (id: string) =>
+    send<{ deleted: boolean }>('dns-providers/' + encodeURIComponent(id), 'DELETE'),
+  getAcmeProxy: () => request<AcmeProxy>('settings/acme-proxy'),
+  updateAcmeProxy: (url: string | null) => send<AcmeProxy>('settings/acme-proxy', 'PUT', { url }),
   users: () => request<Items<UserSummary>>('users').then((value) => value.items),
   createUser: (username: string, role: string) =>
     send<CreateUserResult>('users', 'POST', { username, role }),

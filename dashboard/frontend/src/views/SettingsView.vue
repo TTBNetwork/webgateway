@@ -1,9 +1,44 @@
 <script setup lang="ts">
+import { computed, onMounted, ref } from 'vue'
 import AppIcon from '../components/AppIcon.vue'
+import { api } from '../api'
+import { errorMessage } from '../format'
 import { t } from '../i18n'
 import { prefs } from '../prefs'
 import { navigate } from '../router'
 import { clearSession, session } from '../session'
+import { notifySuccess } from '../toast'
+
+const canAdmin = computed(() => ['admin', 'service'].includes(session.user?.role ?? ''))
+const proxyUrl = ref('')
+const proxySaving = ref(false)
+const proxyError = ref('')
+
+async function loadProxy(): Promise<void> {
+  if (!canAdmin.value) return
+  try {
+    proxyUrl.value = (await api.getAcmeProxy()).url ?? ''
+  } catch (reason) {
+    proxyError.value = t('settings.acmeProxyLoadFailed') + ': ' + errorMessage(reason)
+  }
+}
+
+async function saveProxy(): Promise<void> {
+  proxySaving.value = true
+  proxyError.value = ''
+  try {
+    const value = proxyUrl.value.trim()
+    const result = await api.updateAcmeProxy(value || null)
+    proxyUrl.value = result.url ?? ''
+    notifySuccess(value ? t('settings.acmeProxySaved') : t('settings.acmeProxyCleared'))
+  } catch (reason) {
+    proxyError.value = errorMessage(reason)
+  } finally {
+    proxySaving.value = false
+  }
+}
+
+onMounted(loadProxy)
 
 function signOut(): void {
   clearSession()
@@ -112,6 +147,29 @@ function setLocale(locale: 'zh' | 'en'): void {
         </div>
       </section>
 
+      <section v-if="canAdmin" class="card setting-card">
+        <div class="card-header">
+          <div>
+            <h3>{{ t('settings.acmeProxy') }}</h3>
+            <p>{{ t('settings.acmeProxyHint') }}</p>
+          </div>
+        </div>
+
+        <div class="proxy-form">
+          <input
+            v-model="proxyUrl"
+            class="input"
+            :placeholder="t('settings.acmeProxyPlaceholder')"
+            autocomplete="off"
+          />
+          <button class="btn" type="button" :disabled="proxySaving" @click="saveProxy">
+            {{ proxySaving ? t('websites.saving') : t('common.save') }}
+          </button>
+        </div>
+        <p v-if="proxyError" class="form-error">{{ proxyError }}</p>
+        <p v-else class="muted small-text">{{ t('settings.acmeProxyAdmin') }}</p>
+      </section>
+
       <section class="card setting-card">
         <div class="card-header">
           <div>
@@ -127,7 +185,7 @@ function setLocale(locale: 'zh' | 'en'): void {
           </div>
           <div>
             <dt>{{ t('settings.schema') }}</dt>
-            <dd class="mono">v2</dd>
+            <dd class="mono">v6</dd>
           </div>
           <div>
             <dt>{{ t('settings.version') }}</dt>

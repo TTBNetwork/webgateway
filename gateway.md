@@ -370,5 +370,6 @@ max_tracked_ips = 100000
 
 ````bash
 # 配置：复制 config.example.toml 为 config.toml，或用环境变量
-DATABASE_URL='postgres://...' GATEWAY_PORTS=8080,8443 GATEWAY_HTTP3_PORTS=8443 cargo run -p gateway
+DATABASE_URL='postgres://...' GATEWAY_PORTS=80,443 GATEWAY_HTTP3_PORTS=443 cargo run -p gateway
+# 本地非 root 开发时可用 GATEWAY_PORTS=8080,8443（需要额外权限或高位端口）
 ````

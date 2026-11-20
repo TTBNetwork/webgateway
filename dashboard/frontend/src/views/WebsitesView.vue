@@ -1,11 +1,21 @@
 <script setup lang="ts">
-import { computed, onMounted, ref } from 'vue'
+import { computed, reactive, ref } from 'vue'
 import AppIcon from '../components/AppIcon.vue'
 import EmptyState from '../components/EmptyState.vue'
+import AppModal from '../components/AppModal.vue'
 import { api, type Website, type WebsiteInput } from '../api'
+import { usePolling } from '../composables/usePolling'
 import { errorMessage, formatDate } from '../format'
 import { t } from '../i18n'
 import { session } from '../session'
+import { notifySuccess } from '../toast'
+
+interface BackendDraft {
+  url: string
+  weight: number
+  priority: number
+  extra: Record<string, unknown>
+}
 
 const items = ref<Website[]>([])
 const loading = ref(false)
@@ -14,14 +24,28 @@ const search = ref('')
 
 const showForm = ref(false)
 const editingId = ref<string | null>(null)
-const name = ref('')
-const hostsText = ref('')
-const portsText = ref('')
-const backendsText = ref('')
-const configText = ref('')
 const submitting = ref(false)
 const formError = ref('')
-const formSuccess = ref('')
+const advancedOpen = ref(false)
+
+const form = reactive({
+  name: '',
+  hosts: '',
+  ports: '80, 443',
+  backends: [{ url: 'http://127.0.0.1:8080', weight: 1, priority: 0, extra: {} }] as BackendDraft[],
+  cacheEnabled: false,
+  cacheTtl: 60,
+  cacheTypes: '',
+  cacheExtra: {} as Record<string, unknown>,
+  healthEnabled: false,
+  healthPath: '/',
+  healthInterval: 10,
+  healthTimeout: 2,
+  unhealthyThreshold: 2,
+  healthyThreshold: 2,
+  healthExtra: {} as Record<string, unknown>,
+  extra: '{}',
+})
 
 const canAdmin = computed(() => ['admin', 'service'].includes(session.user?.role ?? ''))
 
@@ -36,6 +60,18 @@ const filtered = computed(() => {
 
 function backendCount(value: unknown): number {
   return Array.isArray(value) ? value.length : 0
+}
+
+function cacheEnabled(item: Website): boolean {
+  const config = item.config as Record<string, unknown> | null
+  const cache = config?.cache as Record<string, unknown> | undefined
+  return Boolean(cache?.enabled)
+}
+
+function healthEnabled(item: Website): boolean {
+  const config = item.config as Record<string, unknown> | null
+  const health = config?.health_check as Record<string, unknown> | undefined
+  return Boolean(health?.enabled)
 }
 
 function parseHosts(value: string): string[] {
@@ -59,55 +95,170 @@ function parsePorts(value: string): number[] {
     })
 }
 
-function parseJson(value: string, label: string): unknown {
+function parseExtra(): Record<string, unknown> {
   try {
-    return JSON.parse(value)
+    const value = JSON.parse(form.extra || '{}') as unknown
+    if (!value || typeof value !== 'object' || Array.isArray(value)) {
+      throw new Error('not an object')
+    }
+    return value as Record<string, unknown>
   } catch {
-    throw new Error(t('websites.invalidJson', { label }))
+    throw new Error(t('websites.invalidJson', { label: t('websites.advanced') }))
   }
+}
+
+function resetForm(): void {
+  form.name = ''
+  form.hosts = ''
+  form.ports = '80, 443'
+  form.backends = [{ url: 'http://127.0.0.1:8080', weight: 1, priority: 0, extra: {} }]
+  form.cacheEnabled = false
+  form.cacheTtl = 60
+  form.cacheTypes = ''
+  form.cacheExtra = {}
+  form.healthEnabled = false
+  form.healthPath = '/'
+  form.healthInterval = 10
+  form.healthTimeout = 2
+  form.unhealthyThreshold = 2
+  form.healthyThreshold = 2
+  form.healthExtra = {}
+  form.extra = '{}'
+  advancedOpen.value = false
+  formError.value = ''
 }
 
 function openCreate(): void {
   editingId.value = null
-  name.value = ''
-  hostsText.value = ''
-  portsText.value = ''
-  backendsText.value = '[\n  { "url": "http://127.0.0.1:8080" }\n]'
-  configText.value = '{}'
-  formError.value = ''
-  formSuccess.value = ''
+  resetForm()
   showForm.value = true
 }
 
 function openEdit(item: Website): void {
   editingId.value = item.id
-  name.value = item.name ?? ''
-  hostsText.value = item.hosts.join(', ')
-  portsText.value = item.ports.join(', ')
-  backendsText.value = JSON.stringify(item.backends, null, 2)
-  configText.value = JSON.stringify(item.config, null, 2)
-  formError.value = ''
-  formSuccess.value = ''
+  resetForm()
+  form.name = item.name ?? ''
+  form.hosts = item.hosts.join(', ')
+  form.ports = item.ports.join(', ')
+
+  if (Array.isArray(item.backends)) {
+    const backends = item.backends as Array<Record<string, unknown>>
+    form.backends = backends.map((backend) => {
+      const { url, weight, priority, ...rest } = backend
+      return {
+        url: String(url ?? ''),
+        weight: Number(weight ?? 1) || 1,
+        priority: Number(priority ?? 0) || 0,
+        extra: rest,
+      }
+    })
+  }
+
+  const config = (item.config ?? {}) as Record<string, unknown>
+  const cache = (config.cache ?? {}) as Record<string, unknown>
+  const health = (config.health_check ?? {}) as Record<string, unknown>
+  form.cacheEnabled = Boolean(cache.enabled)
+  form.cacheTtl = Number(cache.ttl ?? 60) || 60
+  form.cacheTypes = Array.isArray(cache.content_types)
+    ? cache.content_types.map(String).join(', ')
+    : ''
+  const cacheExtra = { ...cache }
+  delete cacheExtra.enabled
+  delete cacheExtra.ttl
+  delete cacheExtra.content_types
+  form.cacheExtra = cacheExtra
+  form.healthEnabled = Boolean(health.enabled)
+  form.healthPath = String(health.path ?? '/')
+  form.healthInterval = Number(health.interval_secs ?? 10) || 10
+  form.healthTimeout = Number(health.timeout_secs ?? 2) || 2
+  form.unhealthyThreshold = Number(health.unhealthy_threshold ?? 2) || 2
+  form.healthyThreshold = Number(health.healthy_threshold ?? 2) || 2
+  const healthExtra = { ...health }
+  delete healthExtra.enabled
+  delete healthExtra.path
+  delete healthExtra.interval_secs
+  delete healthExtra.timeout_secs
+  delete healthExtra.unhealthy_threshold
+  delete healthExtra.healthy_threshold
+  form.healthExtra = healthExtra
+
+  const extra = { ...config }
+  delete extra.cache
+  delete extra.health_check
+  form.extra = JSON.stringify(extra, null, 2)
   showForm.value = true
+}
+
+function addBackend(): void {
+  form.backends.push({ url: '', weight: 1, priority: 0, extra: {} })
+}
+
+function removeBackend(index: number): void {
+  form.backends.splice(index, 1)
 }
 
 async function submit(): Promise<void> {
   formError.value = ''
   submitting.value = true
   try {
+    const hosts = parseHosts(form.hosts)
+    const ports = parsePorts(form.ports)
+    if (hosts.length === 0) {
+      throw new Error(t('websites.hosts'))
+    }
+    if (form.backends.length === 0) {
+      throw new Error(t('websites.noBackends'))
+    }
+    const backends = form.backends.map((backend) => {
+      const url = backend.url.trim()
+      if (!/^https?:\/\//i.test(url)) {
+        throw new Error(t('websites.invalidBackend'))
+      }
+      return {
+        ...backend.extra,
+        url,
+        weight: Math.max(1, Math.round(backend.weight) || 1),
+        ...(backend.priority > 0 ? { priority: Math.round(backend.priority) } : {}),
+      }
+    })
+
+    const config = parseExtra()
+    if (form.cacheEnabled) {
+      config.cache = {
+        ...form.cacheExtra,
+        enabled: true,
+        ttl: Math.max(1, Math.round(form.cacheTtl) || 60),
+        content_types: form.cacheTypes
+          .split(',')
+          .map((value) => value.trim())
+          .filter(Boolean),
+      }
+    }
+    if (form.healthEnabled) {
+      config.health_check = {
+        ...form.healthExtra,
+        enabled: true,
+        path: form.healthPath.trim() || '/',
+        interval_secs: Math.max(1, Math.round(form.healthInterval) || 10),
+        timeout_secs: Math.max(1, Math.round(form.healthTimeout) || 2),
+        unhealthy_threshold: Math.max(1, Math.round(form.unhealthyThreshold) || 2),
+        healthy_threshold: Math.max(1, Math.round(form.healthyThreshold) || 2),
+      }
+    }
+
     const payload: WebsiteInput = {
-      name: name.value.trim() || undefined,
-      hosts: parseHosts(hostsText.value),
-      ports: parsePorts(portsText.value),
-      backends: parseJson(backendsText.value || '[]', 'backends'),
-      config: parseJson(configText.value || '{}', 'config'),
+      name: form.name.trim() || undefined,
+      hosts,
+      ports,
+      backends,
+      config,
     }
     if (editingId.value) {
       await api.updateWebsite(editingId.value, payload)
     } else {
       await api.createWebsite(payload)
     }
-    formSuccess.value = t('websites.saved')
+    notifySuccess(t('websites.saved'))
     showForm.value = false
     await load()
   } catch (reason) {
@@ -140,7 +291,7 @@ async function load(): Promise<void> {
   }
 }
 
-onMounted(load)
+usePolling(load)
 </script>
 
 <template>
@@ -152,13 +303,10 @@ onMounted(load)
         <p class="page-subtitle">{{ t('websites.subtitle') }}</p>
       </div>
       <div class="button-row">
+        <span class="pill-note">{{ t('websites.autoRefresh') }}</span>
         <button v-if="canAdmin" class="btn" type="button" @click="openCreate">
           <AppIcon name="plus" :size="16" />
           {{ t('websites.add') }}
-        </button>
-        <button class="btn" type="button" :disabled="loading" @click="load">
-          <AppIcon name="refresh" :size="16" />
-          {{ t('common.refresh') }}
         </button>
       </div>
     </header>
@@ -166,51 +314,7 @@ onMounted(load)
     <div v-if="error" class="error-banner">
       <AppIcon name="alert" :size="18" />
       <span>{{ error }}</span>
-      <button class="btn small" type="button" @click="load">{{ t('common.retry') }}</button>
     </div>
-
-    <section v-if="showForm" class="card" style="display: grid; gap: 14px; margin-bottom: 18px">
-      <div style="display: grid; gap: 6px">
-        <label class="field-label">{{ t('websites.name') }}</label>
-        <input v-model="name" class="input" :placeholder="t('websites.nameHint')" />
-      </div>
-      <div style="display: grid; gap: 6px">
-        <label class="field-label">{{ t('websites.hosts') }}</label>
-        <input v-model="hostsText" class="input" :placeholder="t('websites.hostsHint')" />
-      </div>
-      <div style="display: grid; gap: 6px">
-        <label class="field-label">{{ t('websites.ports') }}</label>
-        <input v-model="portsText" class="input" :placeholder="t('websites.portsHint')" />
-      </div>
-      <div style="display: grid; gap: 6px">
-        <label class="field-label">{{ t('websites.backends') }}</label>
-        <textarea
-          v-model="backendsText"
-          class="input"
-          rows="6"
-          style="font-family: ui-monospace, monospace"
-        ></textarea>
-      </div>
-      <div style="display: grid; gap: 6px">
-        <label class="field-label">{{ t('websites.config') }}</label>
-        <textarea
-          v-model="configText"
-          class="input"
-          rows="4"
-          style="font-family: ui-monospace, monospace"
-        ></textarea>
-      </div>
-      <div v-if="formError" class="form-error">{{ formError }}</div>
-      <div v-if="formSuccess" class="form-success">{{ formSuccess }}</div>
-      <div class="button-row">
-        <button class="btn" type="button" :disabled="submitting" @click="submit">
-          {{ submitting ? t('websites.saving') : t('websites.save') }}
-        </button>
-        <button class="btn small" type="button" @click="showForm = false">
-          {{ t('certs.cancel') }}
-        </button>
-      </div>
-    </section>
 
     <div class="toolbar">
       <label class="search-box">
@@ -230,6 +334,7 @@ onMounted(load)
               <th>{{ t('websites.hosts') }}</th>
               <th>{{ t('websites.ports') }}</th>
               <th>{{ t('websites.backends') }}</th>
+              <th>{{ t('websites.cache') }} / {{ t('websites.health') }}</th>
               <th>{{ t('websites.updated') }}</th>
               <th v-if="canAdmin">{{ t('common.actions') }}</th>
             </tr>
@@ -252,6 +357,15 @@ onMounted(load)
               </td>
               <td>
                 <span class="badge badge-info">{{ backendCount(item.backends) }}</span>
+              </td>
+              <td>
+                <div class="chips">
+                  <span v-if="cacheEnabled(item)" class="chip">{{ t('websites.cache') }}</span>
+                  <span v-if="healthEnabled(item)" class="chip">{{ t('websites.health') }}</span>
+                  <span v-if="!cacheEnabled(item) && !healthEnabled(item)" class="muted small-text"
+                    >—</span
+                  >
+                </div>
               </td>
               <td class="muted">{{ formatDate(item.updated_at) }}</td>
               <td v-if="canAdmin">
@@ -277,5 +391,149 @@ onMounted(load)
       :title="search ? t('common.empty') : t('websites.empty')"
       :hint="search ? t('websites.search') : t('websites.emptyHint')"
     />
+
+    <AppModal
+      v-if="showForm"
+      :title="editingId ? t('websites.editTitle') : t('websites.createTitle')"
+      wide
+      @close="showForm = false"
+    >
+      <div class="form-section">
+        <h4>{{ t('websites.basics') }}</h4>
+        <p class="muted small-text">{{ t('websites.basicsHint') }}</p>
+        <div class="form-grid">
+          <label class="field">
+            <span class="field-label">{{ t('websites.name') }}</span>
+            <input v-model="form.name" class="input" :placeholder="t('websites.nameHint')" />
+          </label>
+          <label class="field">
+            <span class="field-label">{{ t('websites.ports') }}</span>
+            <input v-model="form.ports" class="input" :placeholder="t('websites.portsHint')" />
+          </label>
+          <label class="field field-wide">
+            <span class="field-label">{{ t('websites.hosts') }}</span>
+            <input v-model="form.hosts" class="input" :placeholder="t('websites.hostsHint')" />
+          </label>
+        </div>
+      </div>
+
+      <div class="form-section">
+        <div class="section-head">
+          <div>
+            <h4>{{ t('websites.backends') }}</h4>
+            <p class="muted small-text">{{ t('websites.backendsHint') }}</p>
+          </div>
+          <button class="btn small" type="button" @click="addBackend">
+            <AppIcon name="plus" :size="14" />
+            {{ t('websites.addBackend') }}
+          </button>
+        </div>
+        <div class="backend-list">
+          <div v-for="(backend, index) in form.backends" :key="index" class="backend-row">
+            <label class="field backend-url">
+              <span class="field-label">{{ t('websites.backendUrl') }}</span>
+              <input v-model="backend.url" class="input" placeholder="http://127.0.0.1:8080" />
+            </label>
+            <label class="field backend-number">
+              <span class="field-label">{{ t('websites.weight') }}</span>
+              <input v-model.number="backend.weight" class="input" type="number" min="1" />
+            </label>
+            <label class="field backend-number">
+              <span class="field-label">{{ t('websites.priority') }}</span>
+              <input v-model.number="backend.priority" class="input" type="number" min="0" />
+            </label>
+            <button
+              class="icon-btn backend-remove"
+              type="button"
+              :aria-label="t('websites.delete')"
+              @click="removeBackend(index)"
+            >
+              <AppIcon name="close" :size="16" />
+            </button>
+          </div>
+        </div>
+      </div>
+
+      <div class="form-columns">
+        <div class="form-section">
+          <div class="section-head">
+            <div>
+              <h4>{{ t('websites.cache') }}</h4>
+            </div>
+            <label class="switch">
+              <input v-model="form.cacheEnabled" type="checkbox" />
+              <span>{{ t('websites.cacheEnabled') }}</span>
+            </label>
+          </div>
+          <div class="form-grid">
+            <label class="field">
+              <span class="field-label">{{ t('websites.cacheTtl') }}</span>
+              <input v-model.number="form.cacheTtl" class="input" type="number" min="1" />
+            </label>
+            <label class="field">
+              <span class="field-label">{{ t('websites.cacheTypes') }}</span>
+              <input v-model="form.cacheTypes" class="input" placeholder="text/html, image/*" />
+            </label>
+          </div>
+          <p class="muted small-text">{{ t('websites.cacheTypesHint') }}</p>
+        </div>
+
+        <div class="form-section">
+          <div class="section-head">
+            <div>
+              <h4>{{ t('websites.health') }}</h4>
+            </div>
+            <label class="switch">
+              <input v-model="form.healthEnabled" type="checkbox" />
+              <span>{{ t('websites.healthEnabled') }}</span>
+            </label>
+          </div>
+          <div class="form-grid">
+            <label class="field">
+              <span class="field-label">{{ t('websites.healthPath') }}</span>
+              <input v-model="form.healthPath" class="input" placeholder="/" />
+            </label>
+            <label class="field">
+              <span class="field-label">{{ t('websites.healthInterval') }}</span>
+              <input v-model.number="form.healthInterval" class="input" type="number" min="1" />
+            </label>
+            <label class="field">
+              <span class="field-label">{{ t('websites.healthTimeout') }}</span>
+              <input v-model.number="form.healthTimeout" class="input" type="number" min="1" />
+            </label>
+            <label class="field">
+              <span class="field-label">{{ t('websites.unhealthyThreshold') }}</span>
+              <input v-model.number="form.unhealthyThreshold" class="input" type="number" min="1" />
+            </label>
+            <label class="field">
+              <span class="field-label">{{ t('websites.healthyThreshold') }}</span>
+              <input v-model.number="form.healthyThreshold" class="input" type="number" min="1" />
+            </label>
+          </div>
+        </div>
+      </div>
+
+      <div class="form-section">
+        <button class="advanced-toggle" type="button" @click="advancedOpen = !advancedOpen">
+          <AppIcon :name="advancedOpen ? 'arrow' : 'plus'" :size="14" />
+          {{ t('websites.advanced') }}
+        </button>
+        <template v-if="advancedOpen">
+          <p class="muted small-text">{{ t('websites.advancedHint') }}</p>
+          <textarea v-model="form.extra" class="input code" rows="8"></textarea>
+        </template>
+      </div>
+
+      <div v-if="formError" class="form-error">{{ formError }}</div>
+
+      <template #footer>
+        <button class="btn" type="button" :disabled="submitting" @click="submit">
+          {{ submitting ? t('websites.saving') : t('websites.save') }}
+        </button>
+        <button class="btn" type="button" @click="showForm = false">
+          {{ t('certs.cancel') }}
+        </button>
+      </template>
+    </AppModal>
   </div>
 </template>

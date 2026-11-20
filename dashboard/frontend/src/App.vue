@@ -1,6 +1,7 @@
 <script setup lang="ts">
 import { computed, onMounted, watchEffect } from 'vue'
 import AppLayout from './layouts/AppLayout.vue'
+import ToastHost from './components/ToastHost.vue'
 import LoginView from './views/LoginView.vue'
 import { api } from './api'
 import { navigate, route } from './router'
@@ -34,4 +35,5 @@ watchEffect(() => {
   </div>
   <LoginView v-else-if="showLogin" />
   <AppLayout v-else />
+  <ToastHost />
 </template>

@@ -156,6 +156,8 @@ Restart=on-failure
 RestartSec=3
 KillSignal=SIGTERM
 TimeoutStopSec=45
+RuntimeDirectory=webgateway
+RuntimeDirectoryMode=0750
 NoNewPrivileges=true
 ProtectSystem=strict
 ProtectHome=true
@@ -196,7 +198,7 @@ WantedBy=multi-user.target
 ```
 
 dashboard 收到 SIGTERM/Ctrl-C 后停止 accept，最多等待 30 秒；gateway 同样在 10 秒内 drain 在途
-HTTP/TCP、flush 访问日志并标记 offline（HTTP/3 在途请求尚未 drain）。
+HTTP/TCP 与 HTTP/3 请求、flush 访问日志并标记 offline。
 
 ## 7. gateway 配置
 
@@ -383,6 +385,9 @@ groups:
 | 统计 distinct IP / 保留期 / 面板时区 | ✅ | feat/stats-accuracy（4a0450b） | minute/daily distinct、tz offset |
 | 仓库主线整理（B-21） | ✅ | master de1da22（原 v2 + 31 个 feature 分支合并）；v1 为旧原型 | 分支已删除，默认分支 master |
 | mnt TOTP CLI / Docker 打包 | ✅ | mnt + Dockerfile/docker-compose | socket 0600、mnt code 登录 200、compose YAML |
+| 面板 UX 批量改造 | ✅ | 本轮 master（00b1955 之后） | Toast/提示、分组菜单、DNS 页、结构化站点表单、日志详情、自动刷新、自定义 Select |
+| 证书申请代理 | ✅ | 本轮 master | 设置页保存（加密）、ACME 客户端经代理；DNS API 直连 |
+| 网关默认 80/443 | ✅ | 本轮 master | systemd AmbientCapabilities、Docker 80/443 + 非 root 端口 sysctl |
 
 **最终验证**（2026-11-20）：
 
@@ -414,7 +419,8 @@ docker compose ps
 curl -fsS http://127.0.0.1:3000/health
 ```
 
-面板监听 `3000`（映射到宿主 3000），网关默认监听容器内 `8080`（映射到宿主 8080）。
+面板监听 `3000`（映射到宿主 3000），网关默认监听容器内 `80` 和 `443`（映射到宿主 80/443；compose 通过
+`net.ipv4.ip_unprivileged_port_start=0` 允许非 root 用户绑定）。
 `SECRET_ENCRYPTION_KEY` 在 compose 中为必填；dashboard 与所有 gateway 必须使用同一个值。
 数据库使用外部 PostgreSQL（compose 不内置 Postgres）；gateway 启动前 dashboard 必须完成迁移。
 
@@ -424,12 +430,12 @@ curl -fsS http://127.0.0.1:3000/health
 |---|---|---|
 | `mnt-init` | 修正共享卷权限 | 以 root 运行一次，把 `/run/webgateway` chown 给 UID 10001 |
 | `dashboard` | 主控 + 面板 | `3000`，健康检查 `/health`；首次启动迁移 schema |
-| `gateway` | 边缘节点 | 默认 `8080`，依赖 dashboard 健康 |
+| `gateway` | 边缘节点 | 默认 `80`/`443`，依赖 dashboard 健康 |
 | `mnt` | 本地运维 CLI | profile `tools`，默认不启动，按需 `run --rm` |
 
 镜像通过 `docker compose build` 构建；dashboard/gateway/mnt 共用同一个镜像，仅 command 不同。
-生产部署时把 gateway 的宿主端口改为 80/443（保持容器内 8080/8443，或调整 `GATEWAY_PORTS`），
-并在前面放 TLS 反向代理/负载均衡。
+生产部署时保持宿主 80/443；如需在前面放 TLS 反向代理/负载均衡，可调整 `GATEWAY_PORTS` 与
+映射端口。HTTP/3 需要额外设置 `GATEWAY_HTTP3_PORTS`（例如 443）并放行 UDP 443。
 
 ### 13.3 本地取 TOTP
 
@@ -468,5 +474,8 @@ TOTP: 123456
 宿主机 systemd 部署时，把 release 的 `webgateway-mnt` 安装到 `/usr/local/bin/`（可再建 `mnt` 软链），
 并以 root 运行；socket 默认路径与 dashboard 一致。Docker 部署直接使用第 13.3 节的 compose 命令。
 
-安全说明：TOTP 是管理员登录因子，所以 mnt 故意只提供本地 socket；
-能读该 socket/secret 的账号等同于管理员。不要把 socket 放到共享目录或挂载给不可信容器。
+证书申请代理：面板“设置 → 证书申请代理”保存一个可选的 HTTP(S) 代理 URL（加密存储），
+仅用于 ACME CA 请求；Tencent DNSPod API 仍直连。留空即直连。代理 URL 变更后下一次签发生效。
+
+安全说明：TOTP 是管理员登录因子，所以 mnt 故意只提供本地 socket；能读该 socket/secret 的账号等同于管理员。
+不要把 socket 放到共享目录或挂载给不可信容器。

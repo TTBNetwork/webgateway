@@ -522,3 +522,18 @@
   mnt（tools profile），数据库使用外部 PostgreSQL。
 - 文档：`deployment.md` 第 13/14 节、`issue.md` F-62。
 
+### 面板 UX 批量改造 + 网关默认 80/443（2026-11-20）
+- 登录页 TOTP 说明改为“?”悬浮提示；登录失败与所有 API 错误统一在顶部居中 Toast 展示，成功操作也有提示。
+- 侧栏改为分组菜单（总览 / 站点与流量 / 基础设施 / 系统），新增 DNS 服务商页面；移除概览页快捷入口。
+- 站点新增/编辑改为结构化表单：Host、端口、后端 URL/权重/优先级、缓存（TTL/类型）、健康检查（路径/间隔/超时/阈值），
+  高级 JSON 保留未暴露字段；不再要求用户手写整段配置。
+- 访问日志点击行弹出详情（请求/响应头、客户端、协议、大小、站点、时间）；日志接口补 headers/website_id。
+- 证书表单增加 DNS 服务商选择；设置页增加“证书申请代理”（加密存储，仅 ACME CA 请求使用，DNS API 直连）。
+- 所有列表页改为 15–30s 自动刷新（页面隐藏时暂停），移除手动刷新/重试按钮；日志条数切换立即重新加载。
+- 所有原生 select 替换为自定义下拉组件（用户角色、日志条数、DNS 类型）。
+- gateway 部署默认端口改为 80/443：systemd 单元加 CAP_NET_BIND_SERVICE，Docker compose 映射 80/443 并用
+  net.ipv4.ip_unprivileged_port_start=0 允许非 root 用户绑定；目标机已切换并验证 80/443 监听。
+- 验证：frontend format/lint/type-check/build 通过；backend 26/53/19+3 测试通过；目标机新面板资源加载正常，
+  /api/logs 返回 headers，ACME 代理设置可读写且密文以 enc:v1: 存储，80/443 返回 404（无匹配站点）而面板 200。
+- 文档：deployment.md 第 6/12/13/14 节、issue.md F-63/F-64/F-65。
+
