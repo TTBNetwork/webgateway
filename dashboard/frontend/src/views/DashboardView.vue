@@ -26,53 +26,51 @@ const error = ref('')
 const cards = computed<Card[]>(() => {
   const data = summary.value
   if (!data) return []
-  const errors = data.e4xx_today + data.e5xx_today
-  const rate = data.responses_today > 0 ? (errors / data.responses_today) * 100 : 0
-  const totalBytes = Number(data.requests_size_today) + Number(data.response_size_today)
+  const rate4 = data.responses_today > 0 ? (data.e4xx_today / data.responses_today) * 100 : 0
+  const rate5 = data.responses_today > 0 ? (data.e5xx_today / data.responses_today) * 100 : 0
 
   return [
     {
-      label: t('dashboard.websites'),
-      value: formatNumber(data.websites),
-      hint: t('dashboard.websitesHint'),
-      icon: 'websites',
-      tone: 'accent' as const,
-    },
-    {
-      label: t('dashboard.certificates'),
-      value: formatNumber(data.certificates),
-      hint: t('certs.subtitle'),
-      icon: 'certificates',
-      tone: 'default' as const,
-    },
-    {
-      label: t('dashboard.gateways'),
-      value: formatNumber(data.gateways_online) + ' / ' + formatNumber(data.gateways_total),
-      hint: t('dashboard.gatewaysHint'),
-      icon: 'gateways',
-      tone: data.gateways_online > 0 ? ('success' as const) : ('warning' as const),
-    },
-    {
-      label: t('dashboard.requestsToday'),
+      label: t('dashboard.requestCount'),
       value: formatNumber(data.requests_today),
-      hint: t('dashboard.requestsHint'),
+      hint: t('dashboard.today'),
       icon: 'logs',
       tone: 'default' as const,
     },
     {
-      label: t('dashboard.errorsToday'),
-      value: formatNumber(errors),
-      hint: t('dashboard.errorsHint'),
-      icon: 'alert',
-      tone: errors > 0 ? ('warning' as const) : ('success' as const),
+      label: t('dashboard.pv'),
+      value: formatNumber(data.responses_today),
+      hint: t('dashboard.pvHint'),
+      icon: 'websites',
+      tone: 'default' as const,
     },
     {
-      label: t('dashboard.errorRate'),
-      value: rate.toFixed(1) + '%',
-      hint: formatBytes(totalBytes) + ' ' + t('dashboard.traffic24h'),
-      icon: 'dashboard',
-      tone:
-        rate >= 5 ? ('danger' as const) : rate > 0 ? ('warning' as const) : ('success' as const),
+      label: t('dashboard.uv'),
+      value: formatNumber(data.uv_today),
+      hint: t('dashboard.uvHint'),
+      icon: 'users',
+      tone: 'default' as const,
+    },
+    {
+      label: t('dashboard.uniqueIPs'),
+      value: formatNumber(data.unique_ips_today),
+      hint: t('dashboard.ipHint'),
+      icon: 'gateways',
+      tone: 'default' as const,
+    },
+    {
+      label: t('dashboard.e4xxCount'),
+      value: formatNumber(data.e4xx_today),
+      hint: t('dashboard.errorRateHint', { rate: rate4.toFixed(2) + '%' }),
+      icon: 'alert',
+      tone: data.e4xx_today > 0 ? ('warning' as const) : ('success' as const),
+    },
+    {
+      label: t('dashboard.e5xxCount'),
+      value: formatNumber(data.e5xx_today),
+      hint: t('dashboard.errorRateHint', { rate: rate5.toFixed(2) + '%' }),
+      icon: 'alert',
+      tone: data.e5xx_today > 0 ? ('danger' as const) : ('success' as const),
     },
   ]
 })
@@ -115,7 +113,7 @@ onMounted(() => {
         <h2>{{ t('dashboard.title') }}</h2>
         <p class="page-subtitle">{{ t('dashboard.subtitle') }}</p>
       </div>
-      <span class="pill-note">{{ t('websites.autoRefresh') }}</span>
+      <span class="pill-note">{{ t('dashboard.autoRefresh') }}</span>
     </header>
 
     <div v-if="error" class="error-banner">

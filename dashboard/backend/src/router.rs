@@ -781,6 +781,14 @@ async fn summary(
               WHERE s.responsed_at >= b.start_at
                 AND s.responsed_at < b.start_at + interval '1 day'
                 AND s.status::int BETWEEN 500 AND 599) AS e5xx,
+            (SELECT count(DISTINCT r.remote_addr)
+               FROM access_request_logs r, bounds b
+              WHERE r.requested_at >= b.start_at
+                AND r.requested_at < b.start_at + interval '1 day') AS unique_ips,
+            (SELECT count(DISTINCT (r.remote_addr, COALESCE(r.headers->>'user-agent', '')))
+               FROM access_request_logs r, bounds b
+              WHERE r.requested_at >= b.start_at
+                AND r.requested_at < b.start_at + interval '1 day') AS uv,
             (SELECT COALESCE(sum(r.body_length::numeric), 0)::text
                FROM access_request_logs r, bounds b
               WHERE r.requested_at >= b.start_at
@@ -833,6 +841,8 @@ async fn summary(
         "responses_today": today.try_get::<i64, _>("responses").map_err(internal)?,
         "e4xx_today": today.try_get::<i64, _>("e4xx").map_err(internal)?,
         "e5xx_today": today.try_get::<i64, _>("e5xx").map_err(internal)?,
+        "uv_today": today.try_get::<i64, _>("uv").map_err(internal)?,
+        "unique_ips_today": today.try_get::<i64, _>("unique_ips").map_err(internal)?,
         "requests_size_today": today.try_get::<String, _>("request_size").map_err(internal)?,
         "response_size_today": today.try_get::<String, _>("response_size").map_err(internal)?,
         "traffic": traffic,
