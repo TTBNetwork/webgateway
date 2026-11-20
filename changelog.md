@@ -586,9 +586,10 @@
 - 新增轻量 `/api/qps`，按浏览器 5s 墙钟边界（:02.5、:07.5…）轮询最近 5 分钟，
 
 ### SafeLine 指标信息对齐（2026-11-20）
-- 概览 KPI 改为请求侧指标：请求次数、访问次数（PV）、独立访客（UV）、独立 IP、
-  4xx 错误数、5xx 错误数；错误卡直接展示错误率。
-- 后端 summary 增加 uv_today / unique_ips_today：UV 按 IP + User-Agent 去重，
-  IP 为今日去重来源地址；PV 使用响应数近似。
-- 页面说明改为 QPS 每 5 秒刷新，与“只有 QPS 卡片轮询”一致。
-- WAF 专属的拦截次数/攻击 IP 不伪造，网关侧暂不展示。
+
+### ECharts 2D 地图与图表（2026-11-20）
+- 复用 SafeLine 2D 统计页的 Apache ECharts 5.4.1 与 world.js 世界地图，
+  通过 EChart 组件加载；地图改为 ECharts geo + visualMap + effectScatter，
+  不再是手写 SVG。
+- QPS 柱状图和 24h 流量曲线同步换成 ECharts，保留 5s 轮询和主题色。
+- 地图保留来源排行、节点标记和内网/未配置提示；新增 2D 标识。

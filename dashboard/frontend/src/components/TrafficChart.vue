@@ -1,54 +1,13 @@
 <script setup lang="ts">
 import { computed } from 'vue'
+import EChart from './EChart.vue'
 import type { TrafficPoint } from '../api'
+import { chartTheme } from '../charts'
 import { formatNumber } from '../format'
-import { prefs } from '../prefs'
 import { t } from '../i18n'
+import { prefs } from '../prefs'
 
 const props = defineProps<{ points: TrafficPoint[] }>()
-
-const width = 720
-const height = 220
-const padding = 26
-
-const maxValue = computed(() => Math.max(1, ...props.points.map((point) => point.requests)))
-
-const series = computed(() =>
-  props.points.map((point, index) => {
-    const x =
-      props.points.length === 1
-        ? width / 2
-        : padding + (index / (props.points.length - 1)) * (width - padding * 2)
-    const y = height - padding - (point.requests / maxValue.value) * (height - padding * 2)
-    return { ...point, x, y }
-  }),
-)
-
-const linePath = computed(() =>
-  series.value
-    .map(
-      (point, index) => (index === 0 ? 'M' : 'L') + point.x.toFixed(1) + ' ' + point.y.toFixed(1),
-    )
-    .join(' '),
-)
-
-const areaPath = computed(() => {
-  const first = series.value.at(0)
-  const last = series.value.at(-1)
-  if (!first || !last) return ''
-  return (
-    linePath.value +
-    ' L ' +
-    last.x.toFixed(1) +
-    ' ' +
-    String(height - padding) +
-    ' L ' +
-    first.x.toFixed(1) +
-    ' ' +
-    String(height - padding) +
-    ' Z'
-  )
-})
 
 function timeLabel(bucket: string): string {
   const date = new Date(bucket)
@@ -60,51 +19,81 @@ function timeLabel(bucket: string): string {
 }
 
 const labels = computed(() => {
-  const first = series.value.at(0)
-  const last = series.value.at(-1)
+  const first = props.points.at(0)
+  const last = props.points.at(-1)
   return {
     start: first ? timeLabel(first.bucket) : '',
     end: last ? timeLabel(last.bucket) : '',
+  }
+})
+
+const maxValue = computed(() => Math.max(1, ...props.points.map((point) => point.requests)))
+
+const option = computed<Record<string, unknown>>(() => {
+  const theme = chartTheme()
+  return {
+    animationDuration: 320,
+    animationEasing: 'cubicOut',
+    grid: { left: 4, right: 4, top: 12, bottom: 6, containLabel: false },
+    tooltip: {
+      trigger: 'axis',
+      backgroundColor: theme.panel,
+      borderColor: theme.border,
+      textStyle: { color: theme.text, fontSize: 11 },
+      formatter: (params: { name: string; value: number }[]) => {
+        const first = params[0]
+        return first
+          ? first.name + '<br/>' + formatNumber(first.value) + ' ' + t('dashboard.requests')
+          : ''
+      },
+    },
+    xAxis: {
+      type: 'category',
+      boundaryGap: false,
+      data: props.points.map((point) => timeLabel(point.bucket)),
+      axisLine: { show: false },
+      axisTick: { show: false },
+      axisLabel: { show: false },
+    },
+    yAxis: {
+      type: 'value',
+      show: false,
+      splitLine: {
+        lineStyle: { color: theme.border, type: 'dashed' },
+      },
+    },
+    series: [
+      {
+        name: t('dashboard.requests'),
+        type: 'line',
+        smooth: 0.28,
+        showSymbol: false,
+        data: props.points.map((point) => point.requests),
+        lineStyle: { color: theme.accent, width: 2.2 },
+        areaStyle: {
+          color: {
+            type: 'linear',
+            x: 0,
+            y: 0,
+            x2: 0,
+            y2: 1,
+            colorStops: [
+              { offset: 0, color: theme.accent + '55' },
+              { offset: 1, color: theme.accent + '00' },
+            ],
+          },
+        },
+      },
+    ],
   }
 })
 </script>
 
 <template>
   <div class="chart">
-    <svg
-      v-if="series.length"
-      :viewBox="'0 0 ' + width + ' ' + height"
-      role="img"
-      :aria-label="t('dashboard.traffic24h')"
-    >
-      <defs>
-        <linearGradient id="traffic-fill" x1="0" x2="0" y1="0" y2="1">
-          <stop offset="0%" stop-color="currentColor" stop-opacity="0.32" />
-          <stop offset="100%" stop-color="currentColor" stop-opacity="0" />
-        </linearGradient>
-      </defs>
-      <path :d="areaPath" fill="url(#traffic-fill)" class="chart-area" />
-      <path
-        :d="linePath"
-        fill="none"
-        class="chart-line"
-        stroke-width="2.5"
-        stroke-linejoin="round"
-        stroke-linecap="round"
-      />
-      <circle
-        v-for="point in series"
-        :key="point.bucket"
-        :cx="point.x"
-        :cy="point.y"
-        r="3"
-        class="chart-dot"
-      >
-        <title>{{ point.bucket }} · {{ formatNumber(point.requests) }}</title>
-      </circle>
-    </svg>
+    <EChart v-if="points.length" :option="option" class="chart-echart" />
     <div v-else class="chart-empty">{{ t('dashboard.trafficEmpty') }}</div>
-    <div v-if="series.length" class="chart-axis">
+    <div v-if="points.length" class="chart-axis">
       <span>{{ labels.start }}</span>
       <span>{{ t('dashboard.requests') }} · max {{ formatNumber(maxValue) }}</span>
       <span>{{ labels.end }}</span>

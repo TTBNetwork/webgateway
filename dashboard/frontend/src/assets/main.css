@@ -2058,6 +2058,27 @@ body.modal-open {
   color: var(--muted);
   font-size: 10px;
 }
+.geo-modes {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  flex: 0 0 auto;
+}
+.geo-mode {
+  padding: 3px 9px;
+  border: 1px solid var(--border);
+  border-radius: 7px;
+  color: var(--muted);
+  font-size: 10px;
+}
+.geo-mode.is-active {
+  color: var(--accent-contrast);
+  border-color: var(--accent);
+  background: var(--accent);
+}
+.geo-echart {
+  min-height: 330px;
+}
 .geo-canvas {
   position: relative;
   flex: 1;
@@ -2194,6 +2215,12 @@ body.modal-open {
 .qps-chart {
   min-height: 170px;
 }
+.qps-echart {
+  height: 170px;
+}
+.chart-echart {
+  height: 236px;
+}
 .qps-chart svg {
   display: block;
   width: 100%;
@@ -2234,7 +2261,8 @@ body.modal-open {
     grid-template-columns: 1fr;
   }
   .geo-canvas,
-  .geo-canvas svg {
+  .geo-canvas svg,
+  .geo-echart {
     min-height: 300px;
   }
   .dashboard-stack {
@@ -2247,7 +2275,8 @@ body.modal-open {
     display: none;
   }
   .geo-canvas,
-  .geo-canvas svg {
+  .geo-canvas svg,
+  .geo-echart {
     min-height: 220px;
   }
   .dashboard-stack {
