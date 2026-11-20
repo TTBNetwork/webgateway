@@ -44,8 +44,14 @@ pnpm build
 The panel currently uses a small built-in history router and native `fetch`; it
 does not add runtime dependencies beyond Vue.
 
-For production static hosting, configure the web server to fall back to
-`index.html` for unknown paths (SPA history mode).
+The dashboard can host this build directly: set `DASHBOARD_STATIC_DIR` to the
+`dist/` directory and it serves the panel with SPA history fallback, a panel CSP,
+hashed-asset caching and the same hardening headers as the API. This keeps the
+panel and `/api` on one origin, which the session cookie requires. Deploying the
+build behind an external web server instead works too; see
+[deployment.md](../../deployment.md) for the nginx/systemd setup, but the proxy
+must serve `/api` and `/health` from the same origin and reproduce the security
+headers.
 
 ## Security notes
 

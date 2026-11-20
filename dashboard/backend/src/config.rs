@@ -1,6 +1,6 @@
 //! Dashboard configuration: config.toml plus environment overrides.
 
-use std::io;
+use std::{io, path::PathBuf};
 
 use anyhow::{Context, bail};
 use serde::Deserialize;
@@ -34,6 +34,9 @@ pub struct ServerConfig {
     pub api_tokens: Vec<String>,
     /// Panel session (JWT + HttpOnly cookie) lifetime in seconds.
     pub session_ttl_secs: u64,
+    /// Serve the built panel from this directory (SPA fallback). When unset the
+    /// dashboard only exposes the API and /health.
+    pub static_dir: Option<PathBuf>,
 }
 
 impl Default for ServerConfig {
@@ -43,6 +46,7 @@ impl Default for ServerConfig {
             api_token: None,
             api_tokens: Vec::new(),
             session_ttl_secs: DEFAULT_SESSION_TTL_SECS,
+            static_dir: None,
         }
     }
 }
@@ -86,6 +90,9 @@ pub fn load() -> anyhow::Result<Config> {
     if let Ok(token) = std::env::var("DASHBOARD_API_TOKEN") {
         config.server.api_tokens.push(token);
     }
+    if let Ok(dir) = std::env::var("DASHBOARD_STATIC_DIR") {
+        config.server.static_dir = Some(PathBuf::from(dir));
+    }
     if let Ok(raw) = std::env::var("DASHBOARD_TOKEN_EXPIRES") {
         config.server.session_ttl_secs = raw
             .parse()
@@ -98,6 +105,15 @@ pub fn load() -> anyhow::Result<Config> {
 
     if config.database.url.trim().is_empty() {
         bail!("database url is not configured: set DATABASE_URL or [database].url in config.toml");
+    }
+
+    if let Some(dir) = &config.server.static_dir {
+        if !dir.is_dir() {
+            bail!("static dir is not a directory: {}", dir.display());
+        }
+        if !dir.join("index.html").is_file() {
+            bail!("static dir does not contain index.html: {}", dir.display());
+        }
     }
 
     for token in config.server.service_tokens() {

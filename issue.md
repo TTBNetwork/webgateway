@@ -67,6 +67,7 @@
 | F-37 | 前端工程 | ✅ | 自写 history router + 原生 fetch；无新增依赖；package/lock 未改 |
 | F-38 | 面板验证 | ✅ | Vite 代理 401/200 + 真实数据；format/lint/build 通过 |
 | F-53 | 面板会话与响应安全 | ✅ | HttpOnly Cookie 会话、安全响应头（CSP/HSTS/nosniff/DENY/no-store）、内部错误脱敏 + error_id、服务令牌恒时比较多值轮换 |
+| F-54 | 生产部署基础 | ✅ | dashboard 静态托管 + SPA 回退（`DASHBOARD_STATIC_DIR`）、路径穿越防护与资源缓存策略、SIGTERM/Ctrl-C 优雅停机（30s）、`deployment.md` 部署指南 |
 
 ### 1.5 测试
 
@@ -119,7 +120,6 @@
 ### 3.1 管理面 / 安全
 
 - U-02 JWT refresh token / 短期令牌、每用户 API Key 管理（用户管理、RBAC、撤销已完成）
-- U-04 面板静态托管 / SPA fallback / nginx 配置
 - U-05 审计日志、操作记录、配置回滚
 - U-06 IP / User-Agent 拦截（按用户要求暂缓）
 - U-07 限流、WAF、CC 防护
@@ -327,16 +327,16 @@
 - B-23 无 cargo audit / 前端依赖审计。
 - B-24 PostgreSQL 18 beta + uint128 扩展的生产兼容/升级风险。
 - B-25 无 metrics/告警：日志丢弃、缓存命中、统计延迟、上游错误率均不可观测。
-- B-26 面板无静态托管/SPA fallback 配置；生产需 nginx 配置。
-- B-27 无 CSP/HSTS/X-Frame-Options 等安全响应头（API/health 已加，面板静态 HTML 仍由托管层负责）。
+- B-26 面板静态托管/SPA fallback（已修复，2026-11-20：`DASHBOARD_STATIC_DIR` 直接托管面板；nginx 仍可作为替代）。
+- B-27 无 CSP/HSTS/X-Frame-Options 等安全响应头（已修复，2026-11-20：API/health 与 dashboard 托管的面板均带安全头；外置 nginx 托管需自行配置）。
 - B-28 无 OpenAPI/接口契约测试，前端类型手工维护。
 
 ---
 
 ## 5. 当前状态
 
-- 最新分支：feat/dashboard-session-security（叠加在 feat/connect-alt-svc 之后）
-- 测试：网关 37、dashboard 20、shared 14 + 3 集成（含 stats 回填/分区回收）；前端 format/lint/type-check/build 通过
+- 最新分支：feat/production-deploy（叠加在 feat/dashboard-session-security 之后）
+- 测试：网关 37、dashboard 23、shared 14 + 3 集成（含 stats 回填/分区回收）；前端 format/lint/type-check/build 通过
 - 数据库：schema v6；2026-11-20 联调/统计/证书/CRUD/可靠性/资源上限/CONNECT/会话安全验证的临时数据已清理（websites/gateways/users/logs/stats = 0；测试证书已删除）
 - 管理面：站点/网关/用户 CRUD + admin/user/view RBAC + token_version 撤销；面板站点/用户编辑页完成；
   会话改为 HttpOnly Cookie + 安全响应头，服务令牌可多值轮换，内部错误统一脱敏

@@ -321,3 +321,22 @@
   服务令牌过期；面板静态 HTML 的安全头由托管层负责；CSRF 依赖 SameSite=Strict，未额外做 Origin 校验。
 - 文档：`issue.md` B-15/B-16/B-27/B-30、F-53、P-09；`dashboard/frontend/README.md`；
   `dashboard/backend/config.example.toml`；`certificates.md` API 认证说明。
+
+### 生产部署：面板静态托管 + SIGTERM 优雅停机（分支 `feat/production-deploy`）
+- 新增 `DASHBOARD_STATIC_DIR`（`[server].static_dir`）：dashboard 可直接托管构建后的面板，
+  `/api` 与 `/health` 优先，其余路径 SPA 回退到 `index.html`；未知 `/api/*` 仍返回 JSON 404。
+- 静态资源安全：路径穿越校验（拒绝 `..`、反斜杠、NUL）；按扩展名设置 Content-Type；
+  `/assets/*` 返回 `Cache-Control: public, max-age=31536000, immutable`，`index.html` 为 `no-store`。
+- CSP 按响应类型区分：面板 HTML 使用 `default-src 'self'` 策略（同源脚本 + 内联样式），
+  JSON API 保持 `default-src 'none'`；静态资源保留自身缓存策略，API 仍 no-store。
+- 优雅停机：dashboard 同时处理 SIGTERM 与 Ctrl-C，停止 accept 并最多等待 30 秒；随后退出调度任务。
+- 配置校验：`DASHBOARD_STATIC_DIR` 必须存在且包含 `index.html`，否则启动失败；`tokio` 增加 `fs` feature。
+- 实测（端口 13000/13001）：
+  - `/` 200 HTML + 面板 CSP + `no-store`；`/websites` SPA 回退 index；`/assets/*.js` immutable；
+  - `/api/nope` 404 JSON；`/assets/../../Cargo.toml` 不泄露文件（返回 index）；
+  - SIGTERM 后 exit 0、8ms 退出、端口释放，日志记录 received SIGTERM / dashboard stopped。
+- 新增 `deployment.md`：拓扑、构建、数据库备份/迁移、环境变量表、nginx/systemd 示例、
+  首次上线检查表与已知生产限制清单。
+- 测试：dashboard 23（新增 3）；fmt/clippy 通过。
+- 文档：`issue.md` B-26/B-27/U-04、F-54；`dashboard/backend/config.example.toml`；
+  `dashboard/frontend/README.md`。

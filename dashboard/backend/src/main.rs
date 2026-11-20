@@ -10,6 +10,8 @@ mod config;
 mod router;
 mod websites;
 
+use std::time::Duration;
+
 use shared::database::{Database, schema_version};
 use tracing::{Level, event};
 
@@ -34,19 +36,22 @@ async fn main() -> anyhow::Result<()> {
         Level::INFO,
         %address,
         schema_version = schema_version(),
+        static_dir = ?config.server.static_dir,
         "dashboard listening"
     );
 
-    axum::serve(
-        listener,
-        router::router(
-            database,
-            config.server.service_tokens(),
-            config.server.session_ttl_secs,
-        ),
-    )
-    .with_graceful_shutdown(shutdown_signal())
-    .await?;
+    let app = router::router(
+        database,
+        config.server.service_tokens(),
+        config.server.session_ttl_secs,
+        config.server.static_dir.clone(),
+    );
+    let server = axum::serve(listener, app).with_graceful_shutdown(shutdown_signal());
+    // Bound the drain so a stuck connection cannot block a redeploy forever.
+    match tokio::time::timeout(Duration::from_secs(30), server).await {
+        Ok(result) => result?,
+        Err(_) => event!(Level::WARN, "dashboard shutdown timed out after 30s"),
+    }
 
     stats_task.abort();
     certificate_task.abort();
@@ -54,8 +59,35 @@ async fn main() -> anyhow::Result<()> {
     Ok(())
 }
 
+/// Wait for SIGTERM (containers/systemd) or Ctrl-C, then drain gracefully.
 async fn shutdown_signal() {
-    if let Err(error) = tokio::signal::ctrl_c().await {
-        event!(Level::ERROR, %error, "failed to install the Ctrl-C handler");
+    let ctrl_c = async {
+        match tokio::signal::ctrl_c().await {
+            Ok(()) => {}
+            Err(error) => {
+                event!(Level::ERROR, %error, "failed to install the Ctrl-C handler");
+                std::future::pending::<()>().await;
+            }
+        }
+    };
+
+    #[cfg(unix)]
+    let terminate = async {
+        match tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate()) {
+            Ok(mut signal) => {
+                signal.recv().await;
+            }
+            Err(error) => {
+                event!(Level::ERROR, %error, "failed to install the SIGTERM handler");
+                std::future::pending::<()>().await;
+            }
+        }
+    };
+    #[cfg(not(unix))]
+    let terminate = std::future::pending::<()>();
+
+    tokio::select! {
+        () = ctrl_c => event!(Level::INFO, "received Ctrl-C, shutting down"),
+        () = terminate => event!(Level::INFO, "received SIGTERM, shutting down"),
     }
 }

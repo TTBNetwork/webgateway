@@ -22,3 +22,7 @@ port = 3000
 #   DASHBOARD_ADMIN_USERNAME / DASHBOARD_ADMIN_TOTP_SECRET / DASHBOARD_JWT_SECRET
 #   DASHBOARD_TOKEN_EXPIRES (seconds, default 604800, clamped to 300..2592000)
 #   DASHBOARD_API_TOKENS (comma-separated; DASHBOARD_API_TOKEN also accepted)
+#
+# Serve the built panel from this directory. Unknown paths fall back to
+# index.html (SPA history mode) while /api and /health keep their own routes.
+# static_dir = "dashboard/frontend/dist"

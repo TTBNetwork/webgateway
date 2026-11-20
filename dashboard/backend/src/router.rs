@@ -1,11 +1,16 @@
 //! Dashboard API and health endpoint.
 
-use std::{sync::Arc, time::Duration};
+use std::{
+    path::{Path as FsPath, PathBuf},
+    sync::Arc,
+    time::Duration,
+};
 
 use axum::{
     Json, Router,
+    body::Body,
     extract::{Extension, Path, Query, Request, State},
-    http::{HeaderMap, HeaderValue, StatusCode, header},
+    http::{HeaderMap, HeaderValue, StatusCode, Uri, header},
     middleware::{self, Next},
     response::{IntoResponse, Response},
     routing::{delete, get, patch, post, put},
@@ -23,6 +28,12 @@ use crate::websites;
 /// Name of the HttpOnly session cookie handed out by POST /api/auth/login.
 const SESSION_COOKIE: &str = "wg_session";
 
+/// CSP for JSON API responses and health checks.
+const API_CSP: &str =
+    "default-src 'none'; frame-ancestors 'none'; base-uri 'none'; form-action 'none'";
+/// CSP for the bundled panel. Inline styles are required by Vue style bindings.
+const PANEL_CSP: &str = "default-src 'self'; script-src 'self'; style-src 'self' 'unsafe-inline'; img-src 'self' data:; font-src 'self'; connect-src 'self'; frame-ancestors 'none'; base-uri 'none'; form-action 'self'";
+
 #[derive(Clone)]
 struct AppState {
     database: Database,
@@ -30,13 +41,21 @@ struct AppState {
     /// the previous token valid while it is rotated out.
     service_tokens: Arc<[String]>,
     session_ttl_secs: u64,
+    /// Built panel directory; when unset only /health and /api are served.
+    static_root: Option<Arc<PathBuf>>,
 }
 
-pub fn router(database: Database, service_tokens: Vec<String>, session_ttl_secs: u64) -> Router {
+pub fn router(
+    database: Database,
+    service_tokens: Vec<String>,
+    session_ttl_secs: u64,
+    static_dir: Option<PathBuf>,
+) -> Router {
     let state = AppState {
         database,
         service_tokens: Arc::from(service_tokens),
         session_ttl_secs,
+        static_root: static_dir.map(Arc::new),
     };
 
     let read = Router::new()
@@ -83,8 +102,122 @@ pub fn router(database: Database, service_tokens: Vec<String>, session_ttl_secs:
         .route("/health", get(health))
         .route("/api/auth/login", post(login))
         .merge(protected)
+        .fallback(serve_panel)
         .layer(middleware::from_fn(security_headers))
         .with_state(state)
+}
+
+/// Serve the built panel with SPA history fallback. Unknown /api paths stay
+/// JSON 404s so API clients never receive index.html.
+async fn serve_panel(State(state): State<AppState>, headers: HeaderMap, uri: Uri) -> Response {
+    let secure = is_https(&headers);
+    let path = uri.path();
+    if path == "/api" || path.starts_with("/api/") {
+        let mut response = api_not_found();
+        apply_security_headers(response.headers_mut(), secure);
+        return response;
+    }
+
+    let response = match state.static_root.as_deref() {
+        None => api_not_found(),
+        Some(root) => match safe_join(root, path.trim_start_matches('/')) {
+            Some(file) if file.is_file() => match tokio::fs::read(&file).await {
+                Ok(bytes) => static_response(&file, bytes),
+                Err(_) => panel_index(root).await,
+            },
+            _ => panel_index(root).await,
+        },
+    };
+
+    let mut response = response;
+    apply_security_headers(response.headers_mut(), secure);
+    response
+}
+
+async fn panel_index(root: &FsPath) -> Response {
+    let index = root.join("index.html");
+    match tokio::fs::read(&index).await {
+        Ok(bytes) => static_response(&index, bytes),
+        Err(_) => {
+            let mut response = Response::new(Body::from("panel not available\n"));
+            *response.status_mut() = StatusCode::NOT_FOUND;
+            response.headers_mut().insert(
+                header::CONTENT_TYPE,
+                HeaderValue::from_static("text/plain; charset=utf-8"),
+            );
+            response
+        }
+    }
+}
+
+/// Join a URL path to the static root, rejecting traversal and absolute paths.
+fn safe_join(root: &FsPath, relative: &str) -> Option<PathBuf> {
+    let mut path = root.to_path_buf();
+    let mut found = false;
+    for segment in relative.split('/') {
+        if segment.is_empty() || segment == "." {
+            continue;
+        }
+        if segment == ".." || segment.contains('\\') || segment.contains('\0') {
+            return None;
+        }
+        path.push(segment);
+        found = true;
+    }
+    found.then_some(path)
+}
+
+fn static_response(path: &FsPath, bytes: Vec<u8>) -> Response {
+    let content_type = content_type(path);
+    let cache = if path_has_hashed_assets(path) {
+        "public, max-age=31536000, immutable"
+    } else if content_type.starts_with("text/html") {
+        "no-store"
+    } else {
+        "no-cache"
+    };
+    let mut response = Response::new(Body::from(bytes));
+    let headers = response.headers_mut();
+    headers.insert(header::CONTENT_TYPE, HeaderValue::from_static(content_type));
+    headers.insert(header::CACHE_CONTROL, HeaderValue::from_static(cache));
+    response
+}
+
+fn path_has_hashed_assets(path: &FsPath) -> bool {
+    path.components().any(|component| {
+        component
+            .as_os_str()
+            .to_str()
+            .is_some_and(|value| value == "assets")
+    })
+}
+
+fn content_type(path: &FsPath) -> &'static str {
+    match path
+        .extension()
+        .and_then(|extension| extension.to_str())
+        .unwrap_or_default()
+        .to_ascii_lowercase()
+        .as_str()
+    {
+        "html" => "text/html; charset=utf-8",
+        "js" | "mjs" => "text/javascript; charset=utf-8",
+        "css" => "text/css; charset=utf-8",
+        "json" | "map" => "application/json",
+        "svg" => "image/svg+xml",
+        "png" => "image/png",
+        "jpg" | "jpeg" => "image/jpeg",
+        "webp" => "image/webp",
+        "ico" => "image/x-icon",
+        "woff2" => "font/woff2",
+        "woff" => "font/woff",
+        "txt" => "text/plain; charset=utf-8",
+        _ => "application/octet-stream",
+    }
+}
+
+fn api_not_found() -> Response {
+    (StatusCode::NOT_FOUND, Json(json!({ "error": "not found" }))).into_response()
 }
 
 /// Add hardening response headers to every dashboard response. The API only
@@ -97,11 +230,19 @@ async fn security_headers(request: Request, next: Next) -> Response {
 }
 
 fn apply_security_headers(headers: &mut HeaderMap, secure: bool) {
+    let content_type = headers
+        .get(header::CONTENT_TYPE)
+        .and_then(|value| value.to_str().ok())
+        .unwrap_or_default()
+        .to_ascii_lowercase();
+    let is_html = content_type.starts_with("text/html");
+    // JSON (or body-less) responses are API output: deny everything and never
+    // cache. Static assets keep the cache policy set by the file handler.
+    let is_api = content_type.is_empty() || content_type.starts_with("application/json");
+
     headers.insert(
         header::CONTENT_SECURITY_POLICY,
-        HeaderValue::from_static(
-            "default-src 'none'; frame-ancestors 'none'; base-uri 'none'; form-action 'none'",
-        ),
+        HeaderValue::from_static(if is_html { PANEL_CSP } else { API_CSP }),
     );
     headers.insert(
         header::X_CONTENT_TYPE_OPTIONS,
@@ -112,7 +253,9 @@ fn apply_security_headers(headers: &mut HeaderMap, secure: bool) {
         header::REFERRER_POLICY,
         HeaderValue::from_static("no-referrer"),
     );
-    headers.insert(header::CACHE_CONTROL, HeaderValue::from_static("no-store"));
+    if is_api {
+        headers.insert(header::CACHE_CONTROL, HeaderValue::from_static("no-store"));
+    }
     headers.insert(
         "permissions-policy",
         HeaderValue::from_static("geolocation=(), microphone=(), camera=()"),
@@ -1108,13 +1251,79 @@ mod tests {
             headers.get(header::X_CONTENT_TYPE_OPTIONS).unwrap(),
             "nosniff"
         );
-        assert!(headers.get(header::CONTENT_SECURITY_POLICY).is_some());
+        assert_eq!(
+            headers.get(header::CONTENT_SECURITY_POLICY).unwrap(),
+            API_CSP
+        );
         assert!(headers.get(header::STRICT_TRANSPORT_SECURITY).is_some());
         assert_eq!(headers.get(header::CACHE_CONTROL).unwrap(), "no-store");
 
         let mut plain = HeaderMap::new();
         apply_security_headers(&mut plain, false);
         assert!(plain.get(header::STRICT_TRANSPORT_SECURITY).is_none());
+    }
+
+    #[test]
+    fn html_gets_the_panel_csp_and_keeps_its_cache_policy() {
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            header::CONTENT_TYPE,
+            HeaderValue::from_static("text/html; charset=utf-8"),
+        );
+        headers.insert(header::CACHE_CONTROL, HeaderValue::from_static("no-store"));
+        apply_security_headers(&mut headers, false);
+        assert_eq!(
+            headers.get(header::CONTENT_SECURITY_POLICY).unwrap(),
+            PANEL_CSP
+        );
+        assert!(PANEL_CSP.contains("script-src 'self'"));
+        assert_eq!(headers.get(header::CACHE_CONTROL).unwrap(), "no-store");
+
+        let mut asset = HeaderMap::new();
+        asset.insert(
+            header::CONTENT_TYPE,
+            HeaderValue::from_static("text/javascript; charset=utf-8"),
+        );
+        asset.insert(
+            header::CACHE_CONTROL,
+            HeaderValue::from_static("public, max-age=31536000, immutable"),
+        );
+        apply_security_headers(&mut asset, false);
+        assert_eq!(
+            asset.get(header::CACHE_CONTROL).unwrap(),
+            "public, max-age=31536000, immutable"
+        );
+    }
+
+    #[test]
+    fn rejects_static_path_traversal() {
+        let root = FsPath::new("/srv/panel");
+        assert_eq!(
+            safe_join(root, "assets/app.js"),
+            Some(PathBuf::from("/srv/panel/assets/app.js"))
+        );
+        assert_eq!(safe_join(root, "/"), None);
+        assert_eq!(safe_join(root, ".."), None);
+        assert_eq!(safe_join(root, "assets/../../etc/passwd"), None);
+        assert_eq!(safe_join(root, "assets\\windows.js"), None);
+    }
+
+    #[test]
+    fn maps_static_content_types() {
+        assert_eq!(
+            content_type(FsPath::new("index.html")),
+            "text/html; charset=utf-8"
+        );
+        assert_eq!(
+            content_type(FsPath::new("app.js")),
+            "text/javascript; charset=utf-8"
+        );
+        assert_eq!(content_type(FsPath::new("logo.svg")), "image/svg+xml");
+        assert_eq!(content_type(FsPath::new("font.woff2")), "font/woff2");
+        assert_eq!(
+            content_type(FsPath::new("blob.bin")),
+            "application/octet-stream"
+        );
     }
 
     #[test]
