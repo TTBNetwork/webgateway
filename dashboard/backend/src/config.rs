@@ -4,7 +4,7 @@ use std::{io, path::PathBuf};
 
 use anyhow::{Context, bail};
 use serde::Deserialize;
-use shared::database::DatabaseConfig;
+use shared::{database::DatabaseConfig, stats::StatsConfig};
 use tracing::{Level, event};
 
 /// Minimum accepted lifetime for a panel session.
@@ -21,6 +21,7 @@ const MIN_RECOMMENDED_TOKEN_LEN: usize = 24;
 pub struct Config {
     pub database: DatabaseConfig,
     pub server: ServerConfig,
+    pub stats: StatsConfig,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -80,6 +81,23 @@ pub fn load() -> anyhow::Result<Config> {
     };
 
     config.database.apply_env_overrides();
+
+    if let Ok(raw) = std::env::var("STATS_RAW_RETENTION_DAYS") {
+        config.stats.raw_retention_days = raw
+            .trim()
+            .parse()
+            .context("STATS_RAW_RETENTION_DAYS is not a number")?;
+    }
+    let requested_days = config.stats.raw_retention_days;
+    config.stats = config.stats.sanitized();
+    if config.stats.raw_retention_days != requested_days {
+        event!(
+            Level::WARN,
+            requested = requested_days,
+            applied = config.stats.raw_retention_days,
+            "clamped the raw access-log retention"
+        );
+    }
 
     if let Ok(raw) = std::env::var("DASHBOARD_API_PORT") {
         config.server.port = raw

@@ -7,6 +7,7 @@ export interface TrafficPoint {
 }
 
 export interface Summary {
+  timezone_offset_minutes: number
   websites: number
   certificates: number
   gateways_online: number
@@ -184,7 +185,11 @@ async function login(username: string, code: string): Promise<LoginResponse> {
 export const api = {
   login,
   me: () => request<{ user: SessionUser }>('auth/me').then((value) => value.user),
-  summary: () => request<Summary>('summary'),
+  summary: () => {
+    // Show "today" in the browser's timezone instead of the database UTC day.
+    const offset = -new Date().getTimezoneOffset()
+    return request<Summary>('summary?tz_offset_minutes=' + String(offset))
+  },
   websites: () => request<Items<Website>>('websites').then((value) => value.items),
   certificates: () => request<Items<Certificate>>('certificates').then((value) => value.items),
   uploadCertificate: (payload: UploadCertificatePayload) =>

@@ -725,7 +725,22 @@ async fn health(State(state): State<AppState>) -> impl IntoResponse {
     }
 }
 
-async fn summary(State(state): State<AppState>) -> Result<Json<Value>, ApiError> {
+#[derive(Debug, Deserialize)]
+struct SummaryQuery {
+    /// Browser UTC offset in minutes (e.g. 480 for UTC+8).
+    tz_offset_minutes: Option<i64>,
+}
+
+/// Clamp a client-supplied offset to the valid UTC-14..UTC+14 range.
+fn normalize_tz_offset(offset: Option<i64>) -> i32 {
+    offset.unwrap_or(0).clamp(-14 * 60, 14 * 60) as i32
+}
+
+async fn summary(
+    State(state): State<AppState>,
+    Query(query): Query<SummaryQuery>,
+) -> Result<Json<Value>, ApiError> {
+    let tz_offset = normalize_tz_offset(query.tz_offset_minutes);
     let counts = sqlx::query(
         "SELECT
             (SELECT count(*) FROM websites) AS websites,
@@ -737,26 +752,39 @@ async fn summary(State(state): State<AppState>) -> Result<Json<Value>, ApiError>
     .await
     .map_err(internal)?;
 
+    // Raw logs are used for the local-day window: stats rollups split at UTC
+    // midnight, so a UTC+8 panel day straddles two daily rows. Raw logs are kept
+    // for the configured retention and today's window is always inside it.
     let today = sqlx::query(
-        "WITH stats AS (
-            SELECT total_requests, total_responses, e4xx_requests, e5xx_requests,
-                   total_requests_size, total_response_size
-              FROM access_stats_minute
-             WHERE minute_at >= date_trunc('day', now())
-            UNION ALL
-            SELECT total_requests, total_responses, e4xx_requests, e5xx_requests,
-                   total_requests_size, total_response_size
-              FROM access_stats_second
-             WHERE second_at >= date_trunc('day', now())
+        "WITH bounds AS (
+            SELECT date_trunc('day', now() + make_interval(mins => $1))
+                   - make_interval(mins => $1) AS start_at
          )
-         SELECT COALESCE(sum(total_requests), 0)::bigint AS requests,
-                COALESCE(sum(total_responses), 0)::bigint AS responses,
-                COALESCE(sum(e4xx_requests), 0)::bigint AS e4xx,
-                COALESCE(sum(e5xx_requests), 0)::bigint AS e5xx,
-                COALESCE(sum(total_requests_size::numeric), 0)::text AS request_size,
-                COALESCE(sum(total_response_size::numeric), 0)::text AS response_size
-           FROM stats",
+         SELECT
+            (SELECT count(*) FROM access_request_logs r, bounds b
+              WHERE r.requested_at >= b.start_at
+                AND r.requested_at < b.start_at + interval '1 day') AS requests,
+            (SELECT count(*) FROM access_response_logs s, bounds b
+              WHERE s.responsed_at >= b.start_at
+                AND s.responsed_at < b.start_at + interval '1 day') AS responses,
+            (SELECT count(*) FROM access_response_logs s, bounds b
+              WHERE s.responsed_at >= b.start_at
+                AND s.responsed_at < b.start_at + interval '1 day'
+                AND s.status::int BETWEEN 400 AND 499) AS e4xx,
+            (SELECT count(*) FROM access_response_logs s, bounds b
+              WHERE s.responsed_at >= b.start_at
+                AND s.responsed_at < b.start_at + interval '1 day'
+                AND s.status::int BETWEEN 500 AND 599) AS e5xx,
+            (SELECT COALESCE(sum(r.body_length::numeric), 0)::text
+               FROM access_request_logs r, bounds b
+              WHERE r.requested_at >= b.start_at
+                AND r.requested_at < b.start_at + interval '1 day') AS request_size,
+            (SELECT COALESCE(sum(COALESCE(s.body_length, 0::bigint::uint8)::numeric), 0)::text
+               FROM access_response_logs s, bounds b
+              WHERE s.responsed_at >= b.start_at
+                AND s.responsed_at < b.start_at + interval '1 day') AS response_size",
     )
+    .bind(tz_offset)
     .fetch_one(state.database.pool())
     .await
     .map_err(internal)?;
@@ -802,6 +830,7 @@ async fn summary(State(state): State<AppState>) -> Result<Json<Value>, ApiError>
         "requests_size_today": today.try_get::<String, _>("request_size").map_err(internal)?,
         "response_size_today": today.try_get::<String, _>("response_size").map_err(internal)?,
         "traffic": traffic,
+        "timezone_offset_minutes": tz_offset,
     })))
 }
 
@@ -1329,6 +1358,15 @@ mod tests {
             content_type(FsPath::new("blob.bin")),
             "application/octet-stream"
         );
+    }
+
+    #[test]
+    fn clamps_timezone_offsets() {
+        assert_eq!(normalize_tz_offset(None), 0);
+        assert_eq!(normalize_tz_offset(Some(480)), 480);
+        assert_eq!(normalize_tz_offset(Some(-300)), -300);
+        assert_eq!(normalize_tz_offset(Some(5000)), 840);
+        assert_eq!(normalize_tz_offset(Some(-5000)), -840);
     }
 
     #[test]

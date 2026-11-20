@@ -32,7 +32,7 @@ async fn main() -> anyhow::Result<()> {
     secrets::encrypt_legacy_secrets(&database).await?;
     auth::ensure_default_admin(&database).await?;
 
-    let stats_task = shared::stats::spawn(database.clone());
+    let stats_task = shared::stats::spawn(database.clone(), config.stats);
     let certificate_task = certificate::spawn(database.clone());
 
     let address = std::net::SocketAddr::from(([0, 0, 0, 0], config.server.port));

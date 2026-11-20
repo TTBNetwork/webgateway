@@ -469,3 +469,26 @@
   dashboard 25、shared 18 + 3；fmt/clippy 通过。
 - 限制：仍无 single-flight、`If-Modified-Since`、stale-while-revalidate、持久化；配置同步仍清空全部缓存。
 - 文档：`gateway.md` 5.4、`deployment.md` 限制表、`issue.md` P-05/B-09/F-60。
+
+### 统计准确性 + 面板时区（分支 `feat/stats-accuracy`）
+- `total_ips`：`MINUTE_ROLLUP` 在秒→分归并时、`DAILY_ROLLUP` 在跨天归并时，对本次归并窗口
+  从原始访问日志重新计算 `COUNT(DISTINCT remote_addr)`；只有原始日志已过保留期的缺口
+  才回退为秒/分聚合值。`BULK_MINUTE_ROLLUP` 本来就直接从原始日志按分钟去重。
+- 保留期配置化：新增 `[stats].raw_retention_days` / `STATS_RAW_RETENTION_DAYS`
+  （7..90 天，默认 7，低于 7 会 WARN 并夹到 7）；分区 DROP、边界 DELETE 和日志清理都使用该值。
+- 面板时区：`GET /api/summary?tz_offset_minutes=<分钟>`（-840..840），按浏览器时区从原始
+  访问日志计算“今日”请求/响应/4xx/5xx/字节数，响应回显 `timezone_offset_minutes`；
+  前端 `api.summary()` 自动发送 `-new Date().getTimezoneOffset()`。
+- 实测（beta 库）：
+  - 插入“本地昨天 UTC、+08 今天”的 1 请求/1 响应(503)/12、34 字节：
+    `tz_offset_minutes=480` → requests=1、responses=1、e5xx=1、sizes 12/34；
+    `tz_offset_minutes=0` → 全部 0；5000 夹到 840；非数字返回 400；
+  - `STATS_RAW_RETENTION_DAYS=3` → 启动 WARN 夹到 7，rollup 正常；
+  - 统计集成测试新增断言：同一分钟 2 个不同 IP（3 次请求）→ minute total_ips=2；
+    同一天跨两个分钟的 2 个不同 IP → daily total_ips=2。
+- 测试：shared 18 → 19（+保留期 clamp）、dashboard 25 → 26（+时区 clamp）、gateway 53；
+  3 个集成测试通过；fmt/clippy 通过。
+- 仍未做：请求/响应 sizes 仍依赖 Content-Length（chunked 为 0/NULL）；秒/分/日表保留期
+  （1h/1d/长期）仍硬编码；边界分区仍逐行 DELETE。
+- 文档：`database.md` 5.4、`deployment.md` 环境变量/限制表、`issue.md` P-07/B-08/B-14/F-61、
+  `dashboard/backend/config.example.toml`。

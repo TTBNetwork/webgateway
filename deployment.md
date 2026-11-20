@@ -69,6 +69,7 @@ pg_dump -Fc --no-owner --dbname="$DATABASE_URL" -f webgateway-$(date -u +%Y%m%dT
 | `DASHBOARD_API_PORT` | 否 | 监听端口，默认 3000 |
 | `DASHBOARD_STATIC_DIR` | 推荐 | 构建后的面板目录；设置后 dashboard 直接托管面板与 SPA 回退 |
 | `DASHBOARD_METRICS_PORT` | 推荐 | Prometheus 指标端口；不设则不启用 |
+| `STATS_RAW_RETENTION_DAYS` | 否 | 原始访问日志/周分区保留天数（7..90，默认 7） |
 | `DASHBOARD_METRICS_BIND` | 否 | 指标监听地址，默认 `127.0.0.1` |
 | `DASHBOARD_API_TOKENS` | 推荐 | 服务令牌，逗号分隔；轮换期间可同时配置新旧两个 |
 | `DASHBOARD_API_TOKEN` | 兼容 | 单个服务令牌（已弃用，仍会合并到列表） |
@@ -251,7 +252,7 @@ HTTP/TCP、flush 访问日志并标记 offline（HTTP/3 在途请求尚未 drain
 | P2 | 缓存增强 | `Vary`/HEAD/`If-None-Match` 已支持；无 single-flight、stale-while-revalidate、持久化（B-09 部分修复） |
 | P1 | 健康状态为单节点 | 站点级主动探测 + 被动失败标记已实现；无跨节点健康状态、无熔断/半开（P-10/U-17 部分修复） |
 | P1 | 无 WAF/CC 规则 | 已有每客户端 IP 令牌桶限流（429 + Retry-After）；无 WAF/CC 规则与全局配额（U-07 部分修复） |
-| P2 | 统计偏差 | `total_ips` 跨秒重复、保留期硬编码、面板按 UTC 日（B-08/B-14） |
+| P3 | 统计 sizes | 今日统计/时区已修正、`total_ips` 已按原始日志去重、原始保留期可配；请求/响应 sizes 仍依赖 Content-Length（chunked 为 0/NULL，B-08 剩余） |
 | P2 | 登录限流单实例 | 进程内计数，多实例不共享（B-29） |
 | P2 | CI 无 DB E2E | shared 集成测试在 CI 中跳过；h3/WS/gRPC 仅本地验证（U-31/B-22） |
 | P2 | 版本与分页 | 面板版本/schema 硬编码、列表无服务端分页（B-17/B-18） |

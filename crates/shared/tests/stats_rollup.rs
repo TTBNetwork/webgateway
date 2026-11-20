@@ -12,7 +12,7 @@ use std::{
 use anyhow::Context;
 use shared::{
     database::{Database, DatabaseConfig},
-    stats::run_once,
+    stats::{StatsConfig, run_once},
 };
 use sqlx::{
     PgPool, Row,
@@ -96,6 +96,52 @@ async fn run_scenario(master: &Database) -> anyhow::Result<()> {
     insert_request(master, "req-recent", "site-recent", 30, &recent_ts).await?;
     insert_response(master, "res-recent", "site-recent", 300, 404, &recent_ts).await?;
 
+    // Same client twice plus a second client inside one minute: the minute
+    // total_ips must be 2 distinct addresses, not 3 requests.
+    for (id, ip, seconds) in [
+        ("req-ips-1", "198.51.100.21", 0),
+        ("req-ips-2", "198.51.100.21", 5),
+        ("req-ips-3", "198.51.100.22", 9),
+    ] {
+        sqlx::query(
+            "INSERT INTO access_request_logs
+                 (id, host, method, path, headers, http_version, remote_addr,
+                  body_length, website_id, requested_at)
+             VALUES ($1, 'stats.test', 'GET', '/', '{}'::jsonb, 'HTTP/1.1', $2,
+                     1::uint8, 'site-ips',
+                     date_trunc('minute', now() - interval '2 hours')
+                     + make_interval(secs => $3))",
+        )
+        .bind(id)
+        .bind(ip)
+        .bind(seconds)
+        .execute(master.pool())
+        .await?;
+    }
+
+    // Two days ago, two distinct clients across two minutes: the daily
+    // total_ips must be 2 distinct addresses, not the sum of two minute counts.
+    for (id, ip, seconds) in [
+        ("req-day-1", "198.51.100.31", 0),
+        ("req-day-2", "198.51.100.31", 5),
+        ("req-day-3", "198.51.100.32", 70),
+    ] {
+        sqlx::query(
+            "INSERT INTO access_request_logs
+                 (id, host, method, path, headers, http_version, remote_addr,
+                  body_length, website_id, requested_at)
+             VALUES ($1, 'stats.test', 'GET', '/', '{}'::jsonb, 'HTTP/1.1', $2,
+                     1::uint8, 'site-day-ips',
+                     date_trunc('day', now() - interval '2 days')
+                     + interval '1 hour' + make_interval(secs => $3))",
+        )
+        .bind(id)
+        .bind(ip)
+        .bind(seconds)
+        .execute(master.pool())
+        .await?;
+    }
+
     // A dead partition from eight weeks ago must be dropped by maintenance, even
     // though it still contains a row.
     let old_partition: String = sqlx::query_scalar(
@@ -133,7 +179,7 @@ async fn run_scenario(master: &Database) -> anyhow::Result<()> {
         .execute(master.pool())
         .await?;
 
-    run_once(master, true).await?;
+    run_once(master, true, StatsConfig::default()).await?;
 
     let old_partition_after: bool = sqlx::query_scalar("SELECT to_regclass($1) IS NOT NULL")
         .bind(format!("public.{old_partition}"))
@@ -201,6 +247,25 @@ async fn run_scenario(master: &Database) -> anyhow::Result<()> {
     assert_eq!(recent.try_get::<String, _>("request_size")?, "30");
     assert_eq!(recent.try_get::<String, _>("response_size")?, "300");
 
+    let minute_ips: i64 = sqlx::query_scalar(
+        "SELECT COALESCE(SUM(total_ips), 0)::bigint
+           FROM access_stats_minute
+          WHERE website_id = 'site-ips'",
+    )
+    .fetch_one(master.pool())
+    .await?;
+    assert_eq!(
+        minute_ips, 2,
+        "minute total_ips must count distinct clients"
+    );
+
+    let daily_ips: i64 = sqlx::query_scalar(
+        "SELECT total_ips FROM access_stats_daily WHERE website_id = 'site-day-ips'",
+    )
+    .fetch_one(master.pool())
+    .await?;
+    assert_eq!(daily_ips, 2, "daily total_ips must count distinct clients");
+
     let watermark_recent: bool = sqlx::query_scalar(
         "SELECT last_aggregated_at > now() - interval '1 minute' FROM stats_state",
     )
@@ -213,11 +278,11 @@ async fn run_scenario(master: &Database) -> anyhow::Result<()> {
     let raw_rows: i64 = sqlx::query_scalar("SELECT count(*) FROM access_request_logs")
         .fetch_one(master.pool())
         .await?;
-    assert_eq!(raw_rows, 3);
+    assert_eq!(raw_rows, 9);
 
     // A second run must not double count.
     let before = total_requests(master).await?;
-    run_once(master, false).await?;
+    run_once(master, false, StatsConfig::default()).await?;
     let after = total_requests(master).await?;
     assert_eq!(before, after, "replaying the rollup double counted stats");
 

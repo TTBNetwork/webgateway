@@ -36,3 +36,9 @@ port = 3000
 # Optional Prometheus metrics listener (plain HTTP, loopback by default).
 # metrics_port = 9103
 # metrics_bind = "127.0.0.1"
+
+[stats]
+# Raw access log / weekly partition retention in days (7..90, default 7).
+# The rollup keeps minute and daily aggregates longer.
+# raw_retention_days = 7
+# Env override: STATS_RAW_RETENTION_DAYS

@@ -74,6 +74,7 @@
 | F-58 | 上游健康检查 | ✅ | 站点级 `config.health_check`：主动 GET 探测（interval/timeout/阈值）+ 被动失败标记；选择时优先健康后端、全不健康回退完整集合、priority 备用组自动生效；指标 `health_check_*`、`backends_unhealthy` |
 | F-59 | HTTP/3 流式响应与停机 drain | ✅ | h3 响应从上游流式转发（不再受 `max_response_body_bytes` 限制）；SIGTERM 先停止接受新 QUIC 连接，在途 h3 请求与 TCP 共享 Inflight 计数（最多 10s）；请求体仍缓冲、无 h3 缓存 |
 | F-60 | 缓存 Vary / HEAD / 304 | ✅ | 按 `Vary` 请求头保存多个变体（`*` 不缓存）；HEAD 从缓存 GET 返回（保留 Content-Length、无 body）；GET/HEAD `If-None-Match` 返回 304；LRU 按 (key, variant) 维护 |
+| F-61 | 统计准确性与时区 | ✅ | 分钟/日 `total_ips` 从原始日志去重；原始日志保留期可配（7..90 天）；面板“今日”按浏览器时区从原始日志计算（`tz_offset_minutes`，-840..840，响应回显） |
 
 ### 1.5 测试
 
@@ -111,7 +112,7 @@
 | P-04 | CONNECT | 仅 h1；已修复 400/403 日志与端口白名单；无鉴权 / mTLS；无 HTTP/2 extended CONNECT |
 | P-05 | 缓存 | 仅 h1/h2；`Vary`/HEAD/`If-None-Match` 已支持；仍无持久化/single-flight/stale-while-revalidate/`If-Modified-Since`；配置同步清空全部 |
 | P-06 | 访问日志 | body_length 取 Content-Length；chunked 请求 0、响应 NULL；WS/CONNECT 0；headers 重复键被覆盖；已修复 writer 退出 flush |
-| P-07 | 统计 | total_ips 跨秒重复；sizes 依赖日志 Content-Length；保留期（7 天）仍硬编码；整周过期分区已 DROP，边界分区仍逐行 DELETE |
+| P-07 | 统计 | 分钟/日 `total_ips` 已从原始日志去重；原始保留期可配（7..90 天）；sizes 仍依赖日志 Content-Length；边界分区仍逐行 DELETE |
 | P-08 | 上游 TLS | 只信 webpki + ca_file，不读系统 native roots；无 mTLS/SNI 覆盖 |
 | P-09 | 面板 | 站点/证书/用户已可写；网关只读列表+API 删除；JWT 已改为 HttpOnly Cookie；无 refresh token/每用户 API key；无服务端分页；无静态托管；无前端测试 |
 | P-13 | 证书 | 仅腾讯云 DNS-01；一张证书只能一个 DNS zone；ZeroSSL 必须配置 EAB；通配符未实测；ACME account key 可加密存储（需配置 `SECRET_ENCRYPTION_KEY`，否则明文） |
@@ -235,12 +236,16 @@
 
 ### P2 — 行为 / 安全 / 统计偏差
 
-#### B-08 统计 total_ips / sizes / 保留期偏差
-- total_ips 为每秒 distinct 后求和，跨秒重复计数。
-- 请求/响应 sizes 依赖日志 Content-Length，chunked 不准确。
-- 保留期硬编码：原始 7d、秒 1h、分 1d、日长期。
-- 原始日志只 DELETE 行，不 DROP 分区，磁盘膨胀。
-- 位置：dashboard/backend/src/stats.rs、database.md 5.4
+#### B-08 统计 total_ips / sizes / 保留期偏差（大部分修复，2026-11-20）
+- 已修复：分钟级在秒→分归并时、日级在跨天归并时从原始日志重新计算
+  `COUNT(DISTINCT remote_addr)`；原始日志已过保留期的历史缺口才回退为聚合值。
+- 已修复：原始访问日志/周分区保留期可配置（`[stats].raw_retention_days` /
+  `STATS_RAW_RETENTION_DAYS`，7..90 天，默认 7）。
+- 仍存在：请求/响应 sizes 依赖日志 Content-Length（chunked 请求为 0、响应 NULL）；
+  秒/分/日表的保留期（1h/1d/长期）仍硬编码；边界分区仍逐行 DELETE。
+- 实测：同一分钟内 1 个 IP 两次 + 另一个 IP → minute total_ips=2；跨两个分钟的同一天
+  2 个不同 IP → daily total_ips=2（集成测试断言）。
+- 位置：crates/shared/src/stats.rs、dashboard/backend/src/stats.rs、database.md 5.4
 
 #### B-09 缓存行为限制（大部分修复，2026-11-20）
 - 已修复：缓存只在响应带 `Content-Length` 且不超过
@@ -278,9 +283,14 @@
   Dashboard 会话 `ongoing = 1` 直到 Agent 停止；Go gRPC 客户端未报 trailer 错误。
 - 仍无 CI 级 gRPC E2E（依赖外部软件，见 U-31）；访问日志只有 HTTP 200，不记录 grpc-status。
 
-#### B-14 面板“今日”按 UTC 日界
-- summary 的 date_trunc('day', now()) 是数据库 UTC 日；+08 用户看到的“今日”从本地 08:00 开始。
-- 建议：按用户时区或站点时区聚合；至少文档说明。
+#### B-14 面板“今日”按 UTC 日界（已修复，2026-11-20）
+- 修复：`GET /api/summary?tz_offset_minutes=<分钟>`（-840..840，前端传浏览器时区偏移）；
+  “今日”按该偏移从原始访问日志计算，避免 UTC 日界与跨日聚合。
+- 前端 `api.summary()` 自动发送 `-new Date().getTimezoneOffset()`；响应回显
+  `timezone_offset_minutes`。
+- 实测：UTC+8 偏移下，本地位于“昨天 UTC、今天 +08”的 1 请求/1 响应/1×5xx 被计入
+  （12/34 字节），UTC 偏移下为 0；5000 被夹到 840，非数字返回 400。
+- 位置：dashboard/backend/src/router.rs、dashboard/frontend/src/api.ts
 
 #### B-15 面板认证安全（大部分修复，2026-11-20）
 - 已修复：JWT 改为 `wg_session` HttpOnly + SameSite=Strict Cookie，不再进入 localStorage，
@@ -354,8 +364,8 @@
 
 ## 5. 当前状态
 
-- 最新分支：feat/cache-vary（叠加在 feat/h3-streaming 之后）
-- 测试：网关 53、dashboard 25、shared 18 + 3 集成（含 crypto、stats 回填/分区回收）；前端 format/lint/type-check/build 通过
+- 最新分支：feat/stats-accuracy（叠加在 feat/cache-vary 之后）
+- 测试：网关 53、dashboard 26、shared 19 + 3 集成（含 crypto、stats 回填/分区回收）；前端 format/lint/type-check/build 通过
 - 数据库：schema v6；2026-11-20 联调/统计/证书/CRUD/可靠性/资源上限/CONNECT/会话安全验证的临时数据已清理（websites/gateways/users/logs/stats = 0；测试证书已删除）
 - 管理面：站点/网关/用户 CRUD + admin/user/view RBAC + token_version 撤销；面板站点/用户编辑页完成；
   会话改为 HttpOnly Cookie + 安全响应头，服务令牌可多值轮换，内部错误统一脱敏；
@@ -376,4 +386,5 @@
 4. U-11/U-13：h3 流式/Alt-Svc、h2 extended CONNECT
 5. ~~U-19 metrics~~ ✅；~~U-07 每 IP 限流~~ ✅（WAF/CC 未做）；~~U-17 站点级健康检查~~ ✅（熔断未做）；
    U-23：缓存持久化/single-flight
-6. B-21：合并分支、清理 PR 栈
+6. ~~B-08/B-14 统计准确性 + 时区~~ ✅（sizes 精度仍为 CL 估算）；
+7. B-21：合并分支、清理 PR 栈
