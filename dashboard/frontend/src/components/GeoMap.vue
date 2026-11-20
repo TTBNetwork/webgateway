@@ -4,10 +4,12 @@ import worldData from '../assets/world-map.json'
 import type { GeoNode } from '../api'
 import { formatNumber } from '../format'
 import { t } from '../i18n'
+import { prefs } from '../prefs'
 
 interface WorldCountry {
   iso: string | null
   name: string
+  nameZh: string
   path: string
   point: [number, number] | null
 }
@@ -20,6 +22,10 @@ interface WorldMap {
 }
 
 const world = worldData as unknown as WorldMap
+
+function countryName(country: WorldCountry): string {
+  return prefs.locale === 'zh' && country.nameZh ? country.nameZh : country.name
+}
 
 const props = withDefaults(
   defineProps<{
@@ -76,7 +82,7 @@ const sourceMarkers = computed(() =>
           {
             code: item.code,
             count: item.count,
-            name: item.feature.name,
+            name: countryName(item.feature),
             x: item.feature.point[0],
             y: item.feature.point[1],
           },
@@ -131,7 +137,7 @@ const onlineNodes = computed(() => props.nodes.filter((node) => node.online).len
       <div v-if="topSources.length" class="geo-ranking">
         <p class="geo-ranking-title">{{ t('dashboard.geoSources') }}</p>
         <div v-for="item in topSources" :key="item.code" class="geo-ranking-row">
-          <span class="geo-ranking-name">{{ item.feature.name }}</span>
+          <span class="geo-ranking-name">{{ countryName(item.feature) }}</span>
           <strong>{{ formatNumber(item.count) }}</strong>
           <i :style="{ width: (item.count / maxSource) * 100 + '%' }"></i>
         </div>
