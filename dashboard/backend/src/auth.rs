@@ -157,11 +157,13 @@ pub async fn authenticate(database: &Database, token: &str) -> Option<User> {
 }
 
 /// Validate username + TOTP with replay protection and per-user/IP throttling.
+/// The issued JWT expires after `ttl_secs` (configured session lifetime).
 pub async fn login(
     database: &Database,
     username: &str,
     code: &str,
     last_ip: Option<String>,
+    ttl_secs: u64,
 ) -> anyhow::Result<LoginOutcome> {
     let keys = login_keys(username, last_ip.as_deref());
     if let Some(retry_after_secs) = LOGIN_LIMITER.locked_for(&keys) {
@@ -234,10 +236,7 @@ pub async fn login(
         .duration_since(UNIX_EPOCH)
         .context("system clock is before unix epoch")?
         .as_secs() as usize;
-    let expires = env::var("DASHBOARD_TOKEN_EXPIRES")
-        .ok()
-        .and_then(|value| value.parse::<usize>().ok())
-        .unwrap_or(7 * 24 * 60 * 60);
+    let expires = usize::try_from(ttl_secs).unwrap_or(usize::MAX);
 
     let username: String = row.try_get("username")?;
     let role: String = row.try_get("role")?;

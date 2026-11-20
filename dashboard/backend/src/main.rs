@@ -39,7 +39,11 @@ async fn main() -> anyhow::Result<()> {
 
     axum::serve(
         listener,
-        router::router(database, config.server.api_token.clone()),
+        router::router(
+            database,
+            config.server.service_tokens(),
+            config.server.session_ttl_secs,
+        ),
     )
     .with_graceful_shutdown(shutdown_signal())
     .await?;

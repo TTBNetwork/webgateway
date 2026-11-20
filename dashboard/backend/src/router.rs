@@ -1,11 +1,11 @@
 //! Dashboard API and health endpoint.
 
-use std::time::Duration;
+use std::{sync::Arc, time::Duration};
 
 use axum::{
     Json, Router,
     extract::{Extension, Path, Query, Request, State},
-    http::{HeaderMap, StatusCode, header},
+    http::{HeaderMap, HeaderValue, StatusCode, header},
     middleware::{self, Next},
     response::{IntoResponse, Response},
     routing::{delete, get, patch, post, put},
@@ -20,16 +20,23 @@ use crate::auth::{self, User};
 use crate::certificate;
 use crate::websites;
 
+/// Name of the HttpOnly session cookie handed out by POST /api/auth/login.
+const SESSION_COOKIE: &str = "wg_session";
+
 #[derive(Clone)]
 struct AppState {
     database: Database,
-    api_token: Option<String>,
+    /// Service tokens accepted as bearer credentials. More than one entry keeps
+    /// the previous token valid while it is rotated out.
+    service_tokens: Arc<[String]>,
+    session_ttl_secs: u64,
 }
 
-pub fn router(database: Database, api_token: Option<String>) -> Router {
+pub fn router(database: Database, service_tokens: Vec<String>, session_ttl_secs: u64) -> Router {
     let state = AppState {
         database,
-        api_token,
+        service_tokens: Arc::from(service_tokens),
+        session_ttl_secs,
     };
 
     let read = Router::new()
@@ -76,25 +83,56 @@ pub fn router(database: Database, api_token: Option<String>) -> Router {
         .route("/health", get(health))
         .route("/api/auth/login", post(login))
         .merge(protected)
+        .layer(middleware::from_fn(security_headers))
         .with_state(state)
 }
 
-async fn require_auth(State(state): State<AppState>, mut request: Request, next: Next) -> Response {
-    let token = request
-        .headers()
-        .get(header::AUTHORIZATION)
-        .and_then(|value| value.to_str().ok())
-        .and_then(|value| value.strip_prefix("Bearer "))
-        .map(str::to_string);
+/// Add hardening response headers to every dashboard response. The API only
+/// returns JSON, so a deny-all CSP is safe here.
+async fn security_headers(request: Request, next: Next) -> Response {
+    let secure = is_https(request.headers());
+    let mut response = next.run(request).await;
+    apply_security_headers(response.headers_mut(), secure);
+    response
+}
 
-    let user = match token.as_deref() {
-        Some(token) if state.api_token.as_deref() == Some(token) => Some(User {
-            id: "service".to_string(),
-            username: "service".to_string(),
-            role: "service".to_string(),
-        }),
+fn apply_security_headers(headers: &mut HeaderMap, secure: bool) {
+    headers.insert(
+        header::CONTENT_SECURITY_POLICY,
+        HeaderValue::from_static(
+            "default-src 'none'; frame-ancestors 'none'; base-uri 'none'; form-action 'none'",
+        ),
+    );
+    headers.insert(
+        header::X_CONTENT_TYPE_OPTIONS,
+        HeaderValue::from_static("nosniff"),
+    );
+    headers.insert(header::X_FRAME_OPTIONS, HeaderValue::from_static("DENY"));
+    headers.insert(
+        header::REFERRER_POLICY,
+        HeaderValue::from_static("no-referrer"),
+    );
+    headers.insert(header::CACHE_CONTROL, HeaderValue::from_static("no-store"));
+    headers.insert(
+        "permissions-policy",
+        HeaderValue::from_static("geolocation=(), microphone=(), camera=()"),
+    );
+    if secure {
+        headers.insert(
+            header::STRICT_TRANSPORT_SECURITY,
+            HeaderValue::from_static("max-age=31536000"),
+        );
+    }
+}
+
+async fn require_auth(State(state): State<AppState>, mut request: Request, next: Next) -> Response {
+    let user = match bearer_token(request.headers()) {
+        Some(token) if is_service_token(&state.service_tokens, token) => Some(service_user()),
         Some(token) => auth::authenticate(&state.database, token).await,
-        None => None,
+        None => match session_token(request.headers()) {
+            Some(token) => auth::authenticate(&state.database, token).await,
+            None => None,
+        },
     };
 
     match user {
@@ -102,12 +140,110 @@ async fn require_auth(State(state): State<AppState>, mut request: Request, next:
             request.extensions_mut().insert(user);
             next.run(request).await
         }
-        None => (
-            StatusCode::UNAUTHORIZED,
-            Json(json!({ "error": "unauthorized" })),
-        )
-            .into_response(),
+        None => {
+            let mut response = (
+                StatusCode::UNAUTHORIZED,
+                Json(json!({ "error": "unauthorized" })),
+            )
+                .into_response();
+            // Drop a session cookie that no longer authenticates (expired or
+            // revoked) so the browser stops replaying it.
+            if session_token(request.headers()).is_some() {
+                set_cookie(
+                    &mut response,
+                    cleared_session_cookie(is_https(request.headers())),
+                );
+            }
+            response
+        }
     }
+}
+
+fn service_user() -> User {
+    User {
+        id: "service".to_string(),
+        username: "service".to_string(),
+        role: "service".to_string(),
+    }
+}
+
+fn bearer_token(headers: &HeaderMap) -> Option<&str> {
+    headers
+        .get(header::AUTHORIZATION)
+        .and_then(|value| value.to_str().ok())
+        .and_then(|value| value.strip_prefix("Bearer "))
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+}
+
+fn session_token(headers: &HeaderMap) -> Option<&str> {
+    headers
+        .get_all(header::COOKIE)
+        .iter()
+        .filter_map(|value| value.to_str().ok())
+        .flat_map(|value| value.split(';'))
+        .filter_map(|pair| pair.split_once('='))
+        .find_map(|(name, value)| {
+            let (name, value) = (name.trim(), value.trim());
+            (name == SESSION_COOKIE && !value.is_empty()).then_some(value)
+        })
+}
+
+/// Compare a candidate against every configured service token without exiting
+/// early, so the comparison does not leak position information.
+fn is_service_token(tokens: &[String], candidate: &str) -> bool {
+    let mut matched = false;
+    for token in tokens {
+        matched |= constant_time_eq(token.as_bytes(), candidate.as_bytes());
+    }
+    matched
+}
+
+fn constant_time_eq(left: &[u8], right: &[u8]) -> bool {
+    let mut difference = (left.len() ^ right.len()) as u32;
+    for index in 0..left.len().min(right.len()) {
+        difference |= u32::from(left[index] ^ right[index]);
+    }
+    difference == 0
+}
+
+fn session_cookie(token: &str, ttl_secs: u64, secure: bool) -> String {
+    let mut cookie =
+        format!("{SESSION_COOKIE}={token}; Path=/; HttpOnly; SameSite=Strict; Max-Age={ttl_secs}");
+    if secure {
+        cookie.push_str("; Secure");
+    }
+    cookie
+}
+
+fn cleared_session_cookie(secure: bool) -> String {
+    let mut cookie = format!("{SESSION_COOKIE}=; Path=/; HttpOnly; SameSite=Strict; Max-Age=0");
+    if secure {
+        cookie.push_str("; Secure");
+    }
+    cookie
+}
+
+fn set_cookie(response: &mut Response, cookie: String) {
+    if let Ok(value) = HeaderValue::from_str(&cookie) {
+        response.headers_mut().insert(header::SET_COOKIE, value);
+    }
+}
+
+/// A TLS-terminating reverse proxy is expected to set X-Forwarded-Proto.
+fn is_https(headers: &HeaderMap) -> bool {
+    headers
+        .get("x-forwarded-proto")
+        .and_then(|value| value.to_str().ok())
+        .map(|value| {
+            value
+                .split(',')
+                .next()
+                .unwrap_or(value)
+                .trim()
+                .eq_ignore_ascii_case("https")
+        })
+        .unwrap_or(false)
 }
 
 async fn require_admin(request: Request, next: Next) -> Response {
@@ -142,7 +278,7 @@ async fn login(
     State(state): State<AppState>,
     headers: HeaderMap,
     Json(payload): Json<LoginRequest>,
-) -> Result<Json<Value>, ApiError> {
+) -> Result<Response, ApiError> {
     if payload.username.trim().is_empty() || payload.code.trim().is_empty() {
         return Err((
             StatusCode::BAD_REQUEST,
@@ -166,14 +302,26 @@ async fn login(
         payload.username.trim(),
         payload.code.trim(),
         last_ip,
+        state.session_ttl_secs,
     )
     .await
     .map_err(internal)?
     {
-        auth::LoginOutcome::Success(success) => Ok(Json(json!({
-            "token": success.token,
-            "user": success.user,
-        }))),
+        auth::LoginOutcome::Success(success) => {
+            // The JWT never reaches JavaScript: it is delivered as an HttpOnly,
+            // SameSite=Strict cookie (SameSite blocks cross-site CSRF) and the
+            // JSON body only reports the authenticated user.
+            let mut response = Json(json!({
+                "user": success.user,
+                "expires_in": state.session_ttl_secs,
+            }))
+            .into_response();
+            set_cookie(
+                &mut response,
+                session_cookie(&success.token, state.session_ttl_secs, is_https(&headers)),
+            );
+            Ok(response)
+        }
         auth::LoginOutcome::Invalid => {
             tokio::time::sleep(Duration::from_millis(500)).await;
             Err((
@@ -198,13 +346,16 @@ async fn me(Extension(user): Extension<User>) -> Json<Value> {
 async fn logout(
     State(state): State<AppState>,
     Extension(user): Extension<User>,
-) -> Result<Json<Value>, ApiError> {
+    headers: HeaderMap,
+) -> Result<Response, ApiError> {
     if user.role != "service" {
         auth::revoke_tokens(&state.database, &user.id)
             .await
             .map_err(internal)?;
     }
-    Ok(Json(json!({ "status": "ok" })))
+    let mut response = Json(json!({ "status": "ok" })).into_response();
+    set_cookie(&mut response, cleared_session_cookie(is_https(&headers)));
+    Ok(response)
 }
 
 async fn list_users(State(state): State<AppState>) -> Result<Json<Value>, ApiError> {
@@ -410,14 +561,20 @@ async fn health(State(state): State<AppState>) -> impl IntoResponse {
                 "schema_version": schema_version(),
             })),
         ),
-        Err(error) => (
-            StatusCode::SERVICE_UNAVAILABLE,
-            Json(json!({
-                "status": "error",
-                "database": "down",
-                "message": error.to_string(),
-            })),
-        ),
+        Err(error) => {
+            // /health is unauthenticated; log the cause instead of returning
+            // database/driver details to the caller.
+            event!(Level::ERROR, error = %format!("{error:#}"), "database health check failed");
+            (
+                StatusCode::SERVICE_UNAVAILABLE,
+                Json(json!({
+                    "status": "error",
+                    "database": "down",
+                    "message": "database unavailable",
+                    "schema_version": schema_version(),
+                })),
+            )
+        }
     }
 }
 
@@ -827,12 +984,21 @@ fn bad_request(message: impl std::fmt::Display) -> ApiError {
     )
 }
 
+/// Validation failures keep their message (they are actionable for the
+/// caller); database failures are logged and redacted.
 fn auth_error(error: anyhow::Error) -> ApiError {
-    event!(Level::WARN, error = %format!("{error:#}"), "user API request failed");
+    if contains_sqlx(&error) {
+        return internal(format!("{error:#}"));
+    }
     bad_request(error.to_string())
 }
 
+/// ACME and certificate validation errors are returned to the operator, but
+/// database failures are redacted like every other internal error.
 fn certificate_error(error: anyhow::Error) -> ApiError {
+    if contains_sqlx(&error) {
+        return internal(format!("{error:#}"));
+    }
     event!(Level::WARN, error = %format!("{error:#}"), "certificate API request failed");
     (
         StatusCode::BAD_REQUEST,
@@ -842,9 +1008,135 @@ fn certificate_error(error: anyhow::Error) -> ApiError {
 
 type ApiError = (StatusCode, Json<Value>);
 
+/// Log the full error, then return a generic response plus a correlation id.
 fn internal(error: impl std::fmt::Display) -> ApiError {
+    let error_id = error_id();
+    event!(
+        Level::ERROR,
+        error = %error,
+        error_id = %error_id,
+        "dashboard request failed"
+    );
     (
         StatusCode::INTERNAL_SERVER_ERROR,
-        Json(json!({ "error": error.to_string() })),
+        Json(json!({
+            "error": "internal server error",
+            "error_id": error_id,
+        })),
     )
+}
+
+fn contains_sqlx(error: &anyhow::Error) -> bool {
+    error
+        .chain()
+        .any(|cause| cause.downcast_ref::<sqlx::Error>().is_some())
+}
+
+fn error_id() -> String {
+    let mut bytes = [0u8; 8];
+    if getrandom::fill(&mut bytes).is_err() {
+        return "unknown".to_string();
+    }
+    data_encoding::HEXLOWER.encode(&bytes)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn compares_tokens_in_constant_time() {
+        assert!(constant_time_eq(b"secret", b"secret"));
+        assert!(!constant_time_eq(b"secret", b"secreT"));
+        assert!(!constant_time_eq(b"secret", b"secret-longer"));
+        assert!(constant_time_eq(b"", b""));
+    }
+
+    #[test]
+    fn matches_any_rotating_service_token() {
+        let tokens = vec!["old-token".to_string(), "new-token".to_string()];
+        assert!(is_service_token(&tokens, "old-token"));
+        assert!(is_service_token(&tokens, "new-token"));
+        assert!(!is_service_token(&tokens, "other"));
+        assert!(!is_service_token(&[], "old-token"));
+    }
+
+    #[test]
+    fn reads_the_session_cookie() {
+        let mut headers = HeaderMap::new();
+        assert_eq!(session_token(&headers), None);
+        headers.insert(
+            header::COOKIE,
+            HeaderValue::from_static("theme=dark; wg_session=abc.def.ghi"),
+        );
+        assert_eq!(session_token(&headers), Some("abc.def.ghi"));
+        headers.insert(header::COOKIE, HeaderValue::from_static("theme=dark"));
+        assert_eq!(session_token(&headers), None);
+    }
+
+    #[test]
+    fn builds_secure_session_cookies_only_over_tls() {
+        let cookie = session_cookie("jwt", 600, false);
+        assert!(cookie.starts_with("wg_session=jwt;"));
+        assert!(cookie.contains("Path=/"));
+        assert!(cookie.contains("HttpOnly"));
+        assert!(cookie.contains("SameSite=Strict"));
+        assert!(cookie.contains("Max-Age=600"));
+        assert!(!cookie.contains("Secure"));
+        assert!(session_cookie("jwt", 600, true).ends_with("; Secure"));
+
+        let cleared = cleared_session_cookie(true);
+        assert!(cleared.contains("Max-Age=0"));
+        assert!(cleared.ends_with("; Secure"));
+    }
+
+    #[test]
+    fn detects_https_behind_a_proxy() {
+        let mut headers = HeaderMap::new();
+        assert!(!is_https(&headers));
+        headers.insert("x-forwarded-proto", HeaderValue::from_static("https"));
+        assert!(is_https(&headers));
+        headers.insert("x-forwarded-proto", HeaderValue::from_static("http"));
+        assert!(!is_https(&headers));
+    }
+
+    #[test]
+    fn adds_hardening_headers() {
+        let mut headers = HeaderMap::new();
+        apply_security_headers(&mut headers, true);
+        assert_eq!(
+            headers.get(header::X_CONTENT_TYPE_OPTIONS).unwrap(),
+            "nosniff"
+        );
+        assert!(headers.get(header::CONTENT_SECURITY_POLICY).is_some());
+        assert!(headers.get(header::STRICT_TRANSPORT_SECURITY).is_some());
+        assert_eq!(headers.get(header::CACHE_CONTROL).unwrap(), "no-store");
+
+        let mut plain = HeaderMap::new();
+        apply_security_headers(&mut plain, false);
+        assert!(plain.get(header::STRICT_TRANSPORT_SECURITY).is_none());
+    }
+
+    #[test]
+    fn redacts_internal_errors() {
+        let (status, body) = internal(sqlx::Error::RowNotFound);
+        assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR);
+        let text = body.0.to_string();
+        assert!(text.contains("internal server error"));
+        assert!(text.contains("error_id"));
+        assert!(!text.contains("RowNotFound"));
+    }
+
+    #[test]
+    fn keeps_validation_errors_but_redacts_database_errors() {
+        let (status, body) = auth_error(anyhow::anyhow!("username already exists"));
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        assert!(body.0.to_string().contains("username already exists"));
+
+        let database =
+            anyhow::Error::from(sqlx::Error::RowNotFound).context("failed to load the user");
+        let (status, body) = auth_error(database);
+        assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR);
+        assert!(!body.0.to_string().contains("failed to load"));
+    }
 }

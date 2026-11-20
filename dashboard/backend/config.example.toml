@@ -10,10 +10,15 @@ wait_timeout_secs = 300
 
 [server]
 port = 3000
-# Optional service token accepted as `Authorization: Bearer <token>`.
-# api_token = "change-me"
+# Service tokens accepted as `Authorization: Bearer <token>` by API clients.
+# List more than one during a rotation window; `api_token` (singular) is the
+# deprecated equivalent and is merged into the same list.
+# api_tokens = ["change-me-0123456789abcdef"]
 #
 # The panel uses username + TOTP. On an empty users table the master creates an
-# admin and logs its TOTP secret. Env overrides:
+# admin and logs its TOTP secret. The session JWT is delivered in the
+# `wg_session` HttpOnly, SameSite=Strict cookie and is never exposed to scripts.
+# Env overrides:
 #   DASHBOARD_ADMIN_USERNAME / DASHBOARD_ADMIN_TOTP_SECRET / DASHBOARD_JWT_SECRET
-#   DASHBOARD_TOKEN_EXPIRES (default 604800)
+#   DASHBOARD_TOKEN_EXPIRES (seconds, default 604800, clamped to 300..2592000)
+#   DASHBOARD_API_TOKENS (comma-separated; DASHBOARD_API_TOKEN also accepted)
