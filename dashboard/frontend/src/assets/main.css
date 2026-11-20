@@ -225,6 +225,7 @@ ul {
 .nav-item:hover {
   color: var(--text);
   background: var(--panel-soft);
+  transform: translateX(2px);
 }
 
 .nav-item.active {
@@ -1285,6 +1286,16 @@ tbody tr:hover {
 
 .sidebar-backdrop {
   display: none;
+  animation: backdrop-in 0.2s ease;
+}
+
+@keyframes backdrop-in {
+  from {
+    opacity: 0;
+  }
+  to {
+    opacity: 1;
+  }
 }
 
 @media (max-width: 1100px) {
@@ -1421,8 +1432,29 @@ tbody tr:hover {
 }
 
 /* ---- v1-style collapsible navigation ---- */
+.sidebar {
+  padding: 18px 12px 16px 18px;
+}
+.brand {
+  padding: 4px 8px;
+}
+.brand-mark {
+  width: 34px;
+  height: 34px;
+  border-radius: 10px;
+  font-size: 12px;
+  box-shadow: 0 8px 18px rgba(79, 124, 255, 0.24);
+}
+.brand-text strong {
+  font-size: 13.5px;
+}
+.brand-text small {
+  font-size: 10.5px;
+}
 .nav {
   gap: 2px;
+  margin-top: 20px;
+  padding-right: 2px;
   overflow-y: auto;
 }
 .nav-block {
@@ -1430,41 +1462,141 @@ tbody tr:hover {
   gap: 2px;
   padding: 2px 0;
 }
+.nav-item {
+  position: relative;
+  overflow: hidden;
+  border-radius: 9px;
+  transition:
+    color 0.18s ease,
+    background 0.18s ease,
+    border-color 0.18s ease,
+    transform 0.18s ease;
+}
+.nav-item::before {
+  content: '';
+  position: absolute;
+  left: 0;
+  top: 50%;
+  width: 3px;
+  height: 18px;
+  border-radius: 0 3px 3px 0;
+  background: var(--accent);
+  opacity: 0;
+  transform: translateY(-50%) scaleY(0.3);
+  transition:
+    opacity 0.2s ease,
+    transform 0.22s cubic-bezier(0.22, 1, 0.36, 1);
+}
+.nav-item.active {
+  border-color: var(--border);
+  background: linear-gradient(90deg, rgba(109, 155, 255, 0.14), transparent 72%);
+  box-shadow: none;
+}
+.nav-item.active::before {
+  opacity: 1;
+  transform: translateY(-50%) scaleY(1);
+}
+.nav-item:hover svg {
+  color: var(--accent);
+  transition: color 0.18s ease;
+}
 .nav-parent .nav-caret {
   margin-left: auto;
-  opacity: 0.55;
-  transition: transform 0.18s ease;
+  opacity: 0.5;
+  transition:
+    transform 0.24s cubic-bezier(0.22, 1, 0.36, 1),
+    opacity 0.18s ease;
+}
+.nav-parent:hover .nav-caret,
+.nav-parent[aria-expanded='true'] .nav-caret {
+  opacity: 0.9;
 }
 .nav-parent[aria-expanded='true'] .nav-caret {
   transform: rotate(90deg);
 }
+.nav-sub-wrap {
+  display: grid;
+  grid-template-rows: 0fr;
+  pointer-events: none;
+  opacity: 0;
+  visibility: hidden;
+  transition:
+    grid-template-rows 0.26s cubic-bezier(0.22, 1, 0.36, 1),
+    opacity 0.18s ease,
+    visibility 0s linear 0.26s;
+}
+.nav-sub-wrap.open {
+  grid-template-rows: 1fr;
+  pointer-events: auto;
+  opacity: 1;
+  visibility: visible;
+  transition:
+    grid-template-rows 0.26s cubic-bezier(0.22, 1, 0.36, 1),
+    opacity 0.18s ease 0.04s,
+    visibility 0s linear 0s;
+}
+.nav-sub-clip {
+  min-height: 0;
+  overflow: hidden;
+}
 .nav-sub {
   display: grid;
   gap: 2px;
-  margin: 2px 0 4px 15px;
+  margin: 4px 0 6px 15px;
   padding-left: 10px;
   border-left: 1px solid var(--border);
+  transform: translateY(-6px);
+  transition: transform 0.26s cubic-bezier(0.22, 1, 0.36, 1);
+}
+.nav-sub-wrap.open .nav-sub {
+  transform: translateY(0);
 }
 .nav-subitem {
+  position: relative;
   display: flex;
+  align-items: center;
   gap: 8px;
-  padding: 7px 10px;
+  width: 100%;
+  padding: 7px 10px 7px 12px;
+  border: 0;
+  border-radius: 7px;
   color: var(--muted);
+  background: none;
   font-size: 13px;
+  text-align: left;
+  cursor: pointer;
+  transition:
+    color 0.18s ease,
+    background 0.18s ease,
+    padding-left 0.18s ease;
+}
+.nav-subitem::before {
+  content: '';
+  position: absolute;
+  left: -11px;
+  top: 50%;
+  width: 2px;
+  height: 13px;
+  border-radius: 2px;
+  background: var(--accent);
+  opacity: 0;
+  transform: translateY(-50%) scaleY(0.4);
+  transition:
+    opacity 0.2s ease,
+    transform 0.2s cubic-bezier(0.22, 1, 0.36, 1);
 }
 .nav-subitem:hover {
   color: var(--text);
+  background: var(--panel-soft);
 }
 .nav-subitem.active {
+  padding-left: 14px;
   color: var(--text);
   background: var(--panel-soft);
 }
 .nav-subitem.active::before {
-  content: '';
-  width: 3px;
-  height: 14px;
-  border-radius: 2px;
-  background: var(--accent);
+  opacity: 1;
+  transform: translateY(-50%) scaleY(1);
 }
 
 /* ---- label + info tooltip ---- */

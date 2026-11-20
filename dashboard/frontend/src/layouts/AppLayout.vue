@@ -175,18 +175,22 @@ async function logout(): Promise<void> {
               <span>{{ t(group.key) }}</span>
               <AppIcon class="nav-caret" name="chevron" :size="14" />
             </button>
-            <div v-if="openMenu === group.key" class="nav-sub">
-              <button
-                v-for="item in group.items"
-                :key="item.path"
-                type="button"
-                class="nav-item nav-subitem"
-                :class="{ active: route.path === item.path }"
-                :aria-current="route.path === item.path ? 'page' : undefined"
-                @click="go(item.path)"
-              >
-                <span>{{ t(item.key) }}</span>
-              </button>
+            <div class="nav-sub-wrap" :class="{ open: openMenu === group.key }">
+              <div class="nav-sub-clip">
+                <div class="nav-sub">
+                  <button
+                    v-for="item in group.items"
+                    :key="item.path"
+                    type="button"
+                    class="nav-subitem"
+                    :class="{ active: route.path === item.path }"
+                    :aria-current="route.path === item.path ? 'page' : undefined"
+                    @click="go(item.path)"
+                  >
+                    <span>{{ t(item.key) }}</span>
+                  </button>
+                </div>
+              </div>
             </div>
           </template>
         </div>
