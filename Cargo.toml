@@ -3,6 +3,7 @@ members = [
     "crates/shared",
     "dashboard/backend",
     "gateway",
+    "mnt",
 ]
 resolver = "3"
 

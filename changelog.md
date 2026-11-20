@@ -512,4 +512,13 @@
   “在 v2 提交创建 master → 切换默认分支 → 删除 v2”的等价流程。
 - 决策记录：WAF/CC 暂缓；告警保留本地抓取；DNS provider 凭据由面板设置（仍受
   `SECRET_ENCRYPTION_KEY` 保护）；chunked sizes 实际字节统计列为下一编码批次。
+### mnt 运维 CLI + Docker 打包（2026-11-20）
+- 新增 `mnt/` crate（`webgateway-mnt`）：通过 dashboard 的 Unix socket 获取管理员 TOTP；
+  默认输出当前 6 位验证码，`--secret` 输出 secret 与 otpauth URI（首次绑定用）。
+- dashboard 新增 `mnt` socket 服务：默认 `/run/webgateway/mnt.sock`，可用 `MNT_SOCKET` 覆盖，
+  权限 0600；socket 随进程退出清理。验证：socket mode 600、mnt code 登录 200、`--secret` 与 env 一致。
+- 仓库根目录新增 `Dockerfile`、`docker-compose.yml`、`docker/entrypoint.sh`、`docker.env.example`、
+  `.dockerignore`：多阶段构建 dashboard/gateway/mnt 与面板；compose 含 dashboard、gateway、mnt-init、
+  mnt（tools profile），数据库使用外部 PostgreSQL。
+- 文档：`deployment.md` 第 13/14 节、`issue.md` F-62。
 

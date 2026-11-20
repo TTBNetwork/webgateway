@@ -1,0 +1,12 @@
+[package]
+name = "webgateway-mnt"
+version.workspace = true
+edition.workspace = true
+
+[[bin]]
+name = "webgateway-mnt"
+path = "src/main.rs"
+
+[dependencies]
+serde.workspace = true
+serde_json.workspace = true

@@ -8,6 +8,7 @@ mod auth;
 mod certificate;
 mod config;
 mod metrics;
+mod mnt;
 mod router;
 mod secrets;
 mod websites;
@@ -34,6 +35,7 @@ async fn main() -> anyhow::Result<()> {
 
     let stats_task = shared::stats::spawn(database.clone(), config.stats);
     let certificate_task = certificate::spawn(database.clone());
+    let mnt_task = mnt::spawn(database.clone()).await?;
 
     let address = std::net::SocketAddr::from(([0, 0, 0, 0], config.server.port));
     let listener = tokio::net::TcpListener::bind(address).await?;
@@ -86,6 +88,7 @@ async fn main() -> anyhow::Result<()> {
     }
     stats_task.abort();
     certificate_task.abort();
+    mnt_task.abort();
     event!(Level::INFO, "dashboard stopped");
     Ok(())
 }

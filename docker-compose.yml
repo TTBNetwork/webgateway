@@ -1,0 +1,89 @@
+name: webgateway
+
+services:
+  mnt-init:
+    image: webgateway:local
+    build:
+      context: .
+      dockerfile: Dockerfile
+    user: "0:0"
+    entrypoint: ["/bin/sh", "-c", "chown -R 10001:10001 /run/webgateway"]
+    volumes:
+      - mnt-run:/run/webgateway
+    restart: "no"
+
+  dashboard:
+    image: webgateway:local
+    build:
+      context: .
+      dockerfile: Dockerfile
+    command: ["dashboard"]
+    restart: unless-stopped
+    environment:
+      DATABASE_URL: ${DATABASE_URL:?set DATABASE_URL in .env}
+      SECRET_ENCRYPTION_KEY: ${SECRET_ENCRYPTION_KEY:?set SECRET_ENCRYPTION_KEY in .env}
+      DASHBOARD_API_PORT: "3000"
+      DASHBOARD_API_TOKENS: ${DASHBOARD_API_TOKENS:-}
+      DASHBOARD_ADMIN_TOTP_SECRET: ${DASHBOARD_ADMIN_TOTP_SECRET:-}
+      DASHBOARD_METRICS_PORT: "9103"
+      DASHBOARD_STATIC_DIR: /app/panel
+      MNT_SOCKET: /run/webgateway/mnt.sock
+      RUST_LOG: ${DASHBOARD_LOG:-dashboard=info,shared=info}
+    ports:
+      - "3000:3000"
+    volumes:
+      - mnt-run:/run/webgateway
+    depends_on:
+      mnt-init:
+        condition: service_completed_successfully
+    healthcheck:
+      test: ["CMD", "curl", "-fsS", "http://127.0.0.1:3000/health"]
+      interval: 15s
+      timeout: 5s
+      retries: 5
+      start_period: 10s
+
+  gateway:
+    image: webgateway:local
+    build:
+      context: .
+      dockerfile: Dockerfile
+    command: ["gateway"]
+    restart: unless-stopped
+    environment:
+      DATABASE_URL: ${DATABASE_URL:?set DATABASE_URL in .env}
+      SECRET_ENCRYPTION_KEY: ${SECRET_ENCRYPTION_KEY:?set SECRET_ENCRYPTION_KEY in .env}
+      GATEWAY_PORTS: "8080"
+      GATEWAY_METRICS_PORT: ${GATEWAY_METRICS_PORT:-9102}
+      GATEWAY_NODE_NAME: ${GATEWAY_NODE_NAME:-docker}
+      GATEWAY_NODE_COUNTRY: ${GATEWAY_NODE_COUNTRY:-CN}
+      GATEWAY_NODE_CITY: ${GATEWAY_NODE_CITY:-Local}
+      GATEWAY_CACHE_MAX_SIZE: ${GATEWAY_CACHE_MAX_SIZE:-16777216}
+      GATEWAY_MAX_CONNECTIONS: ${GATEWAY_MAX_CONNECTIONS:-1024}
+      RUST_LOG: ${GATEWAY_LOG:-gateway=info,shared=info}
+    ports:
+      # Host 80 -> container 8080 for a quick test; change to "80:80" only if
+      # GATEWAY_PORTS is 80 and the container has CAP_NET_BIND_SERVICE.
+      - "${GATEWAY_HTTP_PORT:-8080}:8080"
+    depends_on:
+      dashboard:
+        condition: service_healthy
+
+  mnt:
+    image: webgateway:local
+    build:
+      context: .
+      dockerfile: Dockerfile
+    profiles: ["tools"]
+    entrypoint: ["/app/bin/webgateway-mnt"]
+    command: ["admin-totp"]
+    environment:
+      MNT_SOCKET: /run/webgateway/mnt.sock
+    volumes:
+      - mnt-run:/run/webgateway
+    depends_on:
+      dashboard:
+        condition: service_healthy
+
+volumes:
+  mnt-run:

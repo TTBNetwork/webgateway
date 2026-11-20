@@ -240,6 +240,8 @@ HTTP/TCP、flush 访问日志并标记 offline（HTTP/3 在途请求尚未 drain
 10. 给关键站点配置 `health_check`，故意停一个后端，确认请求只落到健康后端且
     `webgateway_backends_unhealthy` 归零/恢复。
 11. 做一次 `systemctl restart webgateway-dashboard` 和 `kill -TERM` gateway，确认无异常退出。
+12. 在主机运行 `webgateway-mnt admin-totp`（Docker：`docker compose --profile tools run --rm mnt admin-totp`）
+    确认能取到当前 TOTP；首次绑定用 `--secret` 获取 secret/otpauth URI。
 
 ## 9. 已知生产限制（上线前必须评估）
 
@@ -380,6 +382,7 @@ groups:
 | 缓存 Vary / HEAD / 304 | ✅ | feat/cache-vary（61d6c0b） | 变体隔离、HEAD/304 |
 | 统计 distinct IP / 保留期 / 面板时区 | ✅ | feat/stats-accuracy（4a0450b） | minute/daily distinct、tz offset |
 | 仓库主线整理（B-21） | ✅ | master de1da22（原 v2 + 31 个 feature 分支合并）；v1 为旧原型 | 分支已删除，默认分支 master |
+| mnt TOTP CLI / Docker 打包 | ✅ | mnt + Dockerfile/docker-compose | socket 0600、mnt code 登录 200、compose YAML |
 
 **最终验证**（2026-11-20）：
 
@@ -395,3 +398,75 @@ groups:
 **结论**：代码层面已具备生产部署条件。上线前按第 8 节检查表执行，使用单 dashboard 实例、TLS 反向代理，
 并为 dashboard 与所有 gateway 配置同一 `SECRET_ENCRYPTION_KEY`。B-21 已完成（master/v1 重整，
 feature 分支删除）。剩余为第 9 节列出的增强项与可选外部接入（集中告警、CI DB E2E）。
+## 13. Docker / Docker Compose 部署
+
+仓库根目录提供多阶段 `Dockerfile`、`docker-compose.yml`、`docker/entrypoint.sh` 和
+`docker.env.example`。镜像内包含 dashboard、gateway、`webgateway-mnt` 以及已构建的面板静态文件；
+运行时基于 Debian bookworm-slim，非 root 用户 UID/GID 为 10001。
+
+### 13.1 快速开始
+
+```bash
+cp docker.env.example .env
+# 编辑 .env：至少填写 DATABASE_URL、SECRET_ENCRYPTION_KEY（openssl rand -hex 32）
+docker compose up -d --build
+docker compose ps
+curl -fsS http://127.0.0.1:3000/health
+```
+
+面板监听 `3000`（映射到宿主 3000），网关默认监听容器内 `8080`（映射到宿主 8080）。
+`SECRET_ENCRYPTION_KEY` 在 compose 中为必填；dashboard 与所有 gateway 必须使用同一个值。
+数据库使用外部 PostgreSQL（compose 不内置 Postgres）；gateway 启动前 dashboard 必须完成迁移。
+
+### 13.2 Compose 服务
+
+| 服务 | 作用 | 说明 |
+|---|---|---|
+| `mnt-init` | 修正共享卷权限 | 以 root 运行一次，把 `/run/webgateway` chown 给 UID 10001 |
+| `dashboard` | 主控 + 面板 | `3000`，健康检查 `/health`；首次启动迁移 schema |
+| `gateway` | 边缘节点 | 默认 `8080`，依赖 dashboard 健康 |
+| `mnt` | 本地运维 CLI | profile `tools`，默认不启动，按需 `run --rm` |
+
+镜像通过 `docker compose build` 构建；dashboard/gateway/mnt 共用同一个镜像，仅 command 不同。
+生产部署时把 gateway 的宿主端口改为 80/443（保持容器内 8080/8443，或调整 `GATEWAY_PORTS`），
+并在前面放 TLS 反向代理/负载均衡。
+
+### 13.3 本地取 TOTP
+
+```bash
+# 当前 6 位验证码
+docker compose --profile tools run --rm mnt admin-totp
+# 首次绑定用：secret + otpauth URI
+docker compose --profile tools run --rm mnt --secret admin-totp
+```
+
+## 14. mnt 本地运维 CLI
+
+`webgateway-mnt` 通过 Unix socket（默认 `/run/webgateway/mnt.sock`，可用 `MNT_SOCKET` 覆盖；systemd 用
+`RuntimeDirectory=webgateway` 创建该目录，避免 `PrivateTmp` 隐藏 socket）
+向 dashboard 请求管理员 TOTP。socket 由 dashboard 以 `0600` 创建，
+**仅限本机/同容器访问**；不经过网络，也不会出现在 HTTP API 中。
+
+```bash
+# 取得当前验证码（登录面板时输入）
+webgateway-mnt admin-totp
+
+# 首次绑定：输出 secret 与 otpauth URI（可手动加入验证器）
+webgateway-mnt --secret admin-totp
+
+# 指定 socket（容器/自定义部署）
+webgateway-mnt --socket /run/webgateway/mnt.sock admin-totp
+```
+
+输出示例：
+
+```text
+User: admin
+TOTP: 123456
+```
+
+宿主机 systemd 部署时，把 release 的 `webgateway-mnt` 安装到 `/usr/local/bin/`（可再建 `mnt` 软链），
+并以 root 运行；socket 默认路径与 dashboard 一致。Docker 部署直接使用第 13.3 节的 compose 命令。
+
+安全说明：TOTP 是管理员登录因子，所以 mnt 故意只提供本地 socket；
+能读该 socket/secret 的账号等同于管理员。不要把 socket 放到共享目录或挂载给不可信容器。

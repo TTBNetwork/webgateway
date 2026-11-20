@@ -75,6 +75,7 @@
 | F-59 | HTTP/3 流式响应与停机 drain | ✅ | h3 响应从上游流式转发（不再受 `max_response_body_bytes` 限制）；SIGTERM 先停止接受新 QUIC 连接，在途 h3 请求与 TCP 共享 Inflight 计数（最多 10s）；请求体仍缓冲、无 h3 缓存 |
 | F-60 | 缓存 Vary / HEAD / 304 | ✅ | 按 `Vary` 请求头保存多个变体（`*` 不缓存）；HEAD 从缓存 GET 返回（保留 Content-Length、无 body）；GET/HEAD `If-None-Match` 返回 304；LRU 按 (key, variant) 维护 |
 | F-61 | 统计准确性与时区 | ✅ | 分钟/日 `total_ips` 从原始日志去重；原始日志保留期可配（7..90 天）；面板“今日”按浏览器时区从原始日志计算（`tz_offset_minutes`，-840..840，响应回显） |
+| F-62 | mnt 本地运维 CLI + Docker 打包 | ✅ | `webgateway-mnt` 经 Unix socket（0600）获取管理员 TOTP 验证码/secret；`Dockerfile` + `docker-compose.yml`（dashboard/gateway/mnt，外部 DB） |
 
 ### 1.5 测试
 
@@ -376,6 +377,8 @@
   会话改为 HttpOnly Cookie + 安全响应头，服务令牌可多值轮换，内部错误统一脱敏；
   dashboard 可直接托管面板（SIGTERM 30s drain），控制面 secret 支持 AES-256-GCM 静态加密；
   dashboard/gateway 提供 Prometheus `/metrics`（默认回环）
+- 运维：`webgateway-mnt` 本地 Unix socket 获取管理员 TOTP（默认验证码，`--secret` 输出 secret+URI）；
+  仓库提供 Dockerfile / docker-compose.yml / docker.env.example
 - 网关数据面：每 IP 令牌桶限流、站点级上游健康检查/失败摘除、HTTP/3 流式响应与停机 drain、
   缓存 Vary/HEAD/304、资源上限（连接/header/body）、CONNECT 白名单与 Alt-Svc
 - 证书：手动上传 + ACME（Let's Encrypt 实测签发；ZeroSSL 需 EAB）→ 网关 SNI 加载验证通过，见 `certificates.md`

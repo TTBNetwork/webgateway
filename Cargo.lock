@@ -4314,6 +4314,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "webgateway-mnt"
+version = "0.1.0"
+dependencies = [
+ "serde",
+ "serde_json",
+]
+
+[[package]]
 name = "webpki-root-certs"
 version = "1.0.12"
 source = "registry+https://github.com/rust-lang/crates.io-index"

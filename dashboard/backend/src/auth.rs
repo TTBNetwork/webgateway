@@ -300,6 +300,11 @@ fn build_totp(secret: &str) -> Option<Totp> {
     Builder::new().with_secret(secret).with_skew(1).build().ok()
 }
 
+/// Current TOTP code for the local `mnt` management channel.
+pub fn totp_code(secret: &str) -> Option<String> {
+    build_totp(secret).map(|totp| totp.generate_current().to_string())
+}
+
 pub(crate) fn random_id() -> anyhow::Result<String> {
     random_hex(12)
 }

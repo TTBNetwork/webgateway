@@ -4,4 +4,7 @@ old_project/
 target/
 # Local configuration (may contain credentials)
 config.toml
+.env
 .secrets/
+data/
+run/

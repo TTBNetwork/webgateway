@@ -1,0 +1,13 @@
+.git
+.github
+.agents
+.tools
+.secrets
+target
+old_project
+postgresql-dockerfile
+data
+run
+**/node_modules
+dashboard/frontend/dist
+*.log
