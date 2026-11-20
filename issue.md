@@ -1,8 +1,7 @@
 # WebGateway v2 — Features & Issue Tracker
 
 > 生成时间：2026-11-19；更新：2026-11-20  
-> 截至提交：feat/stats-accuracy b22c12b（分支栈：health-checks a5aee76 → h3-streaming 30ac6b0 →
-> cache-vary 88b0191 → stats-accuracy b22c12b）  
+> 截至提交：master de1da22（原 v2 + 全部 feature 分支已合并；旧原型归档为 v1）  
 > 验证环境：beta PostgreSQL（schema v6）、本地 E2E、GitHub Actions  
 > 图例：✅ 已完成并验证；⚠️ 可用但有明确限制；❌ 未实现
 
@@ -130,7 +129,7 @@
 - U-02 JWT refresh token / 短期令牌、每用户 API Key 管理（用户管理、RBAC、撤销已完成）
 - U-05 审计日志、操作记录、配置回滚
 - U-06 IP / User-Agent 拦截（按用户要求暂缓）
-- U-07 限流（每 IP 令牌桶已实现）；WAF/CC/UA 规则与全局配额未实现
+- U-07 限流（每 IP 令牌桶已实现）；WAF/CC/UA 规则按用户要求暂缓，全局配额未实现
 - U-08 请求体/头大小限制、连接数限制
 - U-09 上游 mTLS、客户端证书
 - U-10 面板安全头（API/health 已实现；面板静态 HTML 仍由托管层配置）
@@ -243,7 +242,8 @@
 - 已修复：原始访问日志/周分区保留期可配置（`[stats].raw_retention_days` /
   `STATS_RAW_RETENTION_DAYS`，7..90 天，默认 7）。
 - 仍存在：请求/响应 sizes 依赖日志 Content-Length（chunked 请求为 0、响应 NULL）；
-  秒/分/日表的保留期（1h/1d/长期）仍硬编码；边界分区仍逐行 DELETE。
+  需要补 chunked 实际字节统计（流式路径逐帧计数，v1 有该能力）；秒/分/日表的保留期
+  （1h/1d/长期）仍硬编码；边界分区仍逐行 DELETE。
 - 实测：同一分钟内 1 个 IP 两次 + 另一个 IP → minute total_ips=2；跨两个分钟的同一天
   2 个不同 IP → daily total_ips=2（集成测试断言）。
 - 位置：crates/shared/src/stats.rs、dashboard/backend/src/stats.rs、database.md 5.4
@@ -349,14 +349,16 @@
 
 ### P3 — 工程 / 运维
 
-- B-21 分支堆叠未合并：ci/test-workflow → ... → feat/dashboard-auth，main 未集成；PR 未合并。
+- B-21 分支堆叠未合并（已解决，2026-11-20）：旧 master 重命名为 v1；在原 v2 提交上建立 master 并
+  快进合并全部 31 个 feature 分支（de1da22），随后删除远端/本地 feature 分支；默认分支为 master。
 - B-22 CI 不跑 E2E：shared 集成测试在无 DATABASE_URL 时跳过；HTTP/3/WS/gRPC/CONNECT 仅本地验证。
 - B-23 无 cargo audit / 前端依赖审计。
 - B-24 PostgreSQL 18 beta + uint128 扩展的生产兼容/升级风险。
 - B-25 无 metrics/告警（部分修复，2026-11-20）：dashboard/gateway 已导出 Prometheus 指标
   （缓存命中、日志丢弃、配置同步、连接、统计水位、登录失败等），并给出抓取与告警规则示例；
-  仍未内置 Alertmanager/tracing 导出，上游错误率尚无独立指标。位置：gateway/src/metrics.rs、
-  dashboard/backend/src/metrics.rs、deployment.md 第 11 节。
+  仍未内置 Alertmanager/tracing 导出，上游错误率尚无独立指标。按用户决定：告警保留本地抓取，
+  不内置集中告警后端。位置：gateway/src/metrics.rs、dashboard/backend/src/metrics.rs、
+  deployment.md 第 11 节。
 - B-26 面板静态托管/SPA fallback（已修复，2026-11-20：`DASHBOARD_STATIC_DIR` 直接托管面板；nginx 仍可作为替代）。
 - B-27 无 CSP/HSTS/X-Frame-Options 等安全响应头（已修复，2026-11-20：API/health 与 dashboard 托管的面板均带安全头；外置 nginx 托管需自行配置）。
 - B-28 无 OpenAPI/接口契约测试，前端类型手工维护。
@@ -365,8 +367,8 @@
 
 ## 5. 当前状态
 
-- 最新分支：feat/stats-accuracy（分支栈 health-checks → h3-streaming → cache-vary → stats-accuracy）；
-  四个 head 的 CI 均绿（见第 7 节）。
+- 主线：master（de1da22，已快进合并全部 31 个 feature 分支）；旧原型：v1（7ee8c9a）；
+  远端只保留 master 与 v1，feature 分支已删除（2026-11-20）。
 - 测试：网关 53、dashboard 26、shared 19 + 3 集成（含 crypto、stats 回填/分区回收）；前端 format/lint/type-check/build 通过
 - 数据库：schema v6；2026-11-20 全部联调/统计/证书/CRUD/可靠性/资源上限/CONNECT/会话安全/健康检查/h3/缓存/统计验证的
   临时数据已清理（users/websites/certificates/gateways/logs/stats = 0）
@@ -393,9 +395,10 @@
 5. ~~U-19 metrics~~ ✅；~~U-07 每 IP 限流~~ ✅（WAF/CC 未做）；~~U-17 站点级健康检查~~ ✅（熔断未做）；
    U-23：缓存持久化/single-flight
 6. ~~B-08/B-14 统计准确性 + 时区~~ ✅（sizes 精度仍为 CL 估算）；
-7. **B-21：合并分支、清理 PR 栈（需用户决策）**
+7. ~~B-21：合并分支、清理 PR 栈~~ ✅（master / v1 重整完成，feature 分支已删除）
 8. 剩余增强：B-30 refresh token / 每用户 API Key / 服务令牌过期；缓存 single-flight / If-Modified-Since；
-   h3 缓存与请求体流式；WAF/CC、跨节点健康状态/熔断；CI DB E2E；统计 sizes 精度
+   h3 缓存与请求体流式；WAF/CC（按用户要求暂缓）、跨节点健康状态/熔断；CI DB E2E；
+   统计 sizes 精度（含 chunked 实际字节统计，v1 已实现——下一编码批次）
 ---
 
 ## 7. 生产就绪汇总（2026-11-20）
@@ -414,10 +417,11 @@
 | 缓存 Vary/HEAD/304（B-09） | ✅ | feat/cache-vary（61d6c0b） | 三变体隔离、HEAD HIT、GET/HEAD 304 |
 | 统计 distinct/保留期/时区（B-08/B-14） | ✅ | feat/stats-accuracy（4a0450b） | minute/daily distinct、tz offset、保留期 clamp |
 
-- 四个 head CI 全绿：a5aee76 / 30ac6b0 / 88b0191 / b22c12b。
+- 仓库主线：master（de1da22）+ v1（7ee8c9a），31 个 feature 分支已合并删除；默认分支 master。
+- 四个历史 head CI 均绿：a5aee76 / 30ac6b0 / 88b0191 / b22c12b。
 - 最终全量：gateway 53、dashboard 26、shared 19 + 3 集成；前端 format/lint/type-check/build 通过。
 - 叠加 smoke 通过（加密证书 + h3 + 缓存 + 健康检查 + 面板托管 + 指标 + 双端 SIGTERM）。
 
 **结论**：代码层面已具备生产部署条件（单 dashboard 实例、TLS 反向代理、所有节点同一 `SECRET_ENCRYPTION_KEY`、
-按 `deployment.md` 第 8 节上线）。发布前仅剩用户决策 B-21（分支合并/PR），以及外部接入
-（Alertmanager、CI DB E2E）；其余增强见第 6 节第 8 项。
+按 `deployment.md` 第 8 节上线）。B-21 已完成（master/v1 重整）；剩余为增强项（见第 6 节第 8 项）
+与外部接入（如需集中告警、CI DB E2E）。

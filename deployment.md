@@ -245,18 +245,18 @@ HTTP/TCP、flush 访问日志并标记 offline（HTTP/3 在途请求尚未 drain
 
 | 级别 | 限制 | 说明 |
 |---|---|---|
-| P0 | 分支未合并 | 堆叠分支尚未合并到主线（B-21）；**发布前需用户确认合并/PR 方式** |
+| — | 发布准备 | 主线已整理：master = 原 v2 + 全部 feature 分支（de1da22），旧原型 = v1；按第 8 节完成环境/密钥/域名切换即可发布 |
 | P1 | 密钥依赖环境变量 | 未设置 `SECRET_ENCRYPTION_KEY` 时仍明文入库；密钥丢失不可恢复；无自动重加密（B-31/P-13） |
-| P1 | 告警需自建 | dashboard/gateway 已导出 Prometheus 指标，但未内置 Alertmanager/追踪；需按第 11 节接入（B-25 部分修复） |
+| P2 | 告警在本地 | 指标由本地 Prometheus 抓取/告警（按用户决定，不内置 Alertmanager/集中告警）；配置见第 11 节 |
 | P2 | 认证增强 | 无 refresh token、每用户 API Key、服务令牌过期/自动轮换（B-30 剩余） |
 | P2 | 健康状态为单节点 | 站点级主动探测 + 被动失败标记已实现；无跨节点健康状态、无熔断/半开（P-10/U-17 部分修复） |
-| P2 | 无 WAF/CC 规则 | 已有每客户端 IP 令牌桶限流（429 + Retry-After）；无 WAF/CC 规则与全局配额（U-07 部分修复） |
+| P3 | WAF/CC 暂缓 | 已有每客户端 IP 令牌桶限流（429 + Retry-After）；WAF/CC/UA 规则按用户要求暂缓，全局配额未实现 |
 | P2 | HTTP/3 请求体仍缓冲 | 响应已流式、已参与停机 drain；请求体仍整体缓冲（上限 max_request_body_bytes），h3 无缓存（B-04/P-01 部分修复） |
 | P2 | 缓存增强 | `Vary`/HEAD/`If-None-Match` 已支持；无 single-flight、`If-Modified-Since`、stale-while-revalidate、持久化（B-09 部分修复） |
 | P2 | 登录限流单实例 | 进程内计数，多实例不共享（B-29） |
 | P2 | CI 无 DB E2E | shared 集成测试在 CI 中跳过；h3/WS/gRPC 仅本地验证（U-31/B-22） |
 | P2 | 版本与分页 | 面板版本/schema 硬编码、列表无服务端分页（B-17/B-18） |
-| P3 | 统计 sizes | 今日统计/时区已修正、`total_ips` 已按原始日志去重、原始保留期可配；请求/响应 sizes 仍依赖 Content-Length（chunked 为 0/NULL，B-08 剩余） |
+| P2 | 统计 sizes | 今日统计/时区、`total_ips`、原始保留期已修；请求/响应 sizes 仍依赖 Content-Length（chunked 为 0/NULL），需补流式路径的 chunked 实际字节统计（v1 有该能力，下一批次） |
 | P3 | 协议扩展 | h2 extended CONNECT / WebSocket over h2、gRPC-Web、h3 请求体流式（U-13/U-15） |
 | P3 | 依赖审计 | 无 cargo audit / 前端依赖审计（B-23） |
 
@@ -379,17 +379,19 @@ groups:
 | HTTP/3 流式响应 / 停机 drain | ✅ | feat/h3-streaming（30ac6b0） | 64 KiB 流式、慢请求 drain |
 | 缓存 Vary / HEAD / 304 | ✅ | feat/cache-vary（61d6c0b） | 变体隔离、HEAD/304 |
 | 统计 distinct IP / 保留期 / 面板时区 | ✅ | feat/stats-accuracy（4a0450b） | minute/daily distinct、tz offset |
+| 仓库主线整理（B-21） | ✅ | master de1da22（原 v2 + 31 个 feature 分支合并）；v1 为旧原型 | 分支已删除，默认分支 master |
 
 **最终验证**（2026-11-20）：
 
 - 测试：gateway 53、dashboard 26、shared 19 + 3 集成；`cargo fmt` / `clippy -D warnings` 通过；
   前端 format/lint/type-check/build 通过。
-- 四个分支 head CI 全绿：a5aee76（run 44716905077）、30ac6b0（run 44718152074）、
+- 分支整理：远端只保留 master（de1da22，默认分支）与 v1（7ee8c9a）；31 个历史 feature 分支已合并删除。
+- 历史分支 head CI 均绿：a5aee76（run 44716905077）、30ac6b0（run 44718152074）、
   88b0191（run 44718646839）、b22c12b（run 44720149107）。
 - 叠加功能 smoke：加密私钥证书 HTTPS 200；h3 64 KiB 响应（响应上限 1 KiB）200 + 完整字节；
   缓存 MISS→HIT；死后端被健康检查摘除；面板静态托管 200（面板 CSP）；两端 `/metrics` 正常；
   3s 慢 h3 请求在 SIGTERM 后 200，gateway exit 0；dashboard SIGTERM exit 0；端口全部释放。
 
 **结论**：代码层面已具备生产部署条件。上线前按第 8 节检查表执行，使用单 dashboard 实例、TLS 反向代理，
-并为 dashboard 与所有 gateway 配置同一 `SECRET_ENCRYPTION_KEY`。发布流程仍待用户确认 **B-21 分支合并**；
-告警后端与 CI DB E2E 需外部接入。剩余限制与增强见第 9 节。
+并为 dashboard 与所有 gateway 配置同一 `SECRET_ENCRYPTION_KEY`。B-21 已完成（master/v1 重整，
+feature 分支删除）。剩余为第 9 节列出的增强项与可选外部接入（集中告警、CI DB E2E）。

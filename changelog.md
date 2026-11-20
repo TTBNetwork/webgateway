@@ -502,5 +502,14 @@
   前端 format/lint/type-check/build 通过；四个 head CI 全绿；
   叠加 smoke（加密证书 + h3 流式 + 缓存 + 健康检查 + 面板静态托管 + 指标 + 双端 SIGTERM）通过。
 - 生产清单：`deployment.md` 第 9/12 节、`issue.md` 第 7 节。
-- 发布前剩余用户决策：B-21 分支合并/PR；外部接入：Alertmanager、CI DB E2E。
+- 生产清单：`deployment.md` 第 9/12 节、`issue.md` 第 7 节。
+
+### 仓库主线整理（2026-11-20）
+- 旧 `master`（原型 7ee8c9a）重命名为 `v1`；在原 `v2` 提交（c34922e）上建立新的 `master`，
+  并快进合并全部 31 个 feature 分支到 `de1da22`；GitHub 默认分支为 `master`。
+- 删除远端/本地全部已合并 feature 分支；远端只保留 `master` 与 `v1`。
+- 备注：GitHub 的 `v2 → master` 重命名 API 返回 `New branch already exists`，改用
+  “在 v2 提交创建 master → 切换默认分支 → 删除 v2”的等价流程。
+- 决策记录：WAF/CC 暂缓；告警保留本地抓取；DNS provider 凭据由面板设置（仍受
+  `SECRET_ENCRYPTION_KEY` 保护）；chunked sizes 实际字节统计列为下一编码批次。
 
