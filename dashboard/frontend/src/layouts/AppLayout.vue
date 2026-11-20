@@ -109,7 +109,19 @@ function firstItem(group: NavGroup): NavItem {
 }
 
 function toggleGroup(key: MessageKey): void {
-  openMenu.value = openMenu.value === key ? null : key
+  const group = groups.value.find((candidate) => candidate.key === key)
+  if (!group) return
+  if (openMenu.value === key) {
+    openMenu.value = null
+    return
+  }
+  openMenu.value = key
+  // Opening a section from outside it should also activate its first page;
+  // otherwise the user sees an open menu with no second-level item selected.
+  if (!group.items.some((item) => item.path === route.path)) {
+    const first = group.items[0]
+    if (first) go(first.path)
+  }
 }
 
 function go(path: string): void {
