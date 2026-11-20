@@ -1,7 +1,8 @@
 # WebGateway v2 — Features & Issue Tracker
 
 > 生成时间：2026-11-19；更新：2026-11-20  
-> 截至提交：feat/connect-alt-svc f6fe9a4 + 面板会话安全改造（feat/dashboard-session-security）  
+> 截至提交：feat/stats-accuracy b22c12b（分支栈：health-checks a5aee76 → h3-streaming 30ac6b0 →
+> cache-vary 88b0191 → stats-accuracy b22c12b）  
 > 验证环境：beta PostgreSQL（schema v6）、本地 E2E、GitHub Actions  
 > 图例：✅ 已完成并验证；⚠️ 可用但有明确限制；❌ 未实现
 
@@ -364,17 +365,22 @@
 
 ## 5. 当前状态
 
-- 最新分支：feat/stats-accuracy（叠加在 feat/cache-vary 之后）
+- 最新分支：feat/stats-accuracy（分支栈 health-checks → h3-streaming → cache-vary → stats-accuracy）；
+  四个 head 的 CI 均绿（见第 7 节）。
 - 测试：网关 53、dashboard 26、shared 19 + 3 集成（含 crypto、stats 回填/分区回收）；前端 format/lint/type-check/build 通过
-- 数据库：schema v6；2026-11-20 联调/统计/证书/CRUD/可靠性/资源上限/CONNECT/会话安全验证的临时数据已清理（websites/gateways/users/logs/stats = 0；测试证书已删除）
+- 数据库：schema v6；2026-11-20 全部联调/统计/证书/CRUD/可靠性/资源上限/CONNECT/会话安全/健康检查/h3/缓存/统计验证的
+  临时数据已清理（users/websites/certificates/gateways/logs/stats = 0）
 - 管理面：站点/网关/用户 CRUD + admin/user/view RBAC + token_version 撤销；面板站点/用户编辑页完成；
   会话改为 HttpOnly Cookie + 安全响应头，服务令牌可多值轮换，内部错误统一脱敏；
   dashboard 可直接托管面板（SIGTERM 30s drain），控制面 secret 支持 AES-256-GCM 静态加密；
-  dashboard/gateway 提供 Prometheus `/metrics`（默认回环）；gateway 支持每 IP 令牌桶限流、站点级上游健康检查、
-  HTTP/3 流式响应与停机 drain、缓存 Vary/HEAD/304
+  dashboard/gateway 提供 Prometheus `/metrics`（默认回环）
+- 网关数据面：每 IP 令牌桶限流、站点级上游健康检查/失败摘除、HTTP/3 流式响应与停机 drain、
+  缓存 Vary/HEAD/304、资源上限（连接/header/body）、CONNECT 白名单与 Alt-Svc
 - 证书：手动上传 + ACME（Let's Encrypt 实测签发；ZeroSSL 需 EAB）→ 网关 SNI 加载验证通过，见 `certificates.md`
 - 实时协议：Nezha gRPC（h2c/TLS/双向流）与 MCSManager WS（101/鉴权/长连接）已用真实软件验证，见 `e2e-realtime.md`
-- 面板：TOTP + JWT 登录；默认缓存 16 MiB（可配）；Vite 代理 /api → 127.0.0.1:3000
+- 统计：`total_ips` 分钟/日按原始日志去重；原始保留期可配；面板“今日”按浏览器时区
+- 最终叠加 smoke（2026-11-20）：加密证书 HTTPS 200、h3 64 KiB 流式 200、cache MISS→HIT、
+  死后端被摘除、面板静态托管 200 + 面板 CSP、慢 h3 请求 SIGTERM 后 200、dashboard SIGTERM exit 0
 
 ## 6. 建议优先级
 
@@ -387,4 +393,31 @@
 5. ~~U-19 metrics~~ ✅；~~U-07 每 IP 限流~~ ✅（WAF/CC 未做）；~~U-17 站点级健康检查~~ ✅（熔断未做）；
    U-23：缓存持久化/single-flight
 6. ~~B-08/B-14 统计准确性 + 时区~~ ✅（sizes 精度仍为 CL 估算）；
-7. B-21：合并分支、清理 PR 栈
+7. **B-21：合并分支、清理 PR 栈（需用户决策）**
+8. 剩余增强：B-30 refresh token / 每用户 API Key / 服务令牌过期；缓存 single-flight / If-Modified-Since；
+   h3 缓存与请求体流式；WAF/CC、跨节点健康状态/熔断；CI DB E2E；统计 sizes 精度
+---
+
+## 7. 生产就绪汇总（2026-11-20）
+
+本轮 6 个批次（每批测试/文档/提交/CI）收敛的生产阻断项：
+
+| 领域 | 状态 | 分支 / 提交 | 验证 |
+|---|---|---|---|
+| 面板会话与安全头（B-15/B-16/B-27） | ✅ | feat/dashboard-session-security（1d0ba33/005bfff） | Cookie 属性、401 清 Cookie、错误脱敏 |
+| 生产部署与停机（U-04/B-26） | ✅ | feat/production-deploy（ac74a83） | 静态面板/SPA/CSP、SIGTERM 30s drain |
+| 密钥静态加密（B-31/P-13） | ✅ | feat/production-deploy（340d3c4/27b92f6） | 明文迁移、登录、gateway 解密证书、缺密钥回退 |
+| Prometheus 指标（B-25/U-19） | ✅ | feat/observability（a54eb85） | 两端 /metrics 回环绑定、缓存/日志/健康计数 |
+| 每 IP 限流（U-07） | ✅ | feat/rate-limit（ad4196f） | 200/200/429、Retry-After、IP 隔离 |
+| 上游健康检查（P-10/U-17） | ✅ | feat/health-checks（9fb72f1） | 死后端摘除、对照 502、指标 |
+| HTTP/3 流式 + drain（B-04/P-01） | ✅ | feat/h3-streaming（30ac6b0） | 64 KiB h3 流式、慢请求 SIGTERM 后 200 |
+| 缓存 Vary/HEAD/304（B-09） | ✅ | feat/cache-vary（61d6c0b） | 三变体隔离、HEAD HIT、GET/HEAD 304 |
+| 统计 distinct/保留期/时区（B-08/B-14） | ✅ | feat/stats-accuracy（4a0450b） | minute/daily distinct、tz offset、保留期 clamp |
+
+- 四个 head CI 全绿：a5aee76 / 30ac6b0 / 88b0191 / b22c12b。
+- 最终全量：gateway 53、dashboard 26、shared 19 + 3 集成；前端 format/lint/type-check/build 通过。
+- 叠加 smoke 通过（加密证书 + h3 + 缓存 + 健康检查 + 面板托管 + 指标 + 双端 SIGTERM）。
+
+**结论**：代码层面已具备生产部署条件（单 dashboard 实例、TLS 反向代理、所有节点同一 `SECRET_ENCRYPTION_KEY`、
+按 `deployment.md` 第 8 节上线）。发布前仅剩用户决策 B-21（分支合并/PR），以及外部接入
+（Alertmanager、CI DB E2E）；其余增强见第 6 节第 8 项。

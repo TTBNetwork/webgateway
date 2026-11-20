@@ -492,3 +492,15 @@
   （1h/1d/长期）仍硬编码；边界分区仍逐行 DELETE。
 - 文档：`database.md` 5.4、`deployment.md` 环境变量/限制表、`issue.md` P-07/B-08/B-14/F-61、
   `dashboard/backend/config.example.toml`。
+### 生产就绪收尾（2026-11-20）
+- 6 个批次的最终分支栈（每批均含测试、文档、提交、CI）：
+  `feat/dashboard-session-security`（1d0ba33/005bfff）→
+  `feat/production-deploy`（ac74a83/340d3c4/27b92f6）→ `feat/observability`（a54eb85）→
+  `feat/rate-limit`（ad4196f）→ `feat/health-checks`（9fb72f1）→ `feat/h3-streaming`（30ac6b0）→
+  `feat/cache-vary`（61d6c0b）→ `feat/stats-accuracy`（4a0450b）。
+- 最终验证：gateway 53、dashboard 26、shared 19 + 3 集成；fmt/clippy 通过；
+  前端 format/lint/type-check/build 通过；四个 head CI 全绿；
+  叠加 smoke（加密证书 + h3 流式 + 缓存 + 健康检查 + 面板静态托管 + 指标 + 双端 SIGTERM）通过。
+- 生产清单：`deployment.md` 第 9/12 节、`issue.md` 第 7 节。
+- 发布前剩余用户决策：B-21 分支合并/PR；外部接入：Alertmanager、CI DB E2E。
+

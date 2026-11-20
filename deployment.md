@@ -245,17 +245,19 @@ HTTP/TCP、flush 访问日志并标记 offline（HTTP/3 在途请求尚未 drain
 
 | 级别 | 限制 | 说明 |
 |---|---|---|
-| P0 | 分支未合并 | 25 个堆叠分支、无主线集成（B-21），发布流程需先确定基线 |
+| P0 | 分支未合并 | 堆叠分支尚未合并到主线（B-21）；**发布前需用户确认合并/PR 方式** |
 | P1 | 密钥依赖环境变量 | 未设置 `SECRET_ENCRYPTION_KEY` 时仍明文入库；密钥丢失不可恢复；无自动重加密（B-31/P-13） |
 | P1 | 告警需自建 | dashboard/gateway 已导出 Prometheus 指标，但未内置 Alertmanager/追踪；需按第 11 节接入（B-25 部分修复） |
+| P2 | 认证增强 | 无 refresh token、每用户 API Key、服务令牌过期/自动轮换（B-30 剩余） |
+| P2 | 健康状态为单节点 | 站点级主动探测 + 被动失败标记已实现；无跨节点健康状态、无熔断/半开（P-10/U-17 部分修复） |
+| P2 | 无 WAF/CC 规则 | 已有每客户端 IP 令牌桶限流（429 + Retry-After）；无 WAF/CC 规则与全局配额（U-07 部分修复） |
 | P2 | HTTP/3 请求体仍缓冲 | 响应已流式、已参与停机 drain；请求体仍整体缓冲（上限 max_request_body_bytes），h3 无缓存（B-04/P-01 部分修复） |
-| P2 | 缓存增强 | `Vary`/HEAD/`If-None-Match` 已支持；无 single-flight、stale-while-revalidate、持久化（B-09 部分修复） |
-| P1 | 健康状态为单节点 | 站点级主动探测 + 被动失败标记已实现；无跨节点健康状态、无熔断/半开（P-10/U-17 部分修复） |
-| P1 | 无 WAF/CC 规则 | 已有每客户端 IP 令牌桶限流（429 + Retry-After）；无 WAF/CC 规则与全局配额（U-07 部分修复） |
-| P3 | 统计 sizes | 今日统计/时区已修正、`total_ips` 已按原始日志去重、原始保留期可配；请求/响应 sizes 仍依赖 Content-Length（chunked 为 0/NULL，B-08 剩余） |
+| P2 | 缓存增强 | `Vary`/HEAD/`If-None-Match` 已支持；无 single-flight、`If-Modified-Since`、stale-while-revalidate、持久化（B-09 部分修复） |
 | P2 | 登录限流单实例 | 进程内计数，多实例不共享（B-29） |
 | P2 | CI 无 DB E2E | shared 集成测试在 CI 中跳过；h3/WS/gRPC 仅本地验证（U-31/B-22） |
 | P2 | 版本与分页 | 面板版本/schema 硬编码、列表无服务端分页（B-17/B-18） |
+| P3 | 统计 sizes | 今日统计/时区已修正、`total_ips` 已按原始日志去重、原始保留期可配；请求/响应 sizes 仍依赖 Content-Length（chunked 为 0/NULL，B-08 剩余） |
+| P3 | 协议扩展 | h2 extended CONNECT / WebSocket over h2、gRPC-Web、h3 请求体流式（U-13/U-15） |
 | P3 | 依赖审计 | 无 cargo audit / 前端依赖审计（B-23） |
 
 ## 10. 运维手册（当前能力）
@@ -266,7 +268,7 @@ HTTP/TCP、flush 访问日志并标记 offline（HTTP/3 在途请求尚未 drain
 - 备份：`pg_dump -Fc` 全库；恢复后先启动 dashboard 校验 schema。
 - 证书续期：dashboard 调度器在到期前 30 天自动续期（`auto_renew` 行）；手写上传证书不自动续期。
 - 缓存：任意配置/证书 NOTIFY 会清空节点缓存，属预期行为。
-- 升级：先 dashboard 后 gateway；gateway 滚动重启会 drain 10s，h3 连接直接断开。
+- 升级：先 dashboard 后 gateway；gateway 滚动重启会 drain HTTP 与 HTTP/3 在途请求（最多 10s）。
 - 指标：dashboard 与 gateway 各自在独立回环端口暴露 `/metrics`，见第 11 节。
 - 限流：`GATEWAY_RATE_LIMIT_RPS` 启用每客户端 IP 令牌桶；超限返回 429 + `Retry-After`，
   计数见 `webgateway_rate_limited_total`。单节点计数，多节点需在边缘外做全局配额。
@@ -362,3 +364,32 @@ groups:
 - 计数器是进程内计数，重启归零；告警请用 `rate`/`increase`，不要依赖绝对值。
 - Alertmanager、日志聚合与 tracing 导出不在本仓库范围内。
 
+## 12. 生产就绪状态（2026-11-20）
+
+6 个批次（每批含测试、文档、提交与 CI）完成的生产阻断项：
+
+| 领域 | 状态 | 分支 / 提交 | 验证 |
+|---|---|---|---|
+| 面板 Cookie 会话 / 安全头 / 错误脱敏 | ✅ | feat/dashboard-session-security（1d0ba33/005bfff） | E2E 登录、撤销、CSP/HSTS |
+| 面板静态托管 / SPA / SIGTERM 30s drain | ✅ | feat/production-deploy（ac74a83） | `/`、资源缓存、SIGTERM exit 0 |
+| 控制面密钥 AES-256-GCM 静态加密 | ✅ | feat/production-deploy（340d3c4/27b92f6） | 明文迁移、gateway 解密证书 |
+| Prometheus 指标（dashboard/gateway） | ✅ | feat/observability（a54eb85） | 缓存/日志/健康/统计指标 |
+| 每 IP 令牌桶限流 | ✅ | feat/rate-limit（ad4196f） | 200/200/429 + Retry-After |
+| 站点级上游健康检查 / 失败摘除 | ✅ | feat/health-checks（9fb72f1） | 死后端自动摘除、指标 |
+| HTTP/3 流式响应 / 停机 drain | ✅ | feat/h3-streaming（30ac6b0） | 64 KiB 流式、慢请求 drain |
+| 缓存 Vary / HEAD / 304 | ✅ | feat/cache-vary（61d6c0b） | 变体隔离、HEAD/304 |
+| 统计 distinct IP / 保留期 / 面板时区 | ✅ | feat/stats-accuracy（4a0450b） | minute/daily distinct、tz offset |
+
+**最终验证**（2026-11-20）：
+
+- 测试：gateway 53、dashboard 26、shared 19 + 3 集成；`cargo fmt` / `clippy -D warnings` 通过；
+  前端 format/lint/type-check/build 通过。
+- 四个分支 head CI 全绿：a5aee76（run 44716905077）、30ac6b0（run 44718152074）、
+  88b0191（run 44718646839）、b22c12b（run 44720149107）。
+- 叠加功能 smoke：加密私钥证书 HTTPS 200；h3 64 KiB 响应（响应上限 1 KiB）200 + 完整字节；
+  缓存 MISS→HIT；死后端被健康检查摘除；面板静态托管 200（面板 CSP）；两端 `/metrics` 正常；
+  3s 慢 h3 请求在 SIGTERM 后 200，gateway exit 0；dashboard SIGTERM exit 0；端口全部释放。
+
+**结论**：代码层面已具备生产部署条件。上线前按第 8 节检查表执行，使用单 dashboard 实例、TLS 反向代理，
+并为 dashboard 与所有 gateway 配置同一 `SECRET_ENCRYPTION_KEY`。发布流程仍待用户确认 **B-21 分支合并**；
+告警后端与 CI DB E2E 需外部接入。剩余限制与增强见第 9 节。
