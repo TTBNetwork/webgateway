@@ -1,9 +1,11 @@
 //! Optional MaxMind GeoLite2 lookup for the dashboard access map.
 //!
 //! The database is intentionally not bundled with the repository (MaxMind
-//! licence). Set `GEOIP_MMDB` to a GeoLite2-City.mmdb file on the host. When
-//! the file is absent the API reports `configured: false` and the UI explains
-//! how to enable it instead of failing requests.
+//! licence). Set `GEOIP_MMDB` to a GeoLite2-City.mmdb file on the host. For
+//! development it also auto-discovers `data/geoip`, `assets/ipdb`, the v1
+//! checkout under `old_project`, and the production `/opt/webgateway` path.
+//! When the file is absent the API reports `configured: false` and the UI
+//! explains how to enable it instead of failing requests.
 
 use std::{net::IpAddr, path::PathBuf, sync::OnceLock};
 
@@ -18,9 +20,20 @@ pub struct GeoIp {
 static INSTANCE: OnceLock<Option<GeoIp>> = OnceLock::new();
 
 fn database_path() -> Option<PathBuf> {
-    std::env::var_os("GEOIP_MMDB")
-        .filter(|value| !value.is_empty())
-        .map(PathBuf::from)
+    if let Some(value) = std::env::var_os("GEOIP_MMDB").filter(|value| !value.is_empty()) {
+        return Some(PathBuf::from(value));
+    }
+    // Keep v1's database usable without extra setup in this monorepo, while
+    // production deployments should still set GEOIP_MMDB explicitly.
+    [
+        "data/geoip/GeoLite2-City.mmdb",
+        "assets/ipdb/GeoLite2-City.mmdb",
+        "old_project/webgateway/dashboard/backend/assets/ipdb/GeoLite2-City.mmdb",
+        "/opt/webgateway/assets/ipdb/GeoLite2-City.mmdb",
+    ]
+    .into_iter()
+    .map(PathBuf::from)
+    .find(|candidate| candidate.is_file())
 }
 
 fn load() -> Option<GeoIp> {

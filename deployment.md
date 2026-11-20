@@ -92,7 +92,10 @@ pg_dump -Fc --no-owner --dbname="$DATABASE_URL" -f webgateway-$(date -u +%Y%m%dT
 4. 地理图需要可选 GeoIP：从 MaxMind 下载 GeoLite2-City.mmdb（需接受其许可），放到
    `/opt/webgateway/assets/ipdb/GeoLite2-City.mmdb`，并设置
    `GEOIP_MMDB=/opt/webgateway/assets/ipdb/GeoLite2-City.mmdb`。内网/私有地址不计入国家，
-   会在图例中单列为“未知/内网”。
+   会在图例中单列为“未知/内网”。开发环境可直接复用 v1 的数据库：
+   `mkdir -p data/geoip && cp old_project/webgateway/dashboard/backend/assets/ipdb/GeoLite2-City.mmdb data/geoip/`。
+   dashboard 会依次尝试 `GEOIP_MMDB`、`data/geoip`、`assets/ipdb`、v1 的
+   `old_project` 路径和 `/opt/webgateway`；生产环境仍建议显式设置 `GEOIP_MMDB`。
 
 ### 4.1 密钥静态加密
 
