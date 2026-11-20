@@ -3,6 +3,7 @@ import { computed, reactive, ref } from 'vue'
 import AppIcon from '../components/AppIcon.vue'
 import EmptyState from '../components/EmptyState.vue'
 import AppModal from '../components/AppModal.vue'
+import ToggleSwitch from '../components/ToggleSwitch.vue'
 import { api, type Website, type WebsiteInput } from '../api'
 import { usePolling } from '../composables/usePolling'
 import { errorMessage, formatDate } from '../format'
@@ -456,60 +457,96 @@ usePolling(load)
         </div>
       </div>
 
-      <div class="form-columns">
-        <div class="form-section">
+      <div class="form-settings">
+        <div class="form-section setting-section">
           <div class="section-head">
             <div>
               <h4>{{ t('websites.cache') }}</h4>
+              <p class="muted small-text">{{ t('websites.cacheEnableHint') }}</p>
             </div>
-            <label class="switch">
-              <input v-model="form.cacheEnabled" type="checkbox" />
-              <span>{{ t('websites.cacheEnabled') }}</span>
-            </label>
+            <ToggleSwitch v-model="form.cacheEnabled" :label="t('websites.cacheEnabled')" />
           </div>
           <div class="form-grid">
             <label class="field">
               <span class="field-label">{{ t('websites.cacheTtl') }}</span>
-              <input v-model.number="form.cacheTtl" class="input" type="number" min="1" />
+              <input
+                v-model.number="form.cacheTtl"
+                class="input"
+                type="number"
+                min="1"
+                :disabled="!form.cacheEnabled"
+              />
             </label>
             <label class="field">
               <span class="field-label">{{ t('websites.cacheTypes') }}</span>
-              <input v-model="form.cacheTypes" class="input" placeholder="text/html, image/*" />
+              <input
+                v-model="form.cacheTypes"
+                class="input"
+                :disabled="!form.cacheEnabled"
+                placeholder="text/html, image/*"
+              />
             </label>
           </div>
           <p class="muted small-text">{{ t('websites.cacheTypesHint') }}</p>
         </div>
 
-        <div class="form-section">
+        <div class="form-section setting-section">
           <div class="section-head">
             <div>
               <h4>{{ t('websites.health') }}</h4>
+              <p class="muted small-text">{{ t('websites.healthEnableHint') }}</p>
             </div>
-            <label class="switch">
-              <input v-model="form.healthEnabled" type="checkbox" />
-              <span>{{ t('websites.healthEnabled') }}</span>
-            </label>
+            <ToggleSwitch v-model="form.healthEnabled" :label="t('websites.healthEnabled')" />
           </div>
           <div class="form-grid">
             <label class="field">
               <span class="field-label">{{ t('websites.healthPath') }}</span>
-              <input v-model="form.healthPath" class="input" placeholder="/" />
+              <input
+                v-model="form.healthPath"
+                class="input"
+                :disabled="!form.healthEnabled"
+                placeholder="/"
+              />
             </label>
             <label class="field">
               <span class="field-label">{{ t('websites.healthInterval') }}</span>
-              <input v-model.number="form.healthInterval" class="input" type="number" min="1" />
+              <input
+                v-model.number="form.healthInterval"
+                class="input"
+                type="number"
+                min="1"
+                :disabled="!form.healthEnabled"
+              />
             </label>
             <label class="field">
               <span class="field-label">{{ t('websites.healthTimeout') }}</span>
-              <input v-model.number="form.healthTimeout" class="input" type="number" min="1" />
+              <input
+                v-model.number="form.healthTimeout"
+                class="input"
+                type="number"
+                min="1"
+                :disabled="!form.healthEnabled"
+              />
             </label>
             <label class="field">
               <span class="field-label">{{ t('websites.unhealthyThreshold') }}</span>
-              <input v-model.number="form.unhealthyThreshold" class="input" type="number" min="1" />
+              <input
+                v-model.number="form.unhealthyThreshold"
+                class="input"
+                type="number"
+                min="1"
+                :disabled="!form.healthEnabled"
+              />
             </label>
             <label class="field">
               <span class="field-label">{{ t('websites.healthyThreshold') }}</span>
-              <input v-model.number="form.healthyThreshold" class="input" type="number" min="1" />
+              <input
+                v-model.number="form.healthyThreshold"
+                class="input"
+                type="number"
+                min="1"
+                :disabled="!form.healthEnabled"
+              />
             </label>
           </div>
         </div>

@@ -10,32 +10,9 @@ const width = 520
 const height = 170
 const padding = { top: 10, right: 4, bottom: 20, left: 4 }
 
-const SLOT_SECONDS = 5
-const SLOT_COUNT = 60
-
-// Keep a stable 60-slot window (5 minutes, one slot per 5 seconds), even when
-// only one bucket has traffic. This prevents a single request from becoming
-// one giant bar across the whole card.
-const series = computed(() => {
-  if (!props.points.length) return []
-  const bySecond = new Map<number, number>()
-  let latest = 0
-  for (const point of props.points) {
-    const second = Math.floor(Date.parse(point.bucket) / 1000)
-    if (!Number.isFinite(second)) continue
-    bySecond.set(second, point.qps)
-    latest = Math.max(latest, second)
-  }
-  if (!latest) return []
-  const end = Math.floor(Math.max(latest, Date.now() / 1000) / SLOT_SECONDS) * SLOT_SECONDS
-  return Array.from({ length: SLOT_COUNT }, (_, index) => {
-    const second = end - (SLOT_COUNT - 1 - index) * SLOT_SECONDS
-    return {
-      bucket: new Date(second * 1000).toISOString(),
-      qps: bySecond.get(second) ?? 0,
-    }
-  })
-})
+// The parent QpsPanel aligns the series to 60 five-second slots before passing
+// it in, so this component stays a pure rendering layer.
+const series = computed(() => props.points.slice(-60))
 const maxValue = computed(() => Math.max(0.01, ...series.value.map((point) => point.qps)))
 
 const bars = computed(() => {

@@ -65,6 +65,7 @@ pub fn router(
         .route("/api/dns-providers", get(dns_providers))
         .route("/api/gateways", get(gateways))
         .route("/api/geo", get(geo))
+        .route("/api/qps", get(qps))
         .route("/api/logs", get(logs))
         .route("/api/auth/me", get(me))
         .route("/api/auth/logout", post(logout));
@@ -823,9 +824,35 @@ async fn summary(
         })
         .collect();
 
-    // One bar per 5-second interval for the last five minutes. Average QPS
-    // over each bucket is request count / 5, not a 60-minute aggregate.
-    let qps = sqlx::query(
+    Ok(Json(json!({
+        "websites": counts.try_get::<i64, _>("websites").map_err(internal)?,
+        "certificates": counts.try_get::<i64, _>("certificates").map_err(internal)?,
+        "gateways_online": counts.try_get::<i64, _>("gateways_online").map_err(internal)?,
+        "gateways_total": counts.try_get::<i64, _>("gateways_total").map_err(internal)?,
+        "requests_today": today.try_get::<i64, _>("requests").map_err(internal)?,
+        "responses_today": today.try_get::<i64, _>("responses").map_err(internal)?,
+        "e4xx_today": today.try_get::<i64, _>("e4xx").map_err(internal)?,
+        "e5xx_today": today.try_get::<i64, _>("e5xx").map_err(internal)?,
+        "requests_size_today": today.try_get::<String, _>("request_size").map_err(internal)?,
+        "response_size_today": today.try_get::<String, _>("response_size").map_err(internal)?,
+        "traffic": traffic,
+        "timezone_offset_minutes": tz_offset,
+    })))
+}
+
+/// Lightweight live QPS endpoint, polled separately from the dashboard
+/// summary. Returns only aggregate counts for the last five minutes.
+async fn qps(State(state): State<AppState>) -> Result<Json<Value>, ApiError> {
+    let clock = sqlx::query(
+        "SELECT to_char(now() AT TIME ZONE 'UTC',
+                        'YYYY-MM-DD\"T\"HH24:MI:SS\"Z\"') AS current_time",
+    )
+    .fetch_one(state.database.pool())
+    .await
+    .map_err(internal)?;
+    let current_time: String = clock.try_get("current_time").map_err(internal)?;
+
+    let rows = sqlx::query(
         "WITH points AS (
             SELECT date_bin('5 seconds', requested_at, TIMESTAMPTZ 'epoch') AS bucket,
                    count(*)::float8 AS requests
@@ -842,7 +869,7 @@ async fn summary(
     .await
     .map_err(internal)?;
 
-    let qps: Vec<Value> = qps
+    let series: Vec<Value> = rows
         .into_iter()
         .filter_map(|row| {
             let bucket: String = row.try_get("bucket").ok()?;
@@ -852,19 +879,8 @@ async fn summary(
         .collect();
 
     Ok(Json(json!({
-        "websites": counts.try_get::<i64, _>("websites").map_err(internal)?,
-        "certificates": counts.try_get::<i64, _>("certificates").map_err(internal)?,
-        "gateways_online": counts.try_get::<i64, _>("gateways_online").map_err(internal)?,
-        "gateways_total": counts.try_get::<i64, _>("gateways_total").map_err(internal)?,
-        "requests_today": today.try_get::<i64, _>("requests").map_err(internal)?,
-        "responses_today": today.try_get::<i64, _>("responses").map_err(internal)?,
-        "e4xx_today": today.try_get::<i64, _>("e4xx").map_err(internal)?,
-        "e5xx_today": today.try_get::<i64, _>("e5xx").map_err(internal)?,
-        "requests_size_today": today.try_get::<String, _>("request_size").map_err(internal)?,
-        "response_size_today": today.try_get::<String, _>("response_size").map_err(internal)?,
-        "traffic": traffic,
-        "qps": qps,
-        "timezone_offset_minutes": tz_offset,
+        "current_time": current_time,
+        "series": series,
     })))
 }
 

@@ -12,6 +12,11 @@ export interface QpsPoint {
   qps: number
 }
 
+export interface QpsResponse {
+  current_time: string
+  series: QpsPoint[]
+}
+
 export interface GeoNode {
   id: string
   name: string | null
@@ -42,7 +47,6 @@ export interface Summary {
   requests_size_today: string
   response_size_today: string
   traffic: TrafficPoint[]
-  qps: QpsPoint[]
 }
 
 export interface Website {
@@ -234,6 +238,7 @@ export const api = {
   },
   websites: () => request<Items<Website>>('websites').then((value) => value.items),
   geo: () => request<GeoSummary>('geo?days=1'),
+  qps: () => request<QpsResponse>('qps'),
   certificates: () => request<Items<Certificate>>('certificates').then((value) => value.items),
   uploadCertificate: (payload: UploadCertificatePayload) =>
     send<{ id: string; hostnames: string[] }>('certificates', 'POST', payload),

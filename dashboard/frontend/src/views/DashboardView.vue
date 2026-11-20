@@ -1,13 +1,12 @@
 <script setup lang="ts">
-import { computed, ref } from 'vue'
+import { computed, onMounted, ref } from 'vue'
 import AppIcon from '../components/AppIcon.vue'
 import EmptyState from '../components/EmptyState.vue'
 import GeoMap from '../components/GeoMap.vue'
-import QpsChart from '../components/QpsChart.vue'
+import QpsPanel from '../components/QpsPanel.vue'
 import StatCard from '../components/StatCard.vue'
 import TrafficChart from '../components/TrafficChart.vue'
 import { api, type GeoSummary, type Summary } from '../api'
-import { usePolling } from '../composables/usePolling'
 import { errorMessage, formatBytes, formatNumber } from '../format'
 import { t } from '../i18n'
 
@@ -23,8 +22,6 @@ const summary = ref<Summary | null>(null)
 const geo = ref<GeoSummary | null>(null)
 const loading = ref(false)
 const error = ref('')
-
-const latestQps = computed(() => summary.value?.qps?.at(-1)?.qps ?? 0)
 
 const cards = computed<Card[]>(() => {
   const data = summary.value
@@ -102,8 +99,12 @@ async function loadGeo(): Promise<void> {
   }
 }
 
-usePolling(load)
-usePolling(loadGeo, 60_000)
+// No page-wide polling: the QPS card owns its 5s clock, while summary/map
+// load once on mount.
+onMounted(() => {
+  void load()
+  void loadGeo()
+})
 </script>
 
 <template>
@@ -146,16 +147,7 @@ usePolling(loadGeo, 60_000)
         />
 
         <div class="dashboard-stack">
-          <div class="card qps-card">
-            <div class="card-header">
-              <div>
-                <h3>{{ t('dashboard.qpsTitle') }}</h3>
-                <p>{{ t('dashboard.qpsSubtitle') }}</p>
-              </div>
-              <span class="badge badge-muted">{{ latestQps.toFixed(2) }} QPS</span>
-            </div>
-            <QpsChart :points="summary.qps ?? []" />
-          </div>
+          <QpsPanel />
 
           <div class="card">
             <div class="card-header">
