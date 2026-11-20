@@ -37,7 +37,7 @@ const form = reactive({
   cacheTtl: 60,
   cacheTypes: '',
   cacheExtra: {} as Record<string, unknown>,
-  healthEnabled: false,
+  healthEnabled: true,
   healthPath: '/',
   healthInterval: 10,
   healthTimeout: 2,
@@ -116,7 +116,7 @@ function resetForm(): void {
   form.cacheTtl = 60
   form.cacheTypes = ''
   form.cacheExtra = {}
-  form.healthEnabled = false
+  form.healthEnabled = true
   form.healthPath = '/'
   form.healthInterval = 10
   form.healthTimeout = 2
@@ -167,7 +167,9 @@ function openEdit(item: Website): void {
   delete cacheExtra.ttl
   delete cacheExtra.content_types
   form.cacheExtra = cacheExtra
-  form.healthEnabled = Boolean(health.enabled)
+  // Sites created before the health_check config existed should default to
+  // active probes; an explicit enabled:false is still respected.
+  form.healthEnabled = health.enabled === undefined ? true : Boolean(health.enabled)
   form.healthPath = String(health.path ?? '/')
   form.healthInterval = Number(health.interval_secs ?? 10) || 10
   form.healthTimeout = Number(health.timeout_secs ?? 2) || 2

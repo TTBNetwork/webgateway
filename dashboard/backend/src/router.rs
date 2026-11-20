@@ -823,18 +823,18 @@ async fn summary(
         })
         .collect();
 
-    // Recent per-minute QPS for the bar chart. The second rollup has a
-    // shorter horizon; the minute rollup fills the rest of the hour.
+    // One bar per 5-second interval for the last five minutes. Average QPS
+    // over each bucket is request count / 5, not a 60-minute aggregate.
     let qps = sqlx::query(
         "WITH points AS (
-            SELECT date_trunc('minute', requested_at) AS bucket,
+            SELECT date_bin('5 seconds', requested_at, TIMESTAMPTZ 'epoch') AS bucket,
                    count(*)::float8 AS requests
               FROM access_request_logs
-             WHERE requested_at >= now() - interval '60 minutes'
+             WHERE requested_at >= now() - interval '5 minutes'
              GROUP BY 1
          )
-         SELECT to_char(bucket, 'YYYY-MM-DD\"T\"HH24:MI:00\"Z\"') AS bucket,
-                round((requests / 60.0)::numeric, 3)::float8 AS qps
+         SELECT to_char(bucket, 'YYYY-MM-DD\"T\"HH24:MI:SS\"Z\"') AS bucket,
+                round((requests / 5.0)::numeric, 3)::float8 AS qps
            FROM points
           ORDER BY bucket",
     )

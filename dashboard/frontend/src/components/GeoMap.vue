@@ -50,9 +50,26 @@ const normalized = computed(() => {
 
 const topSources = computed(() => normalized.value.slice(0, 6))
 const sourceCodes = computed(() => new Set(normalized.value.map((item) => item.code)))
+const sourceCounts = computed(
+  () => new Map(normalized.value.map((item) => [item.code, item.count])),
+)
 const countryCount = computed(() => normalized.value.length)
 const totalSources = computed(() => normalized.value.reduce((sum, item) => sum + item.count, 0))
 const maxSource = computed(() => Math.max(1, ...normalized.value.map((item) => item.count)))
+
+function heatRatio(count: number): number {
+  return Math.sqrt(count / maxSource.value)
+}
+
+function countryStyle(count: number | undefined): Record<string, string> | undefined {
+  if (!count) return undefined
+  const percent = Math.round(18 + 72 * heatRatio(count))
+  return { fill: `color-mix(in srgb, var(--accent) ${percent}%, var(--map-land))` }
+}
+
+function sourceRadius(count: number): number {
+  return 3.2 + 6 * heatRatio(count)
+}
 
 const nodeMarkers = computed(() => {
   const seen = new Map<string, number>()
@@ -82,6 +99,7 @@ const sourceMarkers = computed(() =>
           {
             code: item.code,
             count: item.count,
+            radius: sourceRadius(item.count),
             name: countryName(item.feature),
             x: item.feature.point[0],
             y: item.feature.point[1],
@@ -116,12 +134,13 @@ const onlineNodes = computed(() => props.nodes.filter((node) => node.online).len
           :key="(country.iso ?? '') + country.name"
           class="geo-country"
           :class="{ 'has-source': country.iso && sourceCodes.has(country.iso) }"
+          :style="country.iso ? countryStyle(sourceCounts.get(country.iso)) : undefined"
           :d="country.path"
         />
 
         <g v-for="marker in sourceMarkers" :key="marker.code" class="geo-source-marker">
           <circle class="geo-pulse" :cx="marker.x" :cy="marker.y" r="13" />
-          <circle class="geo-source-dot" :cx="marker.x" :cy="marker.y" r="4.5" />
+          <circle class="geo-source-dot" :cx="marker.x" :cy="marker.y" :r="marker.radius" />
           <title>{{ marker.name }} · {{ formatNumber(marker.count) }}</title>
         </g>
 

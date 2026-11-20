@@ -826,6 +826,16 @@ ul {
   border-color: var(--accent);
 }
 
+.select:disabled,
+.input:disabled,
+textarea:disabled {
+  border-color: var(--border);
+  color: var(--muted);
+  background: var(--panel-solid);
+  opacity: 0.7;
+  cursor: not-allowed;
+}
+
 .pill-note {
   margin-left: auto;
   padding: 5px 9px;
