@@ -80,6 +80,7 @@ pg_dump -Fc --no-owner --dbname="$DATABASE_URL" -f webgateway-$(date -u +%Y%m%dT
 | `SECRET_ENCRYPTION_KEY` | 生产必填 | 32 字节密钥（64 hex 或 base64），加密数据库中的控制面 secret |
 | `SECRET_ENCRYPTION_KEY_PREVIOUS` | 轮换时 | 旧密钥，仅用于解密过渡 |
 | `ACME_EMAIL` | 否 | 证书申请联系邮箱的兜底值 |
+| `GEOIP_MMDB` | 否 | GeoLite2-City.mmdb 路径；设置后概览地理图按国家聚合访问来源。数据库受 MaxMind 许可约束，不随仓库分发；不设置时地图显示“未配置 GeoIP” |
 | `RUST_LOG` | 否 | 建议 `dashboard=info,shared=info` |
 
 首次启动要点：
@@ -88,6 +89,10 @@ pg_dump -Fc --no-owner --dbname="$DATABASE_URL" -f webgateway-$(date -u +%Y%m%dT
    生产建议先设置 `DASHBOARD_ADMIN_TOTP_SECRET`（base32）再启动，直接保存到密码管理器。
 2. `DASHBOARD_API_TOKENS` 请生成高熵随机值（例如 `openssl rand -hex 32`），不要复用开发令牌。
 3. 密钥加密见 4.1；未设置 `SECRET_ENCRYPTION_KEY` 时 secret 仍会明文入库。
+4. 地理图需要可选 GeoIP：从 MaxMind 下载 GeoLite2-City.mmdb（需接受其许可），放到
+   `/opt/webgateway/assets/ipdb/GeoLite2-City.mmdb`，并设置
+   `GEOIP_MMDB=/opt/webgateway/assets/ipdb/GeoLite2-City.mmdb`。内网/私有地址不计入国家，
+   会在图例中单列为“未知/内网”。
 
 ### 4.1 密钥静态加密
 

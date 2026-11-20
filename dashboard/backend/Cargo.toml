@@ -12,6 +12,7 @@ acmex.workspace = true
 anyhow.workspace = true
 axum.workspace = true
 data-encoding = "2.11.1"
+geoip2 = "0.1.8"
 getrandom = "0.4.3"
 jsonwebtoken = { version = "12.0.0", features = ["rust_crypto"] }
 serde.workspace = true

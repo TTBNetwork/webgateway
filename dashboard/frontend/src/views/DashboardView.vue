@@ -2,9 +2,11 @@
 import { computed, ref } from 'vue'
 import AppIcon from '../components/AppIcon.vue'
 import EmptyState from '../components/EmptyState.vue'
+import GeoMap from '../components/GeoMap.vue'
+import QpsChart from '../components/QpsChart.vue'
 import StatCard from '../components/StatCard.vue'
 import TrafficChart from '../components/TrafficChart.vue'
-import { api, type Summary } from '../api'
+import { api, type GeoSummary, type Summary } from '../api'
 import { usePolling } from '../composables/usePolling'
 import { errorMessage, formatBytes, formatNumber } from '../format'
 import { t } from '../i18n'
@@ -18,8 +20,11 @@ interface Card {
 }
 
 const summary = ref<Summary | null>(null)
+const geo = ref<GeoSummary | null>(null)
 const loading = ref(false)
 const error = ref('')
+
+const latestQps = computed(() => summary.value?.qps?.at(-1)?.qps ?? 0)
 
 const cards = computed<Card[]>(() => {
   const data = summary.value
@@ -87,7 +92,18 @@ async function load(): Promise<void> {
   }
 }
 
+// Country aggregation scans raw IPs; it changes slowly and does not need the
+// 15s summary cadence. Keep the previous map on transient failures.
+async function loadGeo(): Promise<void> {
+  try {
+    geo.value = await api.geo()
+  } catch {
+    // The map is optional; summary errors already surface the dashboard error.
+  }
+}
+
 usePolling(load)
+usePolling(loadGeo, 60_000)
 </script>
 
 <template>
@@ -121,52 +137,72 @@ usePolling(load)
         />
       </section>
 
-      <section class="dashboard-grid">
-        <div class="card chart-card">
-          <div class="card-header">
-            <div>
-              <h3>{{ t('dashboard.traffic24h') }}</h3>
-              <p>{{ t('dashboard.requests') }} · hourly</p>
-            </div>
-            <span class="badge badge-info">{{ t('dashboard.requestsHint') }}</span>
-          </div>
-          <TrafficChart :points="summary.traffic" />
-        </div>
+      <section class="dashboard-map-grid">
+        <GeoMap
+          :countries="geo?.countries ?? {}"
+          :nodes="geo?.nodes ?? []"
+          :configured="geo?.configured ?? false"
+          :unknown="geo?.unknown ?? 0"
+        />
 
-        <div class="card">
-          <div class="card-header">
-            <div>
-              <h3>{{ t('dashboard.breakdown') }}</h3>
-              <p>{{ t('dashboard.requests') }} / {{ t('dashboard.responses') }}</p>
+        <div class="dashboard-stack">
+          <div class="card qps-card">
+            <div class="card-header">
+              <div>
+                <h3>{{ t('dashboard.qpsTitle') }}</h3>
+                <p>{{ t('dashboard.qpsSubtitle') }}</p>
+              </div>
+              <span class="badge badge-muted">{{ latestQps.toFixed(2) }} QPS</span>
             </div>
+            <QpsChart :points="summary.qps ?? []" />
           </div>
-          <dl class="metric-list">
-            <div>
-              <dt>{{ t('dashboard.requests') }}</dt>
-              <dd>{{ formatNumber(summary.requests_today) }}</dd>
+
+          <div class="card">
+            <div class="card-header">
+              <div>
+                <h3>{{ t('dashboard.breakdown') }}</h3>
+                <p>{{ t('dashboard.requests') }} / {{ t('dashboard.responses') }}</p>
+              </div>
             </div>
-            <div>
-              <dt>{{ t('dashboard.responses') }}</dt>
-              <dd>{{ formatNumber(summary.responses_today) }}</dd>
-            </div>
-            <div>
-              <dt>{{ t('dashboard.e4xx') }}</dt>
-              <dd class="text-warning">{{ formatNumber(summary.e4xx_today) }}</dd>
-            </div>
-            <div>
-              <dt>{{ t('dashboard.e5xx') }}</dt>
-              <dd class="text-danger">{{ formatNumber(summary.e5xx_today) }}</dd>
-            </div>
-            <div>
-              <dt>{{ t('dashboard.requestSize') }}</dt>
-              <dd>{{ formatBytes(summary.requests_size_today) }}</dd>
-            </div>
-            <div>
-              <dt>{{ t('dashboard.responseSize') }}</dt>
-              <dd>{{ formatBytes(summary.response_size_today) }}</dd>
-            </div>
-          </dl>
+            <dl class="metric-list">
+              <div>
+                <dt>{{ t('dashboard.requests') }}</dt>
+                <dd>{{ formatNumber(summary.requests_today) }}</dd>
+              </div>
+              <div>
+                <dt>{{ t('dashboard.responses') }}</dt>
+                <dd>{{ formatNumber(summary.responses_today) }}</dd>
+              </div>
+              <div>
+                <dt>{{ t('dashboard.e4xx') }}</dt>
+                <dd class="text-warning">{{ formatNumber(summary.e4xx_today) }}</dd>
+              </div>
+              <div>
+                <dt>{{ t('dashboard.e5xx') }}</dt>
+                <dd class="text-danger">{{ formatNumber(summary.e5xx_today) }}</dd>
+              </div>
+              <div>
+                <dt>{{ t('dashboard.requestSize') }}</dt>
+                <dd>{{ formatBytes(summary.requests_size_today) }}</dd>
+              </div>
+              <div>
+                <dt>{{ t('dashboard.responseSize') }}</dt>
+                <dd>{{ formatBytes(summary.response_size_today) }}</dd>
+              </div>
+            </dl>
+          </div>
         </div>
+      </section>
+
+      <section class="card chart-card traffic-card">
+        <div class="card-header">
+          <div>
+            <h3>{{ t('dashboard.traffic24h') }}</h3>
+            <p>{{ t('dashboard.requests') }} · hourly</p>
+          </div>
+          <span class="badge badge-info">{{ t('dashboard.requestsHint') }}</span>
+        </div>
+        <TrafficChart :points="summary.traffic" />
       </section>
     </template>
 

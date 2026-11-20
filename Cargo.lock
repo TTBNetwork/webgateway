@@ -726,6 +726,7 @@ dependencies = [
  "anyhow",
  "axum",
  "data-encoding",
+ "geoip2",
  "getrandom 0.4.3",
  "jsonwebtoken",
  "rustls-pemfile",
@@ -1201,6 +1202,26 @@ checksum = "85649ca51fd72272d7821adaf274ad91c288277713d9c18820d8499a7ff69e9a"
 dependencies = [
  "typenum",
  "version_check",
+]
+
+[[package]]
+name = "geoip2"
+version = "0.1.8"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "a3ab94244418903f1dc68a8ce367f7fb21f8e43feab5441e84c1554589900815"
+dependencies = [
+ "geoip2-codegen",
+]
+
+[[package]]
+name = "geoip2-codegen"
+version = "0.1.5"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "1f2cac58ebe4e3057db62922453a19143a41aa66e7e5207a06cb07b975c5694b"
+dependencies = [
+ "proc-macro2",
+ "quote",
+ "syn 2.0.119",
 ]
 
 [[package]]

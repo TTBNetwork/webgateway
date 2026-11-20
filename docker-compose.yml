@@ -27,12 +27,14 @@ services:
       DASHBOARD_ADMIN_TOTP_SECRET: ${DASHBOARD_ADMIN_TOTP_SECRET:-}
       DASHBOARD_METRICS_PORT: "9103"
       DASHBOARD_STATIC_DIR: /app/panel
+      GEOIP_MMDB: ${GEOIP_MMDB:-/opt/webgateway/assets/ipdb/GeoLite2-City.mmdb}
       MNT_SOCKET: /run/webgateway/mnt.sock
       RUST_LOG: ${DASHBOARD_LOG:-dashboard=info,shared=info}
     ports:
       - "3000:3000"
     volumes:
       - mnt-run:/run/webgateway
+      - ./data/geoip:/opt/webgateway/assets/ipdb:ro
     depends_on:
       mnt-init:
         condition: service_completed_successfully

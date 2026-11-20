@@ -7,6 +7,7 @@
 mod auth;
 mod certificate;
 mod config;
+mod geoip;
 mod metrics;
 mod mnt;
 mod router;

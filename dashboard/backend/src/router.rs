@@ -64,6 +64,7 @@ pub fn router(
         .route("/api/certificates", get(certificates))
         .route("/api/dns-providers", get(dns_providers))
         .route("/api/gateways", get(gateways))
+        .route("/api/geo", get(geo))
         .route("/api/logs", get(logs))
         .route("/api/auth/me", get(me))
         .route("/api/auth/logout", post(logout));
@@ -822,6 +823,34 @@ async fn summary(
         })
         .collect();
 
+    // Recent per-minute QPS for the bar chart. The second rollup has a
+    // shorter horizon; the minute rollup fills the rest of the hour.
+    let qps = sqlx::query(
+        "WITH points AS (
+            SELECT date_trunc('minute', requested_at) AS bucket,
+                   count(*)::float8 AS requests
+              FROM access_request_logs
+             WHERE requested_at >= now() - interval '60 minutes'
+             GROUP BY 1
+         )
+         SELECT to_char(bucket, 'YYYY-MM-DD\"T\"HH24:MI:00\"Z\"') AS bucket,
+                round((requests / 60.0)::numeric, 3)::float8 AS qps
+           FROM points
+          ORDER BY bucket",
+    )
+    .fetch_all(state.database.pool())
+    .await
+    .map_err(internal)?;
+
+    let qps: Vec<Value> = qps
+        .into_iter()
+        .filter_map(|row| {
+            let bucket: String = row.try_get("bucket").ok()?;
+            let qps: f64 = row.try_get("qps").ok()?;
+            Some(json!({ "bucket": bucket, "qps": qps }))
+        })
+        .collect();
+
     Ok(Json(json!({
         "websites": counts.try_get::<i64, _>("websites").map_err(internal)?,
         "certificates": counts.try_get::<i64, _>("certificates").map_err(internal)?,
@@ -834,6 +863,7 @@ async fn summary(
         "requests_size_today": today.try_get::<String, _>("request_size").map_err(internal)?,
         "response_size_today": today.try_get::<String, _>("response_size").map_err(internal)?,
         "traffic": traffic,
+        "qps": qps,
         "timezone_offset_minutes": tz_offset,
     })))
 }
@@ -1063,6 +1093,81 @@ async fn delete_dns_provider(
             Json(json!({ "error": "DNS provider not found" })),
         )),
     }
+}
+
+#[derive(Debug, Deserialize)]
+struct GeoQuery {
+    days: Option<i64>,
+}
+
+/// Country-level access distribution for the geographic map. GeoIP is
+/// optional; when `GEOIP_MMDB` is not set the response is explicit about it.
+async fn geo(
+    State(state): State<AppState>,
+    Query(query): Query<GeoQuery>,
+) -> Result<Json<Value>, ApiError> {
+    let days = query.days.unwrap_or(1).clamp(1, 7);
+    let configured = crate::geoip::configured();
+    let mut countries: std::collections::BTreeMap<String, i64> = std::collections::BTreeMap::new();
+    let mut unknown = 0_i64;
+
+    if configured {
+        let rows = sqlx::query(
+            "SELECT remote_addr::text AS remote_addr,
+                    count(*)::bigint AS requests
+               FROM access_request_logs
+              WHERE requested_at >= now() - make_interval(days => $1)
+              GROUP BY remote_addr",
+        )
+        .bind(days as i32)
+        .fetch_all(state.database.pool())
+        .await
+        .map_err(internal)?;
+
+        for row in rows {
+            let address: String = row.try_get("remote_addr").map_err(internal)?;
+            let count: i64 = row.try_get("requests").map_err(internal)?;
+            match address.parse::<std::net::IpAddr>() {
+                Ok(ip) => match crate::geoip::lookup_country(ip) {
+                    Some(country) => *countries.entry(country).or_insert(0) += count,
+                    None => unknown += count,
+                },
+                Err(_) => unknown += count,
+            }
+        }
+    }
+
+    let nodes = sqlx::query(
+        "SELECT id, name, country, city, status,
+                (status = 'online' AND last_seen_at >= now() - interval '30 seconds') AS online
+           FROM gateways
+          ORDER BY last_seen_at DESC NULLS LAST",
+    )
+    .fetch_all(state.database.pool())
+    .await
+    .map_err(internal)?;
+
+    let nodes: Vec<Value> = nodes
+        .into_iter()
+        .map(|row| {
+            Ok(json!({
+                "id": row.try_get::<String, _>("id").map_err(internal)?,
+                "name": row.try_get::<Option<String>, _>("name").map_err(internal)?,
+                "country": row.try_get::<Option<String>, _>("country").map_err(internal)?,
+                "city": row.try_get::<Option<String>, _>("city").map_err(internal)?,
+                "status": row.try_get::<String, _>("status").map_err(internal)?,
+                "online": row.try_get::<bool, _>("online").map_err(internal)?,
+            }))
+        })
+        .collect::<Result<Vec<_>, ApiError>>()?;
+
+    Ok(Json(json!({
+        "configured": configured,
+        "days": days,
+        "countries": countries,
+        "unknown": unknown,
+        "nodes": nodes,
+    })))
 }
 
 async fn gateways(State(state): State<AppState>) -> Result<Json<Value>, ApiError> {

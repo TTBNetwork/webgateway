@@ -7,6 +7,28 @@ export interface TrafficPoint {
   requests: number
 }
 
+export interface QpsPoint {
+  bucket: string
+  qps: number
+}
+
+export interface GeoNode {
+  id: string
+  name: string | null
+  country: string | null
+  city: string | null
+  status: string
+  online: boolean
+}
+
+export interface GeoSummary {
+  configured: boolean
+  days: number
+  countries: Record<string, number>
+  unknown: number
+  nodes: GeoNode[]
+}
+
 export interface Summary {
   timezone_offset_minutes: number
   websites: number
@@ -20,6 +42,7 @@ export interface Summary {
   requests_size_today: string
   response_size_today: string
   traffic: TrafficPoint[]
+  qps: QpsPoint[]
 }
 
 export interface Website {
@@ -210,6 +233,7 @@ export const api = {
     return request<Summary>('summary?tz_offset_minutes=' + String(offset))
   },
   websites: () => request<Items<Website>>('websites').then((value) => value.items),
+  geo: () => request<GeoSummary>('geo?days=1'),
   certificates: () => request<Items<Certificate>>('certificates').then((value) => value.items),
   uploadCertificate: (payload: UploadCertificatePayload) =>
     send<{ id: string; hostnames: string[] }>('certificates', 'POST', payload),

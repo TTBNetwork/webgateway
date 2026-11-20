@@ -559,3 +559,14 @@
   侧栏 228px、菜单项更紧凑；移动端 KPI 单列、顶部栏与内容内边距收紧。
 - 验证：Headless Chromium 截图检查登录、概览、站点、证书、DNS、日志、设置和移动端；
   前端 format/lint/type-check/build 通过。
+
+### 地理图、QPS 柱状图与 light 主题修正（2026-11-20）
+- 新增 `/api/geo`：按国家聚合访问来源，支持可选 `GEOIP_MMDB`（GeoLite2-City）；
+  未配置时明确返回 `configured:false`，私有/内网地址单列 `unknown`，不伪造地理数据。
+- Dashboard 新增世界地图卡片：国家热度着色、来源排行、网关节点标记、Natural Earth 底图；
+  地图每 60s 刷新，避免每次 15s 汇总轮询都扫描 IP。
+- 概览新增实时 QPS 柱状图（最近 60 分钟，直接按原始请求日志聚合），布局调整为
+  地图 + QPS/今日明细 + 24h 流量，贴近 SafeLine 的大地图 + 右侧指标卡结构。
+- 修正 light 主题：主色由棕色改为青绿色，选中菜单/按钮/图表/Segment/来源国家同步；
+  去掉主题切换时统计卡与地图国家的颜色过渡，避免出现短暂黑块。
+- GeoIP 数据库不随仓库分发（MaxMind 许可），部署文档和 Docker Compose 增加挂载说明。
