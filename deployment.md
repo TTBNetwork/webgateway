@@ -236,7 +236,9 @@ HTTP/TCP、flush 访问日志并标记 offline（HTTP/3 在途请求尚未 drain
 7. 启动 gateway（同样的 `SECRET_ENCRYPTION_KEY`），确认 `gateways.status = online` 且 10 秒内有心跳。
 8. 域名解析指向 gateway，验证 HTTPS 证书、路由、访问日志与统计入库。
 9. 打开站点缓存后验证 MISS→HIT；验证 413/431 等上限行为。
-10. 做一次 `systemctl restart webgateway-dashboard` 和 `kill -TERM` gateway，确认无异常退出。
+10. 给关键站点配置 `health_check`，故意停一个后端，确认请求只落到健康后端且
+    `webgateway_backends_unhealthy` 归零/恢复。
+11. 做一次 `systemctl restart webgateway-dashboard` 和 `kill -TERM` gateway，确认无异常退出。
 
 ## 9. 已知生产限制（上线前必须评估）
 
@@ -247,7 +249,7 @@ HTTP/TCP、flush 访问日志并标记 offline（HTTP/3 在途请求尚未 drain
 | P1 | 告警需自建 | dashboard/gateway 已导出 Prometheus 指标，但未内置 Alertmanager/追踪；需按第 11 节接入（B-25 部分修复） |
 | P1 | HTTP/3 全缓冲 | 大响应占内存、无缓存、停机不 drain（B-04/P-01） |
 | P1 | 缓存正确性 | 无 `Vary`/single-flight/HEAD/If-None-Match: *（B-09） |
-| P1 | 无上游健康检查 | priority 是静态备用组，失败不会自动摘除（P-10/U-17） |
+| P1 | 健康状态为单节点 | 站点级主动探测 + 被动失败标记已实现；无跨节点健康状态、无熔断/半开（P-10/U-17 部分修复） |
 | P1 | 无 WAF/CC 规则 | 已有每客户端 IP 令牌桶限流（429 + Retry-After）；无 WAF/CC 规则与全局配额（U-07 部分修复） |
 | P2 | 统计偏差 | `total_ips` 跨秒重复、保留期硬编码、面板按 UTC 日（B-08/B-14） |
 | P2 | 登录限流单实例 | 进程内计数，多实例不共享（B-29） |
@@ -304,6 +306,9 @@ scrape_configs:
     `webgateway_access_log_queue_available`；
   - 配置：`webgateway_config_sync_success_total`、`webgateway_config_sync_failures_total`、
     `webgateway_route_hosts`、`webgateway_certificate_hosts`；
+  - 健康检查：`webgateway_health_check_success_total`、`webgateway_health_check_failure_total`、
+    `webgateway_backends_unhealthy`；
+  - 限流：`webgateway_rate_limited_total`、`webgateway_rate_limit_tracked_ips`；
   - 构建：`webgateway_info{machine_id,node,version}`。
 - dashboard（控制面）：
   - `dashboard_up`、`dashboard_database_up`、`dashboard_uptime_seconds`；
@@ -332,6 +337,11 @@ groups:
         expr: increase(webgateway_access_log_dropped_total[5m]) > 0
       - alert: ConfigSyncFailing
         expr: increase(webgateway_config_sync_failures_total[10m]) > 0
+      - alert: BackendsUnhealthy
+        expr: webgateway_backends_unhealthy > 0
+        for: 5m
+      - alert: RateLimitingActive
+        expr: increase(webgateway_rate_limited_total[5m]) > 100
       - alert: CacheHitRatioLow
         expr: sum(rate(webgateway_cache_hits_total[10m])) / clamp_min(sum(rate(webgateway_cache_hits_total[10m])) + sum(rate(webgateway_cache_misses_total[10m])), 0.001) < 0.5
         for: 15m

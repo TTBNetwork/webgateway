@@ -1,7 +1,7 @@
 //! Routing tables, per-site proxy headers, certificate store and process state.
 
 use std::{
-    collections::HashMap,
+    collections::{HashMap, HashSet},
     io::Cursor,
     net::{IpAddr, SocketAddr},
     path::Path,
@@ -25,6 +25,7 @@ use url::Url;
 
 use crate::access::AccessEvent;
 use crate::cache::{Cache, CacheConfig};
+use crate::health::{BackendHealth, HealthCheckConfig, backend_key};
 use crate::node::NodeInfo;
 use crate::ratelimit::{RateLimitConfig, RateLimiter};
 
@@ -115,6 +116,8 @@ pub struct AppState {
     pub alt_svc: Option<HeaderValue>,
     /// Per-client-IP rate limiter (disabled by default).
     pub rate_limiter: RateLimiter,
+    /// Upstream health state shared with the probe task.
+    pub backend_health: Arc<BackendHealth>,
 }
 
 impl AppState {
@@ -158,6 +161,7 @@ impl AppState {
             websocket_tls: Arc::new(websocket_tls),
             cache: Cache::new(cache_max_size_bytes),
             rate_limiter: RateLimiter::new(rate_limit),
+            backend_health: Arc::new(BackendHealth::default()),
             logs,
             node,
             max_request_body_bytes,
@@ -455,6 +459,8 @@ pub struct Site {
     pub headers: ProxyHeaders,
     pub client_ip: ClientIpMode,
     pub cache: CacheConfig,
+    /// Upstream probing policy for this site (disabled by default).
+    pub health_check: HealthCheckConfig,
     selector: AtomicUsize,
 }
 
@@ -469,6 +475,7 @@ impl Site {
         headers: ProxyHeaders,
         client_ip: ClientIpMode,
         cache: CacheConfig,
+        health_check: HealthCheckConfig,
     ) -> Self {
         Self {
             id,
@@ -479,12 +486,19 @@ impl Site {
             headers,
             client_ip,
             cache,
+            health_check,
             selector: AtomicUsize::new(0),
         }
     }
 
-    /// Pick the next backend in round-robin order, preferring matching rules.
-    pub fn next_backend(&self, context: &MatchContext<'_>) -> Option<&Backend> {
+    /// Pick the next backend in round-robin order, preferring matching rules
+    /// and skipping backends that the health registry marked down. When every
+    /// candidate is down the full set is used as a last resort.
+    pub fn next_backend(
+        &self,
+        context: &MatchContext<'_>,
+        health: Option<&BackendHealth>,
+    ) -> Option<&Backend> {
         let matched: Vec<&Backend> = self
             .backends
             .iter()
@@ -505,6 +519,25 @@ impl Site {
         if candidates.is_empty() {
             return None;
         }
+
+        let candidates = match health {
+            Some(health) => {
+                let healthy: Vec<&Backend> = candidates
+                    .into_iter()
+                    .filter(|backend| {
+                        health.is_healthy(&backend_key(&self.id, backend.url.as_str()))
+                    })
+                    .collect();
+                if healthy.is_empty() {
+                    // Everything is down: keep serving from the full set
+                    // instead of failing every request.
+                    self.backends.iter().collect::<Vec<_>>()
+                } else {
+                    healthy
+                }
+            }
+            None => candidates,
+        };
 
         // Prefer the lowest priority group (primary); higher values are standby.
         let priority = candidates
@@ -593,6 +626,22 @@ impl Routing {
 
     pub fn host_count(&self) -> usize {
         self.exact.len() + self.wildcard.len()
+    }
+
+    /// Every distinct site, used by the health-probe scheduler.
+    pub fn sites(&self) -> Vec<Arc<Site>> {
+        let mut seen = HashSet::new();
+        let mut sites = Vec::new();
+        for site in self
+            .exact
+            .values()
+            .chain(self.wildcard.iter().map(|(_, site)| site))
+        {
+            if seen.insert(site.id.clone()) {
+                sites.push(site.clone());
+            }
+        }
+        sites
     }
 }
 
@@ -727,6 +776,7 @@ mod tests {
             ProxyHeaders::defaults(),
             ClientIpMode::Raw,
             CacheConfig::default(),
+            HealthCheckConfig::default(),
         ))
     }
 
@@ -767,9 +817,9 @@ mod tests {
             ],
         );
 
-        let api = site.next_backend(&context("/api/v1")).unwrap();
+        let api = site.next_backend(&context("/api/v1"), None).unwrap();
         assert_eq!(api.url.port(), Some(9001));
-        let web = site.next_backend(&context("/index.html")).unwrap();
+        let web = site.next_backend(&context("/index.html"), None).unwrap();
         assert_eq!(web.url.port(), Some(9002));
     }
 
@@ -829,13 +879,38 @@ mod tests {
 
         let mut counts = HashMap::new();
         for _ in 0..40 {
-            let selected = site.next_backend(&context("/")).unwrap();
+            let selected = site.next_backend(&context("/"), None).unwrap();
             *counts.entry(selected.url.port()).or_insert(0) += 1;
         }
 
         assert_eq!(counts.get(&Some(9001)), Some(&30));
         assert_eq!(counts.get(&Some(9002)), Some(&10));
         assert!(!counts.contains_key(&Some(9003)));
+    }
+
+    #[test]
+    fn skips_unhealthy_backends_and_falls_back() {
+        let site = site(
+            &["example.com"],
+            vec![
+                backend("http://127.0.0.1:9001", None),
+                backend("http://127.0.0.1:9002", None),
+            ],
+        );
+        let health = BackendHealth::default();
+        health.record_failure(&backend_key("site", "http://127.0.0.1:9001/"), 1);
+
+        let mut counts = HashMap::new();
+        for _ in 0..10 {
+            let selected = site.next_backend(&context("/"), Some(&health)).unwrap();
+            *counts.entry(selected.url.port()).or_insert(0) += 1;
+        }
+        assert!(!counts.contains_key(&Some(9001)));
+        assert_eq!(counts.get(&Some(9002)), Some(&10));
+
+        // Every backend unhealthy: fall back to the full set instead of 502.
+        health.record_failure(&backend_key("site", "http://127.0.0.1:9002/"), 1);
+        assert!(site.next_backend(&context("/"), Some(&health)).is_some());
     }
 
     #[test]
@@ -868,9 +943,9 @@ mod tests {
             ],
         );
 
-        let api = site.next_backend(&context("/api/v1")).unwrap();
+        let api = site.next_backend(&context("/api/v1"), None).unwrap();
         assert_eq!(api.url.port(), Some(9001));
-        let web = site.next_backend(&context("/web")).unwrap();
+        let web = site.next_backend(&context("/web"), None).unwrap();
         assert_eq!(web.url.port(), Some(9002));
     }
 

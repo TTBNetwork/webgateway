@@ -6,6 +6,7 @@
 mod access;
 mod cache;
 mod config;
+mod health;
 mod http3;
 mod listeners;
 mod metrics;
@@ -100,6 +101,7 @@ async fn run() -> anyhow::Result<()> {
         .bind
         .parse()
         .with_context(|| format!("invalid [server].bind address: {}", config.server.bind))?;
+    let health_task = health::spawn(state.clone());
     let metrics_task = match config.server.metrics_port {
         Some(port) => {
             let metrics_bind: IpAddr = config.server.metrics_bind.parse().with_context(|| {
@@ -194,6 +196,7 @@ async fn run() -> anyhow::Result<()> {
     for task in &http3_tasks {
         task.abort();
     }
+    health_task.abort();
     if let Some(task) = metrics_task {
         task.abort();
     }

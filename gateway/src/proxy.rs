@@ -163,7 +163,7 @@ pub async fn handle(
         method: &method_label,
         user_agent: user_agent.as_deref(),
     };
-    let Some(backend) = site.next_backend(&match_context) else {
+    let Some(backend) = site.next_backend(&match_context, Some(&state.backend_health)) else {
         log_event(
             &state,
             &request_log,
@@ -240,8 +240,12 @@ pub async fn handle(
     let upstream_response = if grpc {
         // gRPC streams can be long-lived; do not apply the HTTP timeout here.
         match state.grpc_client.request(upstream_request).await {
-            Ok(response) => response,
+            Ok(response) => {
+                crate::health::record_passive(&state, &site, backend, true);
+                response
+            }
             Err(error) => {
+                crate::health::record_passive(&state, &site, backend, false);
                 event!(Level::WARN, %error, "gRPC upstream request failed");
                 log_event(
                     &state,
@@ -261,8 +265,12 @@ pub async fn handle(
         )
         .await
         {
-            Ok(Ok(response)) => response,
+            Ok(Ok(response)) => {
+                crate::health::record_passive(&state, &site, backend, true);
+                response
+            }
             Ok(Err(error)) => {
+                crate::health::record_passive(&state, &site, backend, false);
                 event!(Level::WARN, %error, "upstream request failed");
                 log_event(
                     &state,
@@ -275,6 +283,7 @@ pub async fn handle(
                 return text_response(StatusCode::BAD_GATEWAY, "Bad Gateway", &state);
             }
             Err(_) => {
+                crate::health::record_passive(&state, &site, backend, false);
                 event!(Level::WARN, "upstream request timed out");
                 log_event(
                     &state,
@@ -452,7 +461,10 @@ pub async fn handle_buffered(
         method: method.as_str(),
         user_agent: user_agent.as_deref(),
     };
-    let Some(backend) = site.next_backend(&context).cloned() else {
+    let Some(backend) = site
+        .next_backend(&context, Some(&state.backend_health))
+        .cloned()
+    else {
         return buffered_error(
             &state,
             &request_log,
@@ -512,8 +524,12 @@ pub async fn handle_buffered(
     )
     .await
     {
-        Ok(Ok(response)) => response,
+        Ok(Ok(response)) => {
+            crate::health::record_passive(&state, &site, &backend, true);
+            response
+        }
         Ok(Err(error)) => {
+            crate::health::record_passive(&state, &site, &backend, false);
             event!(Level::WARN, %error, "buffered upstream request failed");
             return buffered_error(
                 &state,
@@ -524,6 +540,7 @@ pub async fn handle_buffered(
             );
         }
         Err(_) => {
+            crate::health::record_passive(&state, &site, &backend, false);
             event!(Level::WARN, "buffered upstream request timed out");
             return buffered_error(
                 &state,

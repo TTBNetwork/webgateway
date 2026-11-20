@@ -107,6 +107,8 @@ max_tracked_ips = 100000
   - 连接/在途：`connections_active`、`requests_in_flight`；
   - 访问日志：`access_log_dropped_total`、`access_log_failed_batches_total`、`access_log_queue_available`；
   - 配置：`config_sync_success_total`、`config_sync_failures_total`、`route_hosts`、`certificate_hosts`；
+  - 限流：`rate_limited_total`、`rate_limit_tracked_ips`；
+  - 健康检查：`health_check_success_total`、`health_check_failure_total`、`backends_unhealthy`；
   - 构建信息：`webgateway_info{machine_id,node,version}`。
 - 计数器为进程内 AtomicU64，重启归零；抓取与告警示例见 `deployment.md` 第 11 节。
 
@@ -283,6 +285,37 @@ max_tracked_ips = 100000
 - 配置同步（NOTIFY）时清空缓存。
 - 限制：不缓存 HEAD/POST、不支持 `stale-while-revalidate`、不区分 Vary 维度、无持久化/多级缓存。
 
+### 5.5 上游健康检查
+
+站点通过 `websites.config.health_check` 开启（默认关闭）：
+
+```json
+{
+  "health_check": {
+    "enabled": true,
+    "path": "/",
+    "interval_secs": 10,
+    "timeout_secs": 2,
+    "unhealthy_threshold": 2,
+    "healthy_threshold": 2
+  }
+}
+```
+
+- 主动探测：调度器每秒扫描启用健康检查的站点，按 `interval_secs` 对每个 `backend.url`
+  发 GET `<backend><path>`；状态码 < 500 视为健康，连接失败/超时/5xx 计失败。
+- 连续 `unhealthy_threshold` 次失败标记 unhealthy，连续 `healthy_threshold` 次成功恢复；
+  尚未探测过的后端默认 healthy，避免启动即黑洞。`timeout_secs` 会被夹到 `interval_secs` 内。
+- 被动标记：请求路径上的连接失败/超时也计入失败（仅对开启健康检查的站点），
+  恢复由主动探测完成。
+- 选择逻辑：先在健康后端中按原有 path/rules/weight/priority 规则选择；若全部 unhealthy，
+  回退到完整候选集（避免全站 502）；`priority` 备用组在首选组不健康时自动生效。
+- 状态保存在进程内（site id + backend URL），配置同步/删除站点后会清理；探测任务随停机 abort。
+- 指标：`webgateway_health_check_success_total`、`webgateway_health_check_failure_total`、
+  `webgateway_backends_unhealthy`。
+- 限制：单节点状态，无跨节点共享/熔断/半开状态机；探测为 HTTP GET，可能在上游留下访问记录；
+  4xx 视为健康（避免认证型 health endpoint 被误判）。
+
 ## 6. TLS
 
 - 证书来自 `certificates`（`fullchain` + `private_key` PEM），过期证书不加载。
@@ -323,7 +356,7 @@ max_tracked_ips = 100000
   - HTTP/3 流式请求/响应、0-RTT / 连接迁移调优；
   - HTTP/2 extended CONNECT / WebSocket over h2；
   - 其余特殊 RFC 按需补充。
-- 更复杂的路由（header / 正则）、失败自动切换/健康检查、上游客户端证书。
+- 更复杂的路由（header / 正则）、跨节点健康状态/熔断、上游客户端证书（mTLS）。
 
 ## 9. 运行
 

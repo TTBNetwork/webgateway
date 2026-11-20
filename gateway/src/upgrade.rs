@@ -96,7 +96,10 @@ pub async fn handle_websocket(
         method: method.as_str(),
         user_agent: user_agent.as_deref(),
     };
-    let Some(backend) = site.next_backend(&context).cloned() else {
+    let Some(backend) = site
+        .next_backend(&context, Some(&state.backend_health))
+        .cloned()
+    else {
         log_failure(&state, &request_log, StatusCode::BAD_GATEWAY, 11);
         return proxy::text_response(StatusCode::BAD_GATEWAY, "Bad Gateway", &state);
     };
@@ -122,13 +125,18 @@ pub async fn handle_websocket(
     )
     .await
     {
-        Ok(Ok(stream)) => stream,
+        Ok(Ok(stream)) => {
+            crate::health::record_passive(&state, &site, &backend, true);
+            stream
+        }
         Ok(Err(error)) => {
+            crate::health::record_passive(&state, &site, &backend, false);
             event!(Level::WARN, %error, backend = %backend.url, "failed to connect to websocket upstream");
             log_failure(&state, &request_log, StatusCode::BAD_GATEWAY, 11);
             return proxy::text_response(StatusCode::BAD_GATEWAY, "Bad Gateway", &state);
         }
         Err(_) => {
+            crate::health::record_passive(&state, &site, &backend, false);
             event!(Level::WARN, backend = %backend.url, "websocket upstream connect timed out");
             log_failure(&state, &request_log, StatusCode::GATEWAY_TIMEOUT, 15);
             return proxy::text_response(StatusCode::GATEWAY_TIMEOUT, "Gateway Timeout", &state);

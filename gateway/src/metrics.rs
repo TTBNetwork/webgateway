@@ -43,6 +43,8 @@ static REQUESTS_IN_FLIGHT: AtomicU64 = AtomicU64::new(0);
 static SYNC_SUCCESS: AtomicU64 = AtomicU64::new(0);
 static SYNC_FAILURES: AtomicU64 = AtomicU64::new(0);
 static RATE_LIMITED: AtomicU64 = AtomicU64::new(0);
+static HEALTH_CHECK_SUCCESS: AtomicU64 = AtomicU64::new(0);
+static HEALTH_CHECK_FAILURES: AtomicU64 = AtomicU64::new(0);
 
 fn bump(counter: &AtomicU64) {
     counter.fetch_add(1, Ordering::Relaxed);
@@ -74,6 +76,14 @@ pub fn record_sync_result(success: bool) {
 
 pub fn record_rate_limited() {
     bump(&RATE_LIMITED);
+}
+
+pub fn record_health_check(success: bool) {
+    if success {
+        bump(&HEALTH_CHECK_SUCCESS);
+    } else {
+        bump(&HEALTH_CHECK_FAILURES);
+    }
 }
 
 pub fn cache_hit() {
@@ -162,6 +172,9 @@ pub(crate) struct Snapshot {
     sync_failures: u64,
     rate_limited: u64,
     rate_limit_tracked: u64,
+    health_check_success: u64,
+    health_check_failures: u64,
+    backends_unhealthy: u64,
     route_hosts: u64,
     certificate_hosts: u64,
 }
@@ -274,6 +287,16 @@ pub(crate) fn format_metrics(snapshot: &Snapshot) -> String {
         "webgateway_rate_limited_total",
         snapshot.rate_limited,
     );
+    counter(
+        &mut out,
+        "webgateway_health_check_success_total",
+        snapshot.health_check_success,
+    );
+    counter(
+        &mut out,
+        "webgateway_health_check_failure_total",
+        snapshot.health_check_failures,
+    );
     gauge(&mut out, "webgateway_cache_entries", snapshot.cache_entries);
     gauge(&mut out, "webgateway_cache_bytes", snapshot.cache_bytes);
     gauge(
@@ -300,6 +323,11 @@ pub(crate) fn format_metrics(snapshot: &Snapshot) -> String {
         &mut out,
         "webgateway_rate_limit_tracked_ips",
         snapshot.rate_limit_tracked,
+    );
+    gauge(
+        &mut out,
+        "webgateway_backends_unhealthy",
+        snapshot.backends_unhealthy,
     );
     gauge(&mut out, "webgateway_route_hosts", snapshot.route_hosts);
     gauge(
@@ -340,6 +368,9 @@ fn snapshot(state: &AppState) -> Snapshot {
         sync_failures: SYNC_FAILURES.load(Ordering::Relaxed),
         rate_limited: RATE_LIMITED.load(Ordering::Relaxed),
         rate_limit_tracked: state.rate_limiter.tracked_ips() as u64,
+        health_check_success: HEALTH_CHECK_SUCCESS.load(Ordering::Relaxed),
+        health_check_failures: HEALTH_CHECK_FAILURES.load(Ordering::Relaxed),
+        backends_unhealthy: state.backend_health.unhealthy_count() as u64,
         route_hosts: state
             .routing
             .read()
@@ -432,6 +463,9 @@ mod tests {
             sync_failures: 2,
             rate_limited: 4,
             rate_limit_tracked: 8,
+            health_check_success: 11,
+            health_check_failures: 2,
+            backends_unhealthy: 1,
             route_hosts: 6,
             certificate_hosts: 4,
         }
@@ -446,6 +480,8 @@ mod tests {
         assert!(text.contains("webgateway_access_log_failed_batches_total 1\n"));
         assert!(text.contains("webgateway_rate_limited_total 4\n"));
         assert!(text.contains("webgateway_rate_limit_tracked_ips 8\n"));
+        assert!(text.contains("webgateway_health_check_success_total 11\n"));
+        assert!(text.contains("webgateway_backends_unhealthy 1\n"));
         assert!(text.contains("webgateway_route_hosts 6\n"));
         assert!(text.contains(
             "webgateway_info{machine_id=\"abc-123\",node=\"CN-Shanghai\",version=\"0.1.0\"} 1"

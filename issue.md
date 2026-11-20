@@ -71,6 +71,7 @@
 | F-55 | 密钥静态加密 | ✅ | AES-256-GCM + `enc:v1:` 前缀；`SECRET_ENCRYPTION_KEY`/`_PREVIOUS`；覆盖 TOTP/JWT/客户端 secret、证书私钥、ACME account key、DNS 凭据；启动幂等加密存量明文；gateway 读取时解密 |
 | F-56 | Prometheus 指标 | ✅ | dashboard/gateway 独立回环 `/metrics`：请求、h3/WS/CONNECT、缓存命中/eviction/占用、连接/在途、访问日志丢弃与队列、配置同步、证书/路由数、统计水位、登录/API 错误；deployment.md 含抓取与告警示例 |
 | F-57 | 每 IP 限流 | ✅ | 令牌桶（rps + burst，16 分片、全局 IP 上限、过期清理、满表 fail-open）；按站点 client_ip 解析客户端 IP；HTTP/1/2/3/WS/CONNECT 统一；429 + Retry-After + 访问日志；指标 `rate_limited_total`/`rate_limit_tracked_ips` |
+| F-58 | 上游健康检查 | ✅ | 站点级 `config.health_check`：主动 GET 探测（interval/timeout/阈值）+ 被动失败标记；选择时优先健康后端、全不健康回退完整集合、priority 备用组自动生效；指标 `health_check_*`、`backends_unhealthy` |
 
 ### 1.5 测试
 
@@ -112,7 +113,7 @@
 | P-08 | 上游 TLS | 只信 webpki + ca_file，不读系统 native roots；无 mTLS/SNI 覆盖 |
 | P-09 | 面板 | 站点/证书/用户已可写；网关只读列表+API 删除；JWT 已改为 HttpOnly Cookie；无 refresh token/每用户 API key；无服务端分页；无静态托管；无前端测试 |
 | P-13 | 证书 | 仅腾讯云 DNS-01；一张证书只能一个 DNS zone；ZeroSSL 必须配置 EAB；通配符未实测；ACME account key 可加密存储（需配置 `SECRET_ENCRYPTION_KEY`，否则明文） |
-| P-10 | 负载均衡 | priority 为静态备用组；无健康检查/失败自动切换 |
+| P-10 | 负载均衡 | priority 为静态备用组；站点级健康检查/失败摘除已实现（主动+被动）；无跨节点健康状态/熔断 |
 | P-11 | 管理面 | 无 CRUD、ACME/DNS、审计；有登录但无用户管理/RBAC 细分 |
 | P-12 | 可观测性 | dashboard/gateway 已导出 Prometheus 指标；无 tracing 导出/Alertmanager；面板仅有基础统计 |
 
@@ -140,7 +141,7 @@
 
 ### 3.3 可靠性 / 可观测性
 
-- U-17 健康检查、失败自动切换、熔断
+- U-17 健康检查/失败自动切换（站点级已实现）；熔断、跨节点健康状态未实现
 - U-19 Prometheus /metrics（dashboard/gateway 已实现）；tracing 导出与告警后端未实现
 - U-20 配置热加载（证书/CA 目前需重启或 NOTIFY）
 - U-21 统计保留期配置化（分区自动创建/删除已实现）
@@ -345,13 +346,13 @@
 
 ## 5. 当前状态
 
-- 最新分支：feat/rate-limit（叠加在 feat/observability 之后）
-- 测试：网关 45、dashboard 25、shared 18 + 3 集成（含 crypto、stats 回填/分区回收）；前端 format/lint/type-check/build 通过
+- 最新分支：feat/health-checks（叠加在 feat/rate-limit 之后）
+- 测试：网关 51、dashboard 25、shared 18 + 3 集成（含 crypto、stats 回填/分区回收）；前端 format/lint/type-check/build 通过
 - 数据库：schema v6；2026-11-20 联调/统计/证书/CRUD/可靠性/资源上限/CONNECT/会话安全验证的临时数据已清理（websites/gateways/users/logs/stats = 0；测试证书已删除）
 - 管理面：站点/网关/用户 CRUD + admin/user/view RBAC + token_version 撤销；面板站点/用户编辑页完成；
   会话改为 HttpOnly Cookie + 安全响应头，服务令牌可多值轮换，内部错误统一脱敏；
   dashboard 可直接托管面板（SIGTERM 30s drain），控制面 secret 支持 AES-256-GCM 静态加密；
-  dashboard/gateway 提供 Prometheus `/metrics`（默认回环）；gateway 支持每 IP 令牌桶限流
+  dashboard/gateway 提供 Prometheus `/metrics`（默认回环）；gateway 支持每 IP 令牌桶限流与站点级上游健康检查
 - 证书：手动上传 + ACME（Let's Encrypt 实测签发；ZeroSSL 需 EAB）→ 网关 SNI 加载验证通过，见 `certificates.md`
 - 实时协议：Nezha gRPC（h2c/TLS/双向流）与 MCSManager WS（101/鉴权/长连接）已用真实软件验证，见 `e2e-realtime.md`
 - 面板：TOTP + JWT 登录；默认缓存 16 MiB（可配）；Vite 代理 /api → 127.0.0.1:3000
@@ -363,5 +364,6 @@
    ~~B-31/P-13（密钥静态加密）~~ ✅（剩 refresh token / 每用户 API Key / 服务令牌过期 / 自动重加密）
 3. ~~B-03~~ ✅ / ~~B-05~~ ✅ / ~~B-06~~ ✅ / ~~B-11~~ ✅ / ~~B-07~~ ✅ / ~~B-12~~ ✅ / B-04：h3 限制（body 上限已完成，仍缺缓存/流式）
 4. U-11/U-13：h3 流式/Alt-Svc、h2 extended CONNECT
-5. ~~U-19 metrics~~ ✅；~~U-07 每 IP 限流~~ ✅（WAF/CC 未做）；U-17/U-23：上游健康检查、缓存持久化/single-flight
+5. ~~U-19 metrics~~ ✅；~~U-07 每 IP 限流~~ ✅（WAF/CC 未做）；~~U-17 站点级健康检查~~ ✅（熔断未做）；
+   U-23：缓存持久化/single-flight
 6. B-21：合并分支、清理 PR 栈

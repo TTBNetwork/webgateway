@@ -10,6 +10,7 @@ use tracing::{Level, event};
 use url::Url;
 
 use crate::cache::CacheConfig;
+use crate::health::HealthCheckConfig;
 use crate::state::{
     AppState, Backend, CertStore, ClientIpMode, MatchRules, ProxyHeaders, Routing, Site,
 };
@@ -50,6 +51,8 @@ struct WebsiteConfigRow {
     get_request_ip: ClientIpMode,
     #[serde(default)]
     cache: CacheConfig,
+    #[serde(default)]
+    health_check: HealthCheckConfig,
 }
 
 #[derive(Debug, serde::Deserialize, Default)]
@@ -141,6 +144,18 @@ pub async fn sync_once(
             Some(headers) => ProxyHeaders::from_config(headers.set, headers.remove),
             None => ProxyHeaders::defaults(),
         };
+        let health_check = match config.health_check.sanitized() {
+            Ok(health_check) => health_check,
+            Err(error) => {
+                event!(
+                    Level::WARN,
+                    website = %row.id,
+                    %error,
+                    "invalid health_check config; disabling health checks"
+                );
+                HealthCheckConfig::default()
+            }
+        };
 
         let mut backends = Vec::new();
         for spec in specs {
@@ -188,6 +203,7 @@ pub async fn sync_once(
             headers,
             config.get_request_ip,
             config.cache,
+            health_check,
         ));
         event!(
             Level::DEBUG,

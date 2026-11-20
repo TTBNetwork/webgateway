@@ -407,3 +407,26 @@
 - 限制：单节点计数，多节点需在边缘外做全局配额；限流配置不支持 NOTIFY 热更新。
 - 文档：`gateway.md` 2.3 与配置/环境变量、`deployment.md`、`config.example.toml`、
   `issue.md` U-07/F-57。
+
+### 上游健康检查与失败摘除（分支 `feat/health-checks`）
+- 新增 `gateway/src/health.rs`：站点级 `websites.config.health_check`
+  （enabled / path / interval_secs / timeout_secs / unhealthy_threshold / healthy_threshold，
+  默认关闭；非法 path/interval/timeout 会 WARN 并禁用该站点检查）。
+- 主动探测：调度器每秒扫描启用检查的站点，按 interval 对每个 backend 发 GET
+  `<backend><path>`；状态码 <500 视为健康，连接失败/超时/5xx 计失败。
+- 被动标记：请求路径上的连接失败/超时计入失败（仅健康检查开启的站点），恢复由主动探测完成。
+- 后端选择：优先健康后端，保持原有 path/rules/weight/priority 语义；
+  若候选全部不健康则回退完整集合，避免全站 502；priority 备用组在首选组不健康时自动生效。
+- 状态：进程内 `BackendHealth`（site id + backend URL 为 key，原子计数），配置同步/删除站点后清理；
+  探测任务随停机 abort；未探测过的后端默认 healthy。
+- 指标：`webgateway_health_check_success_total`、`webgateway_health_check_failure_total`、
+  `webgateway_backends_unhealthy`。
+- 实测（gateway 端口 18085/18086/18087，死后端 18081、活后端 18080）：
+  - 开启健康检查的站点 6 次请求 **全部 200**（死后端被摘除）；
+  - 未开启健康检查的对照站点 6 次请求 **502/200 交替**（证明死后端平时会被选中）；
+  - 日志出现 `upstream health check failed backend=http://127.0.0.1:18081/`；
+    指标 `health_check_success_total 3`、`failure_total 3`、`backends_unhealthy 2`。
+- 测试：gateway 45 → 51（+6 health 单测：阈值/恢复、失败重置、探测间隔、清理、配置校验）；
+  fmt/clippy 通过。
+- 限制：健康状态单节点、无跨节点共享/熔断/半开；探测为 GET，可能在上游产生访问记录；4xx 视为健康。
+- 文档：`gateway.md` 2.2/5.5/8、`deployment.md` 限制与告警/上线检查表、`issue.md` P-10/U-17/F-58。
