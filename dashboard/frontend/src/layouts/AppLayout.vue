@@ -79,9 +79,6 @@ const groups = computed<NavGroup[]>(() =>
     }))
     .filter((group) => group.items.length > 0),
 )
-const navigation = computed(() => groups.value.flatMap((group) => group.items))
-const current = computed(() => navigation.value.find((item) => item.path === route.path))
-const title = computed(() => (current.value ? t(current.value.key) : t('notFound.title')))
 const activeView = computed(() => views[route.path as keyof typeof views] ?? NotFoundView)
 const activeGroup = computed(
   () => groups.value.find((group) => group.items.some((item) => item.path === route.path))?.key,
@@ -230,7 +227,7 @@ async function logout(): Promise<void> {
 
         <div class="topbar-title">
           <p class="eyebrow">{{ t('app.name') }}</p>
-          <h1>{{ title }}</h1>
+          <h1>{{ activeGroup ? t(activeGroup) : t('app.name') }}</h1>
         </div>
 
         <div class="topbar-actions">
