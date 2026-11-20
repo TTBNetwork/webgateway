@@ -250,14 +250,17 @@ max_tracked_ips = 100000
 
 - 需要显式开启：`[server].http3_ports` 或 `GATEWAY_HTTP3_PORTS`（UDP）；为空不启动。
 - QUIC 使用 TLS 1.3 + ALPN `h3`，证书复用 TLS 的 SNI 存储（含默认自签证书）。
-- 请求体完整缓冲后，通过内部 HTTP/1.1 buffered client 转发上游；响应体也完整缓冲后发送。
+- 请求体完整缓冲后，通过上游 client（HTTP/1.1）转发；**响应体从上游流式转发**，
+  不再整体 collect，大文件下载的内存占用为单个 chunk。
 - 请求体超过 `max_request_body_bytes` 返回 **413**（声明 Content-Length 或流式累计均检查）；
-  响应超过 `max_response_body_bytes` 返回 502。
+  响应走流式，`max_response_body_bytes` 不再限制 h3 响应。
+- 停机：SIGTERM 时先停止接受新 QUIC 连接，在途 h3 请求与 TCP 请求共享 Inflight 计数，
+  最多等待 10s 后关闭 endpoint 并退出。
 - 启用 h3 时，TLS 的 HTTP/1.1 与 HTTP/2 响应自动带
   `Alt-Svc: h3=":<udp_port>"; ma=86400`；明文 HTTP 与 h3 自身不返回该头。
 - 访问日志记录 `HTTP/3.0`；`get_request_ip` 的 raw/XFF 模式可用，PROXY protocol 不适用。
-- 限制：仍无流式请求/响应；h3 不走缓存；WebSocket / gRPC over h3 未实现；
-  优雅停机不 drain h3 在途请求；未调 0-RTT / 连接迁移。
+- 限制：请求体仍整体缓冲；h3 不走缓存；WebSocket / gRPC over h3 未实现；
+  未调 0-RTT / 连接迁移。
 
 ### 5.4 缓存
 

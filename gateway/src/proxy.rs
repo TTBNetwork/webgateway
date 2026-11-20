@@ -403,7 +403,7 @@ pub async fn handle_buffered(
     state: Arc<AppState>,
     request: BufferedRequest,
     scheme: &'static str,
-) -> Response<Bytes> {
+) -> Response<GatewayBody> {
     let BufferedRequest {
         method,
         uri,
@@ -502,7 +502,7 @@ pub async fn handle_buffered(
         .method(method)
         .uri(upstream_uri)
         .version(Version::HTTP_11)
-        .body(Full::new(body))
+        .body(full_gateway_body(body))
     {
         Ok(request) => request,
         Err(error) => {
@@ -520,7 +520,7 @@ pub async fn handle_buffered(
 
     let upstream_response = match tokio::time::timeout(
         Duration::from_secs(60),
-        state.buffered_client.request(upstream_request),
+        state.client.request(upstream_request),
     )
     .await
     {
@@ -552,6 +552,10 @@ pub async fn handle_buffered(
         }
     };
 
+    let upstream_response = upstream_response.map(|body| {
+        body.map_err(|error| -> BoxError { Box::new(error) })
+            .boxed()
+    });
     let status = upstream_response.status();
     let mut response_headers = upstream_response.headers().clone();
     remove_hop_by_hop(&mut response_headers);
@@ -560,43 +564,28 @@ pub async fn handle_buffered(
         response_headers.insert(HeaderName::from_static("x-webgateway-node"), value);
     }
 
-    let response_limit = usize::try_from(state.max_response_body_bytes).unwrap_or(usize::MAX);
-    let response_body = match Limited::new(upstream_response.into_body(), response_limit)
-        .collect()
-        .await
-    {
-        Ok(body) => body.to_bytes(),
-        Err(error) => {
-            event!(
-                Level::WARN,
-                %error,
-                limit = state.max_response_body_bytes,
-                "buffered upstream body exceeds the limit or failed to read"
-            );
-            return buffered_error(
-                &state,
-                &request_log,
-                StatusCode::BAD_GATEWAY,
-                "Bad Gateway",
-                version,
-            );
-        }
-    };
-
     log_event(
         &state,
         &request_log,
         status,
         &response_headers,
-        Some(response_body.len() as u64),
+        Some(crate::access::content_length(&response_headers)),
         version,
     );
 
-    let mut response = Response::new(response_body);
+    // Stream the upstream body; HTTP/3 no longer buffers the full response.
+    let mut response = Response::new(upstream_response.into_body());
     *response.status_mut() = status;
     *response.version_mut() = version;
     *response.headers_mut() = response_headers;
     response
+}
+
+/// Wrap a fully buffered body in the boxed body type used by the proxy.
+fn full_gateway_body(bytes: Bytes) -> GatewayBody {
+    Full::new(bytes)
+        .map_err(|never: Infallible| -> BoxError { match never {} })
+        .boxed()
 }
 
 fn parts_host(headers: &HeaderMap, uri: &Uri) -> String {
@@ -617,7 +606,7 @@ fn buffered_error(
     status: StatusCode,
     message: &'static str,
     version: Version,
-) -> Response<Bytes> {
+) -> Response<GatewayBody> {
     log_event(
         state,
         request,
@@ -634,8 +623,8 @@ fn buffered_text_response(
     status: StatusCode,
     message: &'static str,
     version: Version,
-) -> Response<Bytes> {
-    let mut response = Response::new(Bytes::from_static(message.as_bytes()));
+) -> Response<GatewayBody> {
+    let mut response = Response::new(full_gateway_body(Bytes::from_static(message.as_bytes())));
     *response.status_mut() = status;
     *response.version_mut() = version;
     let headers = response.headers_mut();
@@ -927,7 +916,7 @@ fn buffered_rate_limit_response(
     request_log: &crate::access::RequestLog,
     client_ip: IpAddr,
     version: Version,
-) -> Option<Response<Bytes>> {
+) -> Option<Response<GatewayBody>> {
     let retry_after = rate_limit_decision(state, request_log, client_ip, version)?;
     let mut response = buffered_text_response(
         state,

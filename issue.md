@@ -72,6 +72,7 @@
 | F-56 | Prometheus 指标 | ✅ | dashboard/gateway 独立回环 `/metrics`：请求、h3/WS/CONNECT、缓存命中/eviction/占用、连接/在途、访问日志丢弃与队列、配置同步、证书/路由数、统计水位、登录/API 错误；deployment.md 含抓取与告警示例 |
 | F-57 | 每 IP 限流 | ✅ | 令牌桶（rps + burst，16 分片、全局 IP 上限、过期清理、满表 fail-open）；按站点 client_ip 解析客户端 IP；HTTP/1/2/3/WS/CONNECT 统一；429 + Retry-After + 访问日志；指标 `rate_limited_total`/`rate_limit_tracked_ips` |
 | F-58 | 上游健康检查 | ✅ | 站点级 `config.health_check`：主动 GET 探测（interval/timeout/阈值）+ 被动失败标记；选择时优先健康后端、全不健康回退完整集合、priority 备用组自动生效；指标 `health_check_*`、`backends_unhealthy` |
+| F-59 | HTTP/3 流式响应与停机 drain | ✅ | h3 响应从上游流式转发（不再受 `max_response_body_bytes` 限制）；SIGTERM 先停止接受新 QUIC 连接，在途 h3 请求与 TCP 共享 Inflight 计数（最多 10s）；请求体仍缓冲、无 h3 缓存 |
 
 ### 1.5 测试
 
@@ -103,7 +104,7 @@
 
 | ID | Feature | 限制 |
 |---|---|---|
-| P-01 | HTTP/3 | 请求/响应全缓冲，无流式；无 0-RTT/连接迁移；h3 不走缓存；WS/gRPC over h3 未实现；已有 body/response 上限；TLS h1/h2 已广播 Alt-Svc |
+| P-01 | HTTP/3 | 响应已流式、参与停机 drain；请求体仍整体缓冲；无 0-RTT/连接迁移；h3 不走缓存；WS/gRPC over h3 未实现；TLS h1/h2 已广播 Alt-Svc |
 | P-02 | gRPC | 已在 Nezha 上验证；访问日志只记 HTTP 200，无法区分 grpc-status；无 gRPC-Web |
 | P-03 | WebSocket | 升级连接字节数记 0；无 mTLS / SNI 覆盖；wss 与后端 base path 已支持（2026-11-19） |
 | P-04 | CONNECT | 仅 h1；已修复 400/403 日志与端口白名单；无鉴权 / mTLS；无 HTTP/2 extended CONNECT |
@@ -199,12 +200,15 @@
   三种场景均完成 Socket.IO 握手/鉴权/`info/overview`/ping-pong；网关 34 个单测通过。
 - 位置：gateway/src/upgrade.rs、gateway/src/state.rs
 
-#### B-04 HTTP/3 绕过缓存 + 无 body 上限（部分修复，2026-11-20）
-- 已修复：请求体声明/流式累计超过 `max_request_body_bytes` 返回 413；
-  `handle_buffered` 响应超过 `max_response_body_bytes` 返回 502；不再无界 collect。
-- 仍未做：h3 不查/写缓存；无流式请求/响应；h3 在途请求不参与优雅停机 drain。
-- 实测：HTTP/1.1 2 KB body（限制 1 KB）返回 413；1 KB 以内正常转发。
-- 位置：gateway/src/http3.rs、gateway/src/proxy.rs（handle_buffered）
+#### B-04 HTTP/3 缓冲 / 缓存 / 停机（大部分修复，2026-11-20）
+- 已修复：请求体声明/流式累计超过 `max_request_body_bytes` 返回 413。
+- 已修复（本轮）：响应改为从上游流式转发（h3 下载不再整体缓冲，`max_response_body_bytes`
+  不再限制 h3 响应）；SIGTERM 时停止接受新 QUIC 连接并等待在途 h3 请求（与 TCP 共享 Inflight，
+  上限 10s）。
+- 仍未做：h3 不查/写缓存；请求体仍整体缓冲；WS/gRPC over h3；0-RTT/连接迁移。
+- 实测：h3 请求 64 KiB 响应（网关 max_response_body=1 KiB）返回 200 且字节完整；
+  3s 慢 h3 请求在 SIGTERM 后仍返回 200，gateway exit 0 并 offline。
+- 位置：gateway/src/http3.rs、gateway/src/proxy.rs（handle_buffered）、gateway/src/main.rs
 
 #### B-05 停机丢日志 / 丢在途请求（已修复，2026-11-19）
 - 修复：SIGTERM 后停止 accept → 用 Inflight 计数等待在途 HTTP/TCP 请求（上限 10s）→
@@ -346,13 +350,14 @@
 
 ## 5. 当前状态
 
-- 最新分支：feat/health-checks（叠加在 feat/rate-limit 之后）
+- 最新分支：feat/h3-streaming（叠加在 feat/health-checks 之后）
 - 测试：网关 51、dashboard 25、shared 18 + 3 集成（含 crypto、stats 回填/分区回收）；前端 format/lint/type-check/build 通过
 - 数据库：schema v6；2026-11-20 联调/统计/证书/CRUD/可靠性/资源上限/CONNECT/会话安全验证的临时数据已清理（websites/gateways/users/logs/stats = 0；测试证书已删除）
 - 管理面：站点/网关/用户 CRUD + admin/user/view RBAC + token_version 撤销；面板站点/用户编辑页完成；
   会话改为 HttpOnly Cookie + 安全响应头，服务令牌可多值轮换，内部错误统一脱敏；
   dashboard 可直接托管面板（SIGTERM 30s drain），控制面 secret 支持 AES-256-GCM 静态加密；
-  dashboard/gateway 提供 Prometheus `/metrics`（默认回环）；gateway 支持每 IP 令牌桶限流与站点级上游健康检查
+  dashboard/gateway 提供 Prometheus `/metrics`（默认回环）；gateway 支持每 IP 令牌桶限流、站点级上游健康检查、
+  HTTP/3 流式响应与停机 drain
 - 证书：手动上传 + ACME（Let's Encrypt 实测签发；ZeroSSL 需 EAB）→ 网关 SNI 加载验证通过，见 `certificates.md`
 - 实时协议：Nezha gRPC（h2c/TLS/双向流）与 MCSManager WS（101/鉴权/长连接）已用真实软件验证，见 `e2e-realtime.md`
 - 面板：TOTP + JWT 登录；默认缓存 16 MiB（可配）；Vite 代理 /api → 127.0.0.1:3000
@@ -362,7 +367,8 @@
 1. ~~B-01 / B-02：分区续建 + 统计补算（P0）~~ ✅
 2. ~~面板 CRUD + 用户管理/RBAC/JWT 撤销（U-01/U-02）~~ ✅；~~B-15/B-16/B-27（Cookie 会话、安全头、错误脱敏）~~ ✅；
    ~~B-31/P-13（密钥静态加密）~~ ✅（剩 refresh token / 每用户 API Key / 服务令牌过期 / 自动重加密）
-3. ~~B-03~~ ✅ / ~~B-05~~ ✅ / ~~B-06~~ ✅ / ~~B-11~~ ✅ / ~~B-07~~ ✅ / ~~B-12~~ ✅ / B-04：h3 限制（body 上限已完成，仍缺缓存/流式）
+3. ~~B-03~~ ✅ / ~~B-05~~ ✅ / ~~B-06~~ ✅ / ~~B-11~~ ✅ / ~~B-07~~ ✅ / ~~B-12~~ ✅ /
+   ~~B-04 h3 流式响应 + drain~~ ✅（剩 h3 缓存、请求体流式）
 4. U-11/U-13：h3 流式/Alt-Svc、h2 extended CONNECT
 5. ~~U-19 metrics~~ ✅；~~U-07 每 IP 限流~~ ✅（WAF/CC 未做）；~~U-17 站点级健康检查~~ ✅（熔断未做）；
    U-23：缓存持久化/single-flight

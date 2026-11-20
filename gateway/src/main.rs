@@ -125,10 +125,15 @@ async fn run() -> anyhow::Result<()> {
     let (mut ports, mut watermark) = initial_sync.context("initial configuration sync failed")?;
     listeners.reconcile(&ports, state.clone());
 
-    let http3_tasks = if config.server.http3_ports.is_empty() {
-        Vec::new()
+    let mut http3 = if config.server.http3_ports.is_empty() {
+        None
     } else {
-        http3::spawn(bind, &config.server.http3_ports, state.clone())?
+        Some(http3::spawn(
+            bind,
+            &config.server.http3_ports,
+            state.clone(),
+            listeners.inflight(),
+        )?)
     };
 
     let heartbeat = spawn_heartbeat(database.clone(), node.clone());
@@ -182,10 +187,15 @@ async fn run() -> anyhow::Result<()> {
         }
     }
 
-    // Stop accepting new connections, give in-flight HTTP requests a chance to
-    // finish, then flush access logs before marking the node offline. HTTP/3
-    // accept loops are aborted (QUIC request drain is not tracked yet).
+    // Stop accepting new TCP and QUIC connections, drain in-flight HTTP/TCP and
+    // HTTP/3 requests (they share the in-flight counter), then flush logs before
+    // marking the node offline.
     notification_task.abort();
+    // Stop accepting new QUIC connections but keep existing streams alive so
+    // they can finish inside the drain window.
+    if let Some(http3) = http3.as_mut() {
+        http3.stop_accepting();
+    }
     let drained = listeners.shutdown(Duration::from_secs(10)).await;
     if !drained {
         event!(
@@ -193,8 +203,9 @@ async fn run() -> anyhow::Result<()> {
             "timed out draining in-flight connections; continuing shutdown"
         );
     }
-    for task in &http3_tasks {
-        task.abort();
+    if let Some(http3) = http3 {
+        http3.close();
+        http3.abort();
     }
     health_task.abort();
     if let Some(task) = metrics_task {

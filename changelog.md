@@ -430,3 +430,22 @@
   fmt/clippy 通过。
 - 限制：健康状态单节点、无跨节点共享/熔断/半开；探测为 GET，可能在上游产生访问记录；4xx 视为健康。
 - 文档：`gateway.md` 2.2/5.5/8、`deployment.md` 限制与告警/上线检查表、`issue.md` P-10/U-17/F-58。
+
+### HTTP/3 流式响应 + 停机 drain（分支 `feat/h3-streaming`）
+- h3 响应改为从上游**流式转发**：`handle_buffered` 返回 `Response<GatewayBody>`，
+  HTTP/3 端逐帧 `send_data`，不再整体 collect；大下载内存占用为单 chunk。
+  `max_response_body_bytes` 不再限制 h3 响应（缓存路径仍使用该上限）。
+- h3 请求路径改用 `state.client`（支持流式响应体），请求体仍完整缓冲并受
+  `max_request_body_bytes` 限制（超限 413）。
+- 停机 drain：新增 `http3::Http3` 句柄（endpoints + accept loop tasks）；SIGTERM 时先
+  `stop_accepting`（停止新 QUIC 连接，不断开在途流），h3 请求与 TCP 连接共享
+  `listeners::Inflight` 计数，`shutdown` 最多等待 10s，随后 `endpoint.close()` 并 abort accept loop。
+- 实测：
+  - h3 GET 64 KiB 响应（`GATEWAY_MAX_RESPONSE_BODY=1024`）→ **200 + 完整 65536 字节**
+    （旧实现会 502）；
+  - 3s 慢 h3 请求在 1s 后收到 SIGTERM：客户端 **200 + 7 字节**，gateway exit 0，
+    日志 `shutdown signal received`、access log flush 后 offline，端口释放。
+- 限制：h3 请求体仍整体缓冲；h3 仍不走缓存；WS/gRPC over h3、0-RTT/连接迁移未实现。
+- 测试：gateway 51（现有 h3/代理/限流/健康检查单测全部通过）、dashboard 25、shared 18 + 3；
+  fmt/clippy 通过。
+- 文档：`gateway.md` 5.3、`deployment.md` 限制表、`issue.md` P-01/B-04/F-59。

@@ -26,18 +26,19 @@ use crate::proxy;
 use crate::proxy_protocol;
 use crate::state::AppState;
 
-/// Tracks connections currently being served so shutdown can drain them.
+/// Tracks connections and requests currently being served so shutdown can
+/// drain them. HTTP/3 requests share the same counter via inflight().
 #[derive(Clone, Default)]
-struct Inflight {
+pub(crate) struct Inflight {
     count: Arc<AtomicUsize>,
 }
 
-struct InflightGuard {
+pub(crate) struct InflightGuard {
     inflight: Inflight,
 }
 
 impl Inflight {
-    fn enter(&self) -> InflightGuard {
+    pub(crate) fn enter(&self) -> InflightGuard {
         self.count.fetch_add(1, Ordering::SeqCst);
         metrics::connection_started();
         InflightGuard {
@@ -45,7 +46,7 @@ impl Inflight {
         }
     }
 
-    async fn wait_idle(&self, limit: Duration) -> bool {
+    pub(crate) async fn wait_idle(&self, limit: Duration) -> bool {
         let deadline = tokio::time::Instant::now() + limit;
         loop {
             if self.count.load(Ordering::SeqCst) == 0 {
@@ -141,6 +142,11 @@ impl Listeners {
                 event!(Level::INFO, port, "listener removed");
             }
         }
+    }
+
+    /// Clone of the in-flight counter, shared with the HTTP/3 listener.
+    pub(crate) fn inflight(&self) -> Inflight {
+        self.inflight.clone()
     }
 
     /// Stop accepting new connections, wait for in-flight requests, and report

@@ -1,4 +1,7 @@
-//! HTTP/3 (QUIC) listener. Requests are buffered before being proxied.
+//! HTTP/3 (QUIC) listener.
+//!
+//! Request bodies are still buffered up to `max_request_body_bytes`; responses
+//! are streamed from the upstream so large downloads do not consume memory.
 
 use std::{
     net::{IpAddr, SocketAddr},
@@ -8,21 +11,55 @@ use std::{
 use anyhow::Context;
 use bytes::{Buf, Bytes, BytesMut};
 use http::StatusCode;
+use http_body_util::BodyExt;
 use tokio::task::JoinHandle;
 use tracing::{Level, event};
 
 use crate::{
+    listeners::Inflight,
     proxy::{self, BufferedRequest},
     state::AppState,
     tls,
 };
 
+/// Handles for the HTTP/3 listener so shutdown can close the endpoints, drain
+/// in-flight requests and then stop the accept loops.
+pub struct Http3 {
+    tasks: Vec<JoinHandle<()>>,
+    endpoints: Vec<quinn::Endpoint>,
+}
+
+impl Http3 {
+    /// Stop accepting new QUIC connections while accepted streams keep draining.
+    pub fn stop_accepting(&mut self) {
+        for task in &self.tasks {
+            task.abort();
+        }
+    }
+
+    /// Close the endpoints after the drain window; sends CONNECTION_CLOSE.
+    pub fn close(&self) {
+        for endpoint in &self.endpoints {
+            endpoint.close(0u32.into(), b"shutdown");
+        }
+    }
+
+    /// Abort the accept loops after the drain window elapsed.
+    pub fn abort(self) {
+        for task in self.tasks {
+            task.abort();
+        }
+    }
+}
+
 pub fn spawn(
     bind: IpAddr,
     ports: &[u16],
     state: Arc<AppState>,
-) -> anyhow::Result<Vec<JoinHandle<()>>> {
+    inflight: Inflight,
+) -> anyhow::Result<Http3> {
     let mut tasks = Vec::new();
+    let mut endpoints = Vec::new();
 
     for &port in ports {
         let config = tls::quic_server_config(state.certs.clone())?;
@@ -32,21 +69,25 @@ pub fn spawn(
         event!(Level::INFO, port, "HTTP/3 listener started");
 
         let state = state.clone();
+        let inflight = inflight.clone();
+        let accept_endpoint = endpoint.clone();
         tasks.push(tokio::spawn(async move {
-            accept_loop(endpoint, state).await;
+            accept_loop(accept_endpoint, state, inflight).await;
         }));
+        endpoints.push(endpoint);
     }
 
-    Ok(tasks)
+    Ok(Http3 { tasks, endpoints })
 }
 
-async fn accept_loop(endpoint: quinn::Endpoint, state: Arc<AppState>) {
+async fn accept_loop(endpoint: quinn::Endpoint, state: Arc<AppState>, inflight: Inflight) {
     while let Some(incoming) = endpoint.accept().await {
         let state = state.clone();
+        let inflight = inflight.clone();
         tokio::spawn(async move {
             match incoming.await {
                 Ok(connection) => {
-                    if let Err(error) = serve_connection(connection, state).await {
+                    if let Err(error) = serve_connection(connection, state, inflight).await {
                         event!(Level::DEBUG, %error, "HTTP/3 connection closed");
                     }
                 }
@@ -59,6 +100,7 @@ async fn accept_loop(endpoint: quinn::Endpoint, state: Arc<AppState>) {
 async fn serve_connection(
     connection: quinn::Connection,
     state: Arc<AppState>,
+    inflight: Inflight,
 ) -> anyhow::Result<()> {
     let peer = connection.remote_address();
     let mut h3 = h3::server::Connection::new(h3_quinn::Connection::new(connection))
@@ -74,8 +116,9 @@ async fn serve_connection(
         // Each request stream is independent; serve them concurrently so one
         // slow upstream does not block the other multiplexed streams.
         let state = state.clone();
+        let inflight = inflight.clone();
         tokio::spawn(async move {
-            if let Err(error) = handle_request(resolver, state, peer).await {
+            if let Err(error) = handle_request(resolver, state, peer, inflight).await {
                 event!(Level::DEBUG, %error, "HTTP/3 request failed");
             }
         });
@@ -115,9 +158,12 @@ async fn handle_request(
     resolver: h3::server::RequestResolver<h3_quinn::Connection, Bytes>,
     state: Arc<AppState>,
     peer: SocketAddr,
+    inflight: Inflight,
 ) -> anyhow::Result<()> {
     crate::metrics::record_http3_request();
-    let _inflight = crate::metrics::InFlightGuard::new();
+    let _metrics_inflight = crate::metrics::InFlightGuard::new();
+    // Shared with the TCP listeners so SIGTERM drains HTTP/3 requests too.
+    let _drain_guard = inflight.enter();
     let (request, mut stream) = resolver
         .resolve_request()
         .await
@@ -180,27 +226,30 @@ async fn handle_request(
     };
     let response = proxy::handle_buffered(state, buffered, "https").await;
     let (response_parts, response_body) = response.into_parts();
-    let mut response = http::Response::from_parts(response_parts, ());
-
-    if !response
-        .headers()
-        .contains_key(http::header::CONTENT_LENGTH)
-        && let Ok(value) = http::HeaderValue::from_str(&response_body.len().to_string())
-    {
-        response
-            .headers_mut()
-            .insert(http::header::CONTENT_LENGTH, value);
-    }
+    let response = http::Response::from_parts(response_parts, ());
 
     stream
         .send_response(response)
         .await
         .context("failed to send the HTTP/3 response headers")?;
-    if !response_body.is_empty() {
-        stream
-            .send_data(response_body)
-            .await
-            .context("failed to send the HTTP/3 response body")?;
+
+    // Stream the upstream body instead of collecting it: HTTP/3 downloads of
+    // any size stay O(chunk) in memory.
+    let mut response_body = response_body;
+    while let Some(frame) = response_body
+        .frame()
+        .await
+        .transpose()
+        .map_err(|error| anyhow::anyhow!("HTTP/3 upstream body failed: {error}"))?
+    {
+        if let Some(data) = frame.data_ref()
+            && !data.is_empty()
+        {
+            stream
+                .send_data(data.clone())
+                .await
+                .context("failed to send the HTTP/3 response body")?;
+        }
     }
     stream
         .finish()
