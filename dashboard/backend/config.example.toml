@@ -32,3 +32,7 @@ port = 3000
 # Serve the built panel from this directory. Unknown paths fall back to
 # index.html (SPA history mode) while /api and /health keep their own routes.
 # static_dir = "dashboard/frontend/dist"
+#
+# Optional Prometheus metrics listener (plain HTTP, loopback by default).
+# metrics_port = 9103
+# metrics_bind = "127.0.0.1"

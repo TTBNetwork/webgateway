@@ -466,19 +466,23 @@ async fn login(
             Ok(response)
         }
         auth::LoginOutcome::Invalid => {
+            crate::metrics::record_auth_failure();
             tokio::time::sleep(Duration::from_millis(500)).await;
             Err((
                 StatusCode::UNAUTHORIZED,
                 Json(json!({ "error": "invalid username or code" })),
             ))
         }
-        auth::LoginOutcome::Throttled { retry_after_secs } => Err((
-            StatusCode::TOO_MANY_REQUESTS,
-            Json(json!({
-                "error": "too many login attempts",
-                "retry_after_secs": retry_after_secs,
-            })),
-        )),
+        auth::LoginOutcome::Throttled { retry_after_secs } => {
+            crate::metrics::record_auth_throttled();
+            Err((
+                StatusCode::TOO_MANY_REQUESTS,
+                Json(json!({
+                    "error": "too many login attempts",
+                    "retry_after_secs": retry_after_secs,
+                })),
+            ))
+        }
     }
 }
 
@@ -1153,6 +1157,7 @@ type ApiError = (StatusCode, Json<Value>);
 
 /// Log the full error, then return a generic response plus a correlation id.
 fn internal(error: impl std::fmt::Display) -> ApiError {
+    crate::metrics::record_api_error();
     let error_id = error_id();
     event!(
         Level::ERROR,

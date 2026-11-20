@@ -80,6 +80,14 @@ pub fn spawn(database: Database) -> (mpsc::Sender<AccessEvent>, AccessWriter) {
     (sender, AccessWriter { shutdown, handle })
 }
 
+/// Snapshot of the access-log writer counters: (dropped events, failed batches).
+pub fn counters() -> (u64, u64) {
+    (
+        DROPPED_EVENTS.load(Ordering::Relaxed),
+        FAILED_BATCHES.load(Ordering::Relaxed),
+    )
+}
+
 /// Record a dropped event (channel full). Logs a warning every 100 drops.
 pub fn record_dropped() {
     let total = DROPPED_EVENTS.fetch_add(1, Ordering::Relaxed) + 1;

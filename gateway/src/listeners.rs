@@ -21,6 +21,7 @@ use tokio::{
 };
 use tracing::{Level, event};
 
+use crate::metrics;
 use crate::proxy;
 use crate::proxy_protocol;
 use crate::state::AppState;
@@ -38,6 +39,7 @@ struct InflightGuard {
 impl Inflight {
     fn enter(&self) -> InflightGuard {
         self.count.fetch_add(1, Ordering::SeqCst);
+        metrics::connection_started();
         InflightGuard {
             inflight: self.clone(),
         }
@@ -60,6 +62,7 @@ impl Inflight {
 impl Drop for InflightGuard {
     fn drop(&mut self) {
         self.inflight.count.fetch_sub(1, Ordering::SeqCst);
+        metrics::connection_finished();
     }
 }
 

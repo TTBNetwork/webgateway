@@ -37,6 +37,10 @@ pub struct ServerConfig {
     /// Serve the built panel from this directory (SPA fallback). When unset the
     /// dashboard only exposes the API and /health.
     pub static_dir: Option<PathBuf>,
+    /// Optional Prometheus metrics listener; disabled when absent.
+    pub metrics_port: Option<u16>,
+    /// Bind address for the metrics listener (loopback by default).
+    pub metrics_bind: String,
 }
 
 impl Default for ServerConfig {
@@ -47,6 +51,8 @@ impl Default for ServerConfig {
             api_tokens: Vec::new(),
             session_ttl_secs: DEFAULT_SESSION_TTL_SECS,
             static_dir: None,
+            metrics_port: None,
+            metrics_bind: "127.0.0.1".to_string(),
         }
     }
 }
@@ -92,6 +98,16 @@ pub fn load() -> anyhow::Result<Config> {
     }
     if let Ok(dir) = std::env::var("DASHBOARD_STATIC_DIR") {
         config.server.static_dir = Some(PathBuf::from(dir));
+    }
+    if let Ok(bind) = std::env::var("DASHBOARD_METRICS_BIND") {
+        config.server.metrics_bind = bind;
+    }
+    if let Ok(raw) = std::env::var("DASHBOARD_METRICS_PORT") {
+        config.server.metrics_port = Some(
+            raw.trim()
+                .parse()
+                .context("DASHBOARD_METRICS_PORT is not a valid port")?,
+        );
     }
     if let Ok(raw) = std::env::var("DASHBOARD_TOKEN_EXPIRES") {
         config.server.session_ttl_secs = raw

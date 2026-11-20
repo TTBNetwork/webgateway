@@ -9,6 +9,8 @@ use std::{
 use bytes::Bytes;
 use http::{HeaderMap, StatusCode};
 
+use crate::metrics;
+
 #[derive(Debug, Clone, serde::Deserialize)]
 pub struct CacheConfig {
     #[serde(default)]
@@ -117,10 +119,16 @@ impl Cache {
             .is_some_and(|entry| entry.expires <= now);
         if expired {
             remove(&mut inner, key);
+            metrics::cache_expired();
+            metrics::cache_miss();
             return None;
         }
 
-        let entry = inner.entries.get(key)?;
+        let Some(entry) = inner.entries.get(key) else {
+            metrics::cache_miss();
+            return None;
+        };
+        metrics::cache_hit();
         let response = entry.response.clone();
         let age = now.saturating_duration_since(entry.stored).as_secs();
 
@@ -140,6 +148,7 @@ impl Cache {
     pub fn insert(&self, key: String, response: CachedResponse, ttl: Duration) {
         let size = response.body.len() as u64;
         if ttl.is_zero() || size > self.max_size {
+            metrics::cache_rejected();
             return;
         }
 
@@ -159,6 +168,7 @@ impl Cache {
             };
             if let Some(removed) = inner.entries.remove(&oldest) {
                 inner.size = inner.size.saturating_sub(removed.size);
+                metrics::cache_eviction();
             }
         }
 
@@ -173,6 +183,7 @@ impl Cache {
                 size,
             },
         );
+        metrics::cache_store();
     }
 
     pub fn clear(&self) {
@@ -180,7 +191,25 @@ impl Cache {
         inner.entries.clear();
         inner.order.clear();
         inner.size = 0;
+        metrics::cache_clear();
     }
+
+    /// Occupancy snapshot used by the metrics endpoint.
+    pub fn stats(&self) -> CacheStats {
+        let inner = self.inner.read().expect("cache lock poisoned");
+        CacheStats {
+            entries: inner.entries.len(),
+            bytes: inner.size,
+            max_bytes: self.max_size,
+        }
+    }
+}
+
+/// Cache occupancy reported as gauges.
+pub struct CacheStats {
+    pub entries: usize,
+    pub bytes: u64,
+    pub max_bytes: u64,
 }
 
 fn remove(inner: &mut Inner, key: &str) {

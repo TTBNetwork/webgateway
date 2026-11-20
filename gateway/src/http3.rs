@@ -116,6 +116,8 @@ async fn handle_request(
     state: Arc<AppState>,
     peer: SocketAddr,
 ) -> anyhow::Result<()> {
+    crate::metrics::record_http3_request();
+    let _inflight = crate::metrics::InFlightGuard::new();
     let (request, mut stream) = resolver
         .resolve_request()
         .await

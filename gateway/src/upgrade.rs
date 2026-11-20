@@ -47,6 +47,7 @@ pub async fn handle_websocket(
     scheme: &'static str,
     proxy_source: Option<SocketAddr>,
 ) -> Response<ProxyBody> {
+    crate::metrics::record_websocket_request();
     let raw_host = proxy::request_host(&request);
     let method = request.method().clone();
     let path = request.uri().path().to_string();
@@ -275,6 +276,7 @@ pub async fn handle_connect(
     peer: SocketAddr,
     proxy_source: Option<SocketAddr>,
 ) -> Response<ProxyBody> {
+    crate::metrics::record_connect_request();
     let authority = request
         .uri()
         .authority()

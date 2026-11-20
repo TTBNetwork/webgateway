@@ -8,6 +8,7 @@ mod cache;
 mod config;
 mod http3;
 mod listeners;
+mod metrics;
 mod node;
 mod notify;
 mod proxy;
@@ -97,15 +98,27 @@ async fn run() -> anyhow::Result<()> {
         .bind
         .parse()
         .with_context(|| format!("invalid [server].bind address: {}", config.server.bind))?;
+    let metrics_task = match config.server.metrics_port {
+        Some(port) => {
+            let metrics_bind: IpAddr = config.server.metrics_bind.parse().with_context(|| {
+                format!(
+                    "invalid [server].metrics_bind address: {}",
+                    config.server.metrics_bind
+                )
+            })?;
+            Some(metrics::spawn(metrics_bind, port, state.clone()).await?)
+        }
+        None => None,
+    };
     let mut listeners = Listeners::new(
         bind,
         config.server.max_connections,
         config.server.max_header_bytes,
     );
 
-    let (mut ports, mut watermark) = sync::sync_once(&database, &state, &config.server.ports)
-        .await
-        .context("initial configuration sync failed")?;
+    let initial_sync = sync::sync_once(&database, &state, &config.server.ports).await;
+    metrics::record_sync_result(initial_sync.is_ok());
+    let (mut ports, mut watermark) = initial_sync.context("initial configuration sync failed")?;
     listeners.reconcile(&ports, state.clone());
 
     let http3_tasks = if config.server.http3_ports.is_empty() {
@@ -150,11 +163,13 @@ async fn run() -> anyhow::Result<()> {
                 if should_sync {
                     match sync::sync_once(&database, &state, &config.server.ports).await {
                         Ok((next_ports, next_watermark)) => {
+                            metrics::record_sync_result(true);
                             ports = next_ports;
                             watermark = next_watermark;
                             listeners.reconcile(&ports, state.clone());
                         }
                         Err(error) => {
+                            metrics::record_sync_result(false);
                             event!(Level::WARN, %error, "configuration sync failed; keeping the previous configuration");
                         }
                     }
@@ -175,6 +190,9 @@ async fn run() -> anyhow::Result<()> {
         );
     }
     for task in &http3_tasks {
+        task.abort();
+    }
+    if let Some(task) = metrics_task {
         task.abort();
     }
     log_writer.shutdown().await;

@@ -35,6 +35,10 @@ ports = [80, 443]
 # Ports allowed as HTTP CONNECT tunnel targets (default [443, 80]).
 # An empty list denies all CONNECT requests.
 # connect_ports = [443, 80]
+# Optional Prometheus metrics listener (plain HTTP). It is bound to loopback by
+# default so it is never exposed on the public listener ports.
+# metrics_port = 9102
+# metrics_bind = "127.0.0.1"
 
 [upstream_tls]
 # Extra PEM CA certificates for https backends (webpki roots are always trusted).

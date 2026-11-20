@@ -68,6 +68,8 @@ connect_ports = [443, 80]
 | `GATEWAY_MAX_REQUEST_BODY` | 请求体上限 |
 | `GATEWAY_MAX_RESPONSE_BODY` | 响应缓冲上限 |
 | `GATEWAY_CONNECT_PORTS` | 逗号分隔的 CONNECT 目标端口白名单 |
+| `GATEWAY_METRICS_PORT` | Prometheus 指标监听端口（默认关闭） |
+| `GATEWAY_METRICS_BIND` | 指标监听地址（默认 `127.0.0.1`） |
 
 ### 2.1 资源限制
 
@@ -82,6 +84,21 @@ connect_ports = [443, 80]
   `min(cache.max_entry_size, max_response_body_bytes)` 时启用；chunked 响应直接流式转发、不缓存。
   HTTP/3 的响应仍完整缓冲，超过 `max_response_body_bytes` 返回 502。
 - **缓存**：HTTP/3 仍不接入缓存（请求走 `handle_buffered`）；HTTP/1/2 缓存行为不变。
+
+### 2.2 监控指标（/metrics）
+
+- 配置 `metrics_port` / `GATEWAY_METRICS_PORT` 后启用独立的 Prometheus 文本端点；
+  `metrics_bind` / `GATEWAY_METRICS_BIND` 默认 `127.0.0.1`，只在本机抓取。
+- 指标：
+  - 请求：`webgateway_requests_total`、`http3_requests_total`、`websocket_requests_total`、`connect_requests_total`；
+  - 缓存：`cache_hits_total`、`cache_misses_total`、`cache_expired_total`、`cache_stores_total`、
+    `cache_evictions_total`、`cache_rejected_total`、`cache_clears_total`、`cache_entries`、
+    `cache_bytes`、`cache_max_bytes`；
+  - 连接/在途：`connections_active`、`requests_in_flight`；
+  - 访问日志：`access_log_dropped_total`、`access_log_failed_batches_total`、`access_log_queue_available`；
+  - 配置：`config_sync_success_total`、`config_sync_failures_total`、`route_hosts`、`certificate_hosts`；
+  - 构建信息：`webgateway_info{machine_id,node,version}`。
+- 计数器为进程内 AtomicU64，重启归零；抓取与告警示例见 `deployment.md` 第 11 节。
 
 ## 3. 路由
 

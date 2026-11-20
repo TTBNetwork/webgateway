@@ -45,6 +45,8 @@ pub async fn handle(
     scheme: &'static str,
     proxy_source: Option<SocketAddr>,
 ) -> Response<ProxyBody> {
+    crate::metrics::record_request();
+    let _inflight = crate::metrics::InFlightGuard::new();
     if request.method() == http::Method::CONNECT {
         return crate::upgrade::handle_connect(state, request, peer, proxy_source).await;
     }

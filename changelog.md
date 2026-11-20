@@ -362,3 +362,26 @@
 - 测试：shared 18（+4 crypto）、dashboard 23、gateway 37；fmt/clippy 通过。
 - 文档：`deployment.md` 4.1 密钥加密与迁移顺序/轮换、gateway 环境变量、首次上线检查表；
   `issue.md` B-31/P-13、F-55；`certificates.md`、两个 `config.example.toml`。
+
+### Prometheus 指标（分支 `feat/observability`）
+- 新增 `gateway/src/metrics.rs`：独立 plain-HTTP `/metrics` 监听（`metrics_port` /
+  `GATEWAY_METRICS_PORT`，`metrics_bind` 默认 `127.0.0.1`），不占用站点端口、无需认证。
+  指标：请求/HTTP3/WS/CONNECT 计数、缓存 hit/miss/expired/store/eviction/rejected/clears 与
+  entries/bytes/max、活跃连接与在途请求、访问日志 dropped/failed/queue、配置同步成功/失败、
+  路由/证书 host 数、`webgateway_info`。
+- 新增 `dashboard/backend/src/metrics.rs`：独立 `/metrics` 监听（`DASHBOARD_METRICS_PORT`，
+  默认回环），输出 `dashboard_info`、database_up、uptime、站点/证书/网关/用户计数、
+  证书 30 天内到期数、统计水位与 lag、登录失败/限流、API 内部错误计数。
+- 计数器为进程内 AtomicU64；缓存计数在 `cache.rs` 内记录，连接数在 listener 生命周期记录，
+  同步结果在 gateway 主循环记录，dashboard 登录/错误计数在 router 记录。
+- 新增 `deployment.md` 第 11 节：抓取配置、指标清单、告警规则示例（DashboardDown/GatewayDown/
+  AccessLogDropping/ConfigSyncFailing/CacheHitRatioLow/StatsLagging/CertificateExpiring 等）。
+- 实测：
+  - dashboard `/metrics` 绑定 127.0.0.1:19100，`dashboard_database_up 1`、`dashboard_info{schema_version="6"}`；
+    错误 TOTP 后 `dashboard_auth_failures_total 1`；
+  - gateway `/metrics` 绑定 127.0.0.1:19101；同一站点请求两次 → `cache_misses_total 1`、
+    `cache_hits_total 1`、`cache_stores_total 1`、`requests_total 2`、`route_hosts 1`；
+  - 监控端口只监听回环，未出现在公网 listener。
+- 测试：gateway 39（+2）、dashboard 25（+2）；fmt/clippy 通过。
+- 文档：`deployment.md` 环境变量/限制/监控章节、`gateway.md` 2.2、两个 `config.example.toml`、
+  `issue.md` B-25/P-12/U-19、F-56。

@@ -50,6 +50,10 @@ pub struct ServerConfig {
     pub max_response_body_bytes: u64,
     /// Ports allowed as HTTP CONNECT tunnel targets.
     pub connect_ports: Vec<u16>,
+    /// Optional Prometheus metrics listener; disabled when absent.
+    pub metrics_port: Option<u16>,
+    /// Bind address for the metrics listener (loopback by default).
+    pub metrics_bind: String,
 }
 
 impl Default for ServerConfig {
@@ -64,6 +68,8 @@ impl Default for ServerConfig {
             max_request_body_bytes: 64 * 1024 * 1024,
             max_response_body_bytes: 64 * 1024 * 1024,
             connect_ports: vec![443, 80],
+            metrics_port: None,
+            metrics_bind: "127.0.0.1".to_string(),
         }
     }
 }
@@ -82,6 +88,16 @@ impl Config {
         overlay_string("GATEWAY_NODE_CITY", &mut config.node.city);
         overlay_string("GATEWAY_NODE_ADDRESS", &mut config.node.address);
         overlay_string("GATEWAY_UPSTREAM_CA_FILE", &mut config.upstream_tls.ca_file);
+        if let Ok(bind) = std::env::var("GATEWAY_METRICS_BIND") {
+            config.server.metrics_bind = bind;
+        }
+        if let Ok(raw) = std::env::var("GATEWAY_METRICS_PORT") {
+            let port: u16 = raw
+                .trim()
+                .parse()
+                .with_context(|| "GATEWAY_METRICS_PORT is not a valid port")?;
+            config.server.metrics_port = Some(port);
+        }
 
         if let Ok(bind) = std::env::var("GATEWAY_BIND") {
             config.server.bind = bind;

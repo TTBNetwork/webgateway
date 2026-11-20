@@ -69,6 +69,7 @@
 | F-53 | 面板会话与响应安全 | ✅ | HttpOnly Cookie 会话、安全响应头（CSP/HSTS/nosniff/DENY/no-store）、内部错误脱敏 + error_id、服务令牌恒时比较多值轮换 |
 | F-54 | 生产部署基础 | ✅ | dashboard 静态托管 + SPA 回退（`DASHBOARD_STATIC_DIR`）、路径穿越防护与资源缓存策略、SIGTERM/Ctrl-C 优雅停机（30s）、`deployment.md` 部署指南 |
 | F-55 | 密钥静态加密 | ✅ | AES-256-GCM + `enc:v1:` 前缀；`SECRET_ENCRYPTION_KEY`/`_PREVIOUS`；覆盖 TOTP/JWT/客户端 secret、证书私钥、ACME account key、DNS 凭据；启动幂等加密存量明文；gateway 读取时解密 |
+| F-56 | Prometheus 指标 | ✅ | dashboard/gateway 独立回环 `/metrics`：请求、h3/WS/CONNECT、缓存命中/eviction/占用、连接/在途、访问日志丢弃与队列、配置同步、证书/路由数、统计水位、登录/API 错误；deployment.md 含抓取与告警示例 |
 
 ### 1.5 测试
 
@@ -112,7 +113,7 @@
 | P-13 | 证书 | 仅腾讯云 DNS-01；一张证书只能一个 DNS zone；ZeroSSL 必须配置 EAB；通配符未实测；ACME account key 可加密存储（需配置 `SECRET_ENCRYPTION_KEY`，否则明文） |
 | P-10 | 负载均衡 | priority 为静态备用组；无健康检查/失败自动切换 |
 | P-11 | 管理面 | 无 CRUD、ACME/DNS、审计；有登录但无用户管理/RBAC 细分 |
-| P-12 | 可观测性 | 无 /metrics、无 tracing 导出；面板仅有基础统计 |
+| P-12 | 可观测性 | dashboard/gateway 已导出 Prometheus 指标；无 tracing 导出/Alertmanager；面板仅有基础统计 |
 
 ---
 
@@ -139,7 +140,7 @@
 ### 3.3 可靠性 / 可观测性
 
 - U-17 健康检查、失败自动切换、熔断
-- U-19 Prometheus /metrics、tracing 导出、告警
+- U-19 Prometheus /metrics（dashboard/gateway 已实现）；tracing 导出与告警后端未实现
 - U-20 配置热加载（证书/CA 目前需重启或 NOTIFY）
 - U-21 统计保留期配置化（分区自动创建/删除已实现）
 - U-22 访问日志落盘/导出指标（已实现重试 3 次 + 丢弃计数，未落盘/未暴露 /metrics）
@@ -331,7 +332,10 @@
 - B-22 CI 不跑 E2E：shared 集成测试在无 DATABASE_URL 时跳过；HTTP/3/WS/gRPC/CONNECT 仅本地验证。
 - B-23 无 cargo audit / 前端依赖审计。
 - B-24 PostgreSQL 18 beta + uint128 扩展的生产兼容/升级风险。
-- B-25 无 metrics/告警：日志丢弃、缓存命中、统计延迟、上游错误率均不可观测。
+- B-25 无 metrics/告警（部分修复，2026-11-20）：dashboard/gateway 已导出 Prometheus 指标
+  （缓存命中、日志丢弃、配置同步、连接、统计水位、登录失败等），并给出抓取与告警规则示例；
+  仍未内置 Alertmanager/tracing 导出，上游错误率尚无独立指标。位置：gateway/src/metrics.rs、
+  dashboard/backend/src/metrics.rs、deployment.md 第 11 节。
 - B-26 面板静态托管/SPA fallback（已修复，2026-11-20：`DASHBOARD_STATIC_DIR` 直接托管面板；nginx 仍可作为替代）。
 - B-27 无 CSP/HSTS/X-Frame-Options 等安全响应头（已修复，2026-11-20：API/health 与 dashboard 托管的面板均带安全头；外置 nginx 托管需自行配置）。
 - B-28 无 OpenAPI/接口契约测试，前端类型手工维护。
@@ -340,12 +344,13 @@
 
 ## 5. 当前状态
 
-- 最新分支：feat/production-deploy（叠加在 feat/dashboard-session-security 之后）
-- 测试：网关 37、dashboard 23、shared 18 + 3 集成（含 crypto、stats 回填/分区回收）；前端 format/lint/type-check/build 通过
+- 最新分支：feat/observability（叠加在 feat/production-deploy 之后）
+- 测试：网关 39、dashboard 25、shared 18 + 3 集成（含 crypto、stats 回填/分区回收）；前端 format/lint/type-check/build 通过
 - 数据库：schema v6；2026-11-20 联调/统计/证书/CRUD/可靠性/资源上限/CONNECT/会话安全验证的临时数据已清理（websites/gateways/users/logs/stats = 0；测试证书已删除）
 - 管理面：站点/网关/用户 CRUD + admin/user/view RBAC + token_version 撤销；面板站点/用户编辑页完成；
   会话改为 HttpOnly Cookie + 安全响应头，服务令牌可多值轮换，内部错误统一脱敏；
-  dashboard 可直接托管面板（SIGTERM 30s drain），控制面 secret 支持 AES-256-GCM 静态加密
+  dashboard 可直接托管面板（SIGTERM 30s drain），控制面 secret 支持 AES-256-GCM 静态加密；
+  dashboard/gateway 提供 Prometheus `/metrics`（默认回环）
 - 证书：手动上传 + ACME（Let's Encrypt 实测签发；ZeroSSL 需 EAB）→ 网关 SNI 加载验证通过，见 `certificates.md`
 - 实时协议：Nezha gRPC（h2c/TLS/双向流）与 MCSManager WS（101/鉴权/长连接）已用真实软件验证，见 `e2e-realtime.md`
 - 面板：TOTP + JWT 登录；默认缓存 16 MiB（可配）；Vite 代理 /api → 127.0.0.1:3000
@@ -357,5 +362,5 @@
    ~~B-31/P-13（密钥静态加密）~~ ✅（剩 refresh token / 每用户 API Key / 服务令牌过期 / 自动重加密）
 3. ~~B-03~~ ✅ / ~~B-05~~ ✅ / ~~B-06~~ ✅ / ~~B-11~~ ✅ / ~~B-07~~ ✅ / ~~B-12~~ ✅ / B-04：h3 限制（body 上限已完成，仍缺缓存/流式）
 4. U-11/U-13：h3 流式/Alt-Svc、h2 extended CONNECT
-5. U-17/U-19/U-23：健康检查、metrics、缓存持久化
+5. ~~U-19 metrics~~ ✅；U-17/U-23：上游健康检查、缓存持久化/single-flight
 6. B-21：合并分支、清理 PR 栈

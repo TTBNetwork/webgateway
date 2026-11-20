@@ -68,6 +68,8 @@ pg_dump -Fc --no-owner --dbname="$DATABASE_URL" -f webgateway-$(date -u +%Y%m%dT
 | `DATABASE_URL` | 是 | PostgreSQL 连接串 |
 | `DASHBOARD_API_PORT` | 否 | 监听端口，默认 3000 |
 | `DASHBOARD_STATIC_DIR` | 推荐 | 构建后的面板目录；设置后 dashboard 直接托管面板与 SPA 回退 |
+| `DASHBOARD_METRICS_PORT` | 推荐 | Prometheus 指标端口；不设则不启用 |
+| `DASHBOARD_METRICS_BIND` | 否 | 指标监听地址，默认 `127.0.0.1` |
 | `DASHBOARD_API_TOKENS` | 推荐 | 服务令牌，逗号分隔；轮换期间可同时配置新旧两个 |
 | `DASHBOARD_API_TOKEN` | 兼容 | 单个服务令牌（已弃用，仍会合并到列表） |
 | `DASHBOARD_TOKEN_EXPIRES` | 否 | 面板会话秒数，默认 604800，范围 300..2592000 |
@@ -212,6 +214,8 @@ HTTP/TCP、flush 访问日志并标记 offline（HTTP/3 在途请求尚未 drain
 | `GATEWAY_MAX_HEADER_BYTES` | 请求头上限，默认 32 KiB（最小 8 KiB） |
 | `GATEWAY_MAX_REQUEST_BODY` / `GATEWAY_MAX_RESPONSE_BODY` | 请求/响应体上限，默认 64 MiB |
 | `GATEWAY_UPSTREAM_CA_FILE` | 额外信任的上游 CA PEM |
+| `GATEWAY_METRICS_PORT` | Prometheus 指标端口；不设则不启用 |
+| `GATEWAY_METRICS_BIND` | 指标监听地址，默认 `127.0.0.1` |
 | `SECRET_ENCRYPTION_KEY` | 与 dashboard 相同的密钥；读取已加密的证书私钥时必须设置 |
 | `SECRET_ENCRYPTION_KEY_PREVIOUS` | 轮换期间用于解密旧密文 |
 | `RUST_LOG` | 建议 `gateway=info,shared=info` |
@@ -237,7 +241,7 @@ HTTP/TCP、flush 访问日志并标记 offline（HTTP/3 在途请求尚未 drain
 |---|---|---|
 | P0 | 分支未合并 | 25 个堆叠分支、无主线集成（B-21），发布流程需先确定基线 |
 | P1 | 密钥依赖环境变量 | 未设置 `SECRET_ENCRYPTION_KEY` 时仍明文入库；密钥丢失不可恢复；无自动重加密（B-31/P-13） |
-| P1 | 无 metrics/告警 | 只有 `/health`；缓存命中、日志丢弃、上游错误不可观测（B-25） |
+| P1 | 告警需自建 | dashboard/gateway 已导出 Prometheus 指标，但未内置 Alertmanager/追踪；需按第 11 节接入（B-25 部分修复） |
 | P1 | HTTP/3 全缓冲 | 大响应占内存、无缓存、停机不 drain（B-04/P-01） |
 | P1 | 缓存正确性 | 无 `Vary`/single-flight/HEAD/If-None-Match: *（B-09） |
 | P1 | 无上游健康检查 | priority 是静态备用组，失败不会自动摘除（P-10/U-17） |
@@ -257,3 +261,88 @@ HTTP/TCP、flush 访问日志并标记 offline（HTTP/3 在途请求尚未 drain
 - 证书续期：dashboard 调度器在到期前 30 天自动续期（`auto_renew` 行）；手写上传证书不自动续期。
 - 缓存：任意配置/证书 NOTIFY 会清空节点缓存，属预期行为。
 - 升级：先 dashboard 后 gateway；gateway 滚动重启会 drain 10s，h3 连接直接断开。
+- 指标：dashboard 与 gateway 各自在独立回环端口暴露 `/metrics`，见第 11 节。
+## 11. 监控与告警
+
+两个进程都暴露 Prometheus 文本指标。指标监听默认只绑定回环地址，不经过公网 listener：
+
+| 服务 | 环境变量 | 默认 | 说明 |
+|---|---|---|---|
+| dashboard | `DASHBOARD_METRICS_PORT` | 关闭 | 设置后启用 `/metrics` |
+| dashboard | `DASHBOARD_METRICS_BIND` | `127.0.0.1` | 指标监听地址 |
+| gateway | `GATEWAY_METRICS_PORT` | 关闭 | 设置后启用 `/metrics` |
+| gateway | `GATEWAY_METRICS_BIND` | `127.0.0.1` | 指标监听地址 |
+
+Prometheus 抓取示例（与实例同机；跨机请用 SSH 隧道或内网，不要把端口暴露到公网）：
+
+```yaml
+scrape_configs:
+  - job_name: webgateway-dashboard
+    static_configs:
+      - targets: ["127.0.0.1:9103"]
+  - job_name: webgateway-gateway
+    static_configs:
+      - targets: ["127.0.0.1:9102"]
+```
+
+主要指标：
+
+- gateway（数据面）：
+  - 请求：`webgateway_requests_total`、`webgateway_http3_requests_total`、
+    `webgateway_websocket_requests_total`、`webgateway_connect_requests_total`；
+  - 缓存：`webgateway_cache_hits_total`、`webgateway_cache_misses_total`、`webgateway_cache_expired_total`、
+    `webgateway_cache_stores_total`、`webgateway_cache_evictions_total`、`webgateway_cache_rejected_total`、
+    `webgateway_cache_clears_total`、`webgateway_cache_entries`、`webgateway_cache_bytes`、
+    `webgateway_cache_max_bytes`；
+  - 连接：`webgateway_connections_active`、`webgateway_requests_in_flight`；
+  - 日志：`webgateway_access_log_dropped_total`、`webgateway_access_log_failed_batches_total`、
+    `webgateway_access_log_queue_available`；
+  - 配置：`webgateway_config_sync_success_total`、`webgateway_config_sync_failures_total`、
+    `webgateway_route_hosts`、`webgateway_certificate_hosts`；
+  - 构建：`webgateway_info{machine_id,node,version}`。
+- dashboard（控制面）：
+  - `dashboard_up`、`dashboard_database_up`、`dashboard_uptime_seconds`；
+  - `dashboard_websites_total`、`dashboard_certificates_total`、`dashboard_certificates_expiring_total`、
+    `dashboard_gateways_online`、`dashboard_gateways_total`、`dashboard_users_total`；
+  - `dashboard_stats_ready`、`dashboard_stats_lag_seconds`；
+  - `dashboard_auth_failures_total`、`dashboard_auth_throttled_total`、`dashboard_api_errors_total`；
+  - `dashboard_info{schema_version}`。
+
+告警规则示例（阈值按业务调整）：
+
+```yaml
+groups:
+  - name: webgateway
+    rules:
+      - alert: DashboardDown
+        expr: up{job="webgateway-dashboard"} == 0
+        for: 2m
+      - alert: GatewayDown
+        expr: up{job="webgateway-gateway"} == 0
+        for: 1m
+      - alert: DashboardDatabaseDown
+        expr: dashboard_database_up == 0
+        for: 2m
+      - alert: AccessLogDropping
+        expr: increase(webgateway_access_log_dropped_total[5m]) > 0
+      - alert: ConfigSyncFailing
+        expr: increase(webgateway_config_sync_failures_total[10m]) > 0
+      - alert: CacheHitRatioLow
+        expr: sum(rate(webgateway_cache_hits_total[10m])) / clamp_min(sum(rate(webgateway_cache_hits_total[10m])) + sum(rate(webgateway_cache_misses_total[10m])), 0.001) < 0.5
+        for: 15m
+      - alert: StatsLagging
+        expr: dashboard_stats_lag_seconds > 300
+        for: 5m
+      - alert: CertificateExpiring
+        expr: dashboard_certificates_expiring_total > 0
+        for: 1h
+      - alert: LoginFailures
+        expr: increase(dashboard_auth_failures_total[10m]) > 20
+```
+
+注意：
+
+- 指标端点没有认证，务必只绑定回环/内网；需要远程抓取时用代理或 SSH 隧道。
+- 计数器是进程内计数，重启归零；告警请用 `rate`/`increase`，不要依赖绝对值。
+- Alertmanager、日志聚合与 tracing 导出不在本仓库范围内。
+

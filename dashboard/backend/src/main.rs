@@ -7,6 +7,7 @@
 mod auth;
 mod certificate;
 mod config;
+mod metrics;
 mod router;
 mod secrets;
 mod websites;
@@ -19,6 +20,7 @@ use tracing::{Level, event};
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
     shared::logger::init("dashboard=info,shared=info");
+    metrics::mark_start();
     // Must run before any secret is read or written.
     shared::crypto::init_from_env()?;
 
@@ -44,6 +46,15 @@ async fn main() -> anyhow::Result<()> {
         "dashboard listening"
     );
 
+    let metrics_task = match config.server.metrics_port {
+        Some(port) => {
+            let bind: std::net::IpAddr = config.server.metrics_bind.parse().map_err(|error| {
+                anyhow::anyhow!("invalid [server].metrics_bind address: {error}")
+            })?;
+            Some(metrics::spawn(bind, port, database.clone()).await?)
+        }
+        None => None,
+    };
     let app = router::router(
         database,
         config.server.service_tokens(),
@@ -70,6 +81,9 @@ async fn main() -> anyhow::Result<()> {
         }
     }
 
+    if let Some(task) = metrics_task {
+        task.abort();
+    }
     stats_task.abort();
     certificate_task.abort();
     event!(Level::INFO, "dashboard stopped");
