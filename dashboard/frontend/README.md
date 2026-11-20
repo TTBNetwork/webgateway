@@ -27,9 +27,11 @@ pnpm dev
 
 Open http://localhost:5173 and sign in as `admin` with a TOTP code. The master
 logs the default admin secret on first start; `DASHBOARD_ADMIN_TOTP_SECRET`
-(base32) pins it for development. `DASHBOARD_API_TOKEN` remains available as a
-service token for API clients. Vite proxies `/api` and `/health` to
-`http://127.0.0.1:3000`.
+(base32) pins it for development. Vite proxies `/api` and `/health` to
+`http://127.0.0.1:3000`, which keeps the panel and the API on one origin so the
+session cookie works. Service tokens for API clients are configured with
+`DASHBOARD_API_TOKENS` (comma-separated; `DASHBOARD_API_TOKEN` is the legacy
+single-token form).
 
 ## Build
 
@@ -45,11 +47,30 @@ does not add runtime dependencies beyond Vue.
 For production static hosting, configure the web server to fall back to
 `index.html` for unknown paths (SPA history mode).
 
+## Security notes
+
+- `POST /api/auth/login` sets the session JWT in the `wg_session` cookie
+  (HttpOnly, SameSite=Strict, `Max-Age` = session TTL). The JSON body only
+  returns the user, so scripts can never read the token. The panel restores the
+  session with `GET /api/auth/me` on boot, which requires the panel and the API
+  to share an origin.
+- Logout and admin revocation bump `users.token_version`, which invalidates
+  every session of that user immediately.
+- Every API response carries a deny-all CSP, `X-Content-Type-Options: nosniff`,
+  `X-Frame-Options: DENY`, `Referrer-Policy: no-referrer` and
+  `Cache-Control: no-store`. A TLS-terminating proxy should send
+  `X-Forwarded-Proto: https` so the dashboard also marks the cookie `Secure`
+  and emits `Strict-Transport-Security`.
+- Internal failures are logged with an `error_id`; clients receive
+  `{"error":"internal server error","error_id":"..."}` and `GET /health` does
+  not expose database error details.
+
 ## API
 
-The master exposes read-only endpoints protected by a JWT from
-`POST /api/auth/login` (username + TOTP). A service token can be supplied via
-`DASHBOARD_API_TOKEN`:
+The master exposes read-only endpoints protected by the session cookie from
+`POST /api/auth/login` (username + TOTP) or, for machine clients, by a service
+token sent as `Authorization: Bearer <token>` (configure `DASHBOARD_API_TOKENS`,
+several entries are accepted during rotation):
 
 - `GET /health`
 - `GET /api/summary`

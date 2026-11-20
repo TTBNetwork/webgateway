@@ -1,8 +1,8 @@
 # WebGateway v2 — Features & Issue Tracker
 
-> 生成时间：2026-11-19  
-> 截至提交：78f8222（feat/dashboard-panel；issue.md 本身未计入）  
-> 验证环境：beta PostgreSQL（schema v3）、本地 E2E、GitHub Actions  
+> 生成时间：2026-11-19；更新：2026-11-20  
+> 截至提交：feat/connect-alt-svc f6fe9a4 + 面板会话安全改造（feat/dashboard-session-security）  
+> 验证环境：beta PostgreSQL（schema v6）、本地 E2E、GitHub Actions  
 > 图例：✅ 已完成并验证；⚠️ 可用但有明确限制；❌ 未实现
 
 ---
@@ -61,11 +61,12 @@
 | ID | Feature | 状态 | 说明 |
 |---|---|---|---|
 | F-33 | 面板 API | ✅ | 读接口 + 证书/站点/网关/用户写接口；错误/校验统一 JSON |
-| F-34 | API 鉴权 | ✅ | TOTP + 每用户 JWT；admin/user/view RBAC；token_version 撤销（logout/revoke/角色变更/重置 TOTP）；服务令牌视为 admin；无 refresh token / 每用户 API key |
+| F-34 | API 鉴权 | ✅ | TOTP + 每用户 JWT（`wg_session` HttpOnly/SameSite=Strict Cookie，响应不返回 token）；admin/user/view RBAC；token_version 撤销（logout/revoke/角色变更/重置 TOTP）；服务令牌恒时比较、多值轮换、视为 admin；无 refresh token / 每用户 API key |
 | F-35 | Vue 3 面板 | ✅ | 登录、概览、站点 CRUD、证书 CRUD、网关、日志、用户管理、设置 |
 | F-36 | 视觉 / 交互 | ✅ | 深/浅色、中/英、响应式侧栏、统计卡片、SVG 流量图 |
 | F-37 | 前端工程 | ✅ | 自写 history router + 原生 fetch；无新增依赖；package/lock 未改 |
 | F-38 | 面板验证 | ✅ | Vite 代理 401/200 + 真实数据；format/lint/build 通过 |
+| F-53 | 面板会话与响应安全 | ✅ | HttpOnly Cookie 会话、安全响应头（CSP/HSTS/nosniff/DENY/no-store）、内部错误脱敏 + error_id、服务令牌恒时比较多值轮换 |
 
 ### 1.5 测试
 
@@ -105,7 +106,7 @@
 | P-06 | 访问日志 | body_length 取 Content-Length；chunked 请求 0、响应 NULL；WS/CONNECT 0；headers 重复键被覆盖；已修复 writer 退出 flush |
 | P-07 | 统计 | total_ips 跨秒重复；sizes 依赖日志 Content-Length；保留期（7 天）仍硬编码；整周过期分区已 DROP，边界分区仍逐行 DELETE |
 | P-08 | 上游 TLS | 只信 webpki + ca_file，不读系统 native roots；无 mTLS/SNI 覆盖 |
-| P-09 | 面板 | 站点/证书/用户已可写；网关只读列表+API 删除；JWT 存 localStorage；无 refresh token/每用户 API key；无服务端分页；无静态托管；无前端测试 |
+| P-09 | 面板 | 站点/证书/用户已可写；网关只读列表+API 删除；JWT 已改为 HttpOnly Cookie；无 refresh token/每用户 API key；无服务端分页；无静态托管；无前端测试 |
 | P-13 | 证书 | 仅腾讯云 DNS-01；一张证书只能一个 DNS zone；ZeroSSL 必须配置 EAB；通配符未实测；ACME account key 明文入库 |
 | P-10 | 负载均衡 | priority 为静态备用组；无健康检查/失败自动切换 |
 | P-11 | 管理面 | 无 CRUD、ACME/DNS、审计；有登录但无用户管理/RBAC 细分 |
@@ -124,7 +125,7 @@
 - U-07 限流、WAF、CC 防护
 - U-08 请求体/头大小限制、连接数限制
 - U-09 上游 mTLS、客户端证书
-- U-10 面板安全头（CSP/HSTS/X-Frame-Options）
+- U-10 面板安全头（API/health 已实现；面板静态 HTML 仍由托管层配置）
 
 ### 3.2 协议
 
@@ -269,10 +270,16 @@
 - summary 的 date_trunc('day', now()) 是数据库 UTC 日；+08 用户看到的“今日”从本地 08:00 开始。
 - 建议：按用户时区或站点时区聚合；至少文档说明。
 
-#### B-15 面板认证安全
-- JWT 存 localStorage，存在 XSS 读取风险；无 CSP。
-- 静态服务令牌仍可用于 API；服务令牌比较为非恒定时间。
-- 建议：HttpOnly Cookie 或短时 token、加 CSP、恒定时间比较。
+#### B-15 面板认证安全（大部分修复，2026-11-20）
+- 已修复：JWT 改为 `wg_session` HttpOnly + SameSite=Strict Cookie，不再进入 localStorage，
+  登录 JSON 不再返回 token；面板启动用 `GET /api/auth/me` 恢复会话。
+- 已修复：服务令牌使用恒定时间比较，支持 `[server].api_tokens` / `DASHBOARD_API_TOKENS`
+  多令牌轮换（与旧 `api_token` 合并）。
+- 已修复：/api 与 /health 响应带 CSP、nosniff、X-Frame-Options、Referrer-Policy、no-store；
+  `X-Forwarded-Proto: https` 时追加 HSTS 与 Cookie `Secure`。
+- 仍未做：服务令牌无过期/自动轮换；refresh token / 每用户 API Key；CSRF 仅依赖
+  SameSite=Strict（未做 Origin 校验）；面板静态 HTML 的安全头由托管层配置。
+- 位置：dashboard/backend/src/router.rs、config.rs；dashboard/frontend/src/session.ts、App.vue
 
 #### B-29 TOTP 无重放保护/速率限制（已修复，2026-11-19）
 - 修复：users.last_totp_step（迁移 0006）；登录用条件 UPDATE 保证同一 step 只接受一次，重放返回 401。
@@ -283,16 +290,18 @@
 #### B-30 JWT 无撤销、RBAC 不细化（已修复，2026-11-19）
 - 修复：users.token_version（迁移 0005）+ JWT claims 版本校验；logout/管理员 revoke/角色变更/重置 TOTP 都会 bump 版本，旧 JWT 立即 401。
 - RBAC：admin（全部）、user（证书写）、view（只读）；路由分组 + 中间件强制。
-- 仍需：服务令牌（DASHBOARD_API_TOKEN）过期/轮换；refresh token / 每用户 API Key。
+- 仍需：服务令牌过期/自动轮换（多令牌手工轮换已支持）；refresh token / 每用户 API Key。
 
 #### B-31 认证密钥暴露面
 - 默认管理员 TOTP secret 只在首次创建时打印 WARN 日志；日志集中后可能泄露。
 - users.totp_secret / jwt_secret 明文存库（沿用 v1）；JWT secret 未轮换。
 - 建议：一次性初始化流程/加密存储/密钥轮换。
 
-#### B-16 面板 API 错误泄露
-- internal() 把数据库 error.to_string() 返回给客户端。
-- 建议：对外返回通用错误，详细错误只记日志。
+#### B-16 面板 API 错误泄露（已修复，2026-11-20）
+- 修复：internal() 记录完整错误 + 随机 error_id，客户端只收到
+  `{"error":"internal server error","error_id":"..."}`；/health 数据库故障不再返回驱动错误。
+- sqlx 错误链（anyhow chain 中的 sqlx::Error）一律 500 脱敏；用户/证书的校验错误保留原文。
+- 实测：无效角色、重复用户名均为 400 原文；单测覆盖 internal()/auth_error() 脱敏。
 - 位置：dashboard/backend/src/router.rs
 
 #### B-17 面板无服务端分页/排序
@@ -319,17 +328,18 @@
 - B-24 PostgreSQL 18 beta + uint128 扩展的生产兼容/升级风险。
 - B-25 无 metrics/告警：日志丢弃、缓存命中、统计延迟、上游错误率均不可观测。
 - B-26 面板无静态托管/SPA fallback 配置；生产需 nginx 配置。
-- B-27 无 CSP/HSTS/X-Frame-Options 等安全响应头。
+- B-27 无 CSP/HSTS/X-Frame-Options 等安全响应头（API/health 已加，面板静态 HTML 仍由托管层负责）。
 - B-28 无 OpenAPI/接口契约测试，前端类型手工维护。
 
 ---
 
 ## 5. 当前状态
 
-- 最新分支：feat/connect-alt-svc（叠加在 feat/limits-hardening 之后）
-- 测试：网关 37、dashboard 10、shared 14 + 3 集成（含 stats 回填/分区回收）；前端 format/lint/type-check/build 通过
-- 数据库：schema v6；2026-11-20 联调/统计/证书/CRUD/可靠性/资源上限/CONNECT 验证的临时数据已清理（websites/gateways/users/logs/stats = 0；测试证书已删除）
-- 管理面：站点/网关/用户 CRUD + admin/user/view RBAC + token_version 撤销；面板站点/用户编辑页完成
+- 最新分支：feat/dashboard-session-security（叠加在 feat/connect-alt-svc 之后）
+- 测试：网关 37、dashboard 20、shared 14 + 3 集成（含 stats 回填/分区回收）；前端 format/lint/type-check/build 通过
+- 数据库：schema v6；2026-11-20 联调/统计/证书/CRUD/可靠性/资源上限/CONNECT/会话安全验证的临时数据已清理（websites/gateways/users/logs/stats = 0；测试证书已删除）
+- 管理面：站点/网关/用户 CRUD + admin/user/view RBAC + token_version 撤销；面板站点/用户编辑页完成；
+  会话改为 HttpOnly Cookie + 安全响应头，服务令牌可多值轮换，内部错误统一脱敏
 - 证书：手动上传 + ACME（Let's Encrypt 实测签发；ZeroSSL 需 EAB）→ 网关 SNI 加载验证通过，见 `certificates.md`
 - 实时协议：Nezha gRPC（h2c/TLS/双向流）与 MCSManager WS（101/鉴权/长连接）已用真实软件验证，见 `e2e-realtime.md`
 - 面板：TOTP + JWT 登录；默认缓存 16 MiB（可配）；Vite 代理 /api → 127.0.0.1:3000
@@ -337,7 +347,8 @@
 ## 6. 建议优先级
 
 1. ~~B-01 / B-02：分区续建 + 统计补算（P0）~~ ✅
-2. ~~面板 CRUD + 用户管理/RBAC/JWT 撤销（U-01/U-02）~~ ✅（剩 refresh token/API key/服务令牌轮换）
+2. ~~面板 CRUD + 用户管理/RBAC/JWT 撤销（U-01/U-02）~~ ✅；~~B-15/B-16/B-27（Cookie 会话、安全头、错误脱敏）~~ ✅
+   （剩 refresh token / 每用户 API Key / 服务令牌过期）
 3. ~~B-03~~ ✅ / ~~B-05~~ ✅ / ~~B-06~~ ✅ / ~~B-11~~ ✅ / ~~B-07~~ ✅ / ~~B-12~~ ✅ / B-04：h3 限制（body 上限已完成，仍缺缓存/流式）
 4. U-11/U-13：h3 流式/Alt-Svc、h2 extended CONNECT
 5. U-17/U-19/U-23：健康检查、metrics、缓存持久化

@@ -33,8 +33,9 @@ value = { "key_pem": "-----BEGIN PRIVATE KEY-----..." }
 
 ## 2. API
 
-所有接口需要 JWT 或 `DASHBOARD_API_TOKEN` 服务令牌。证书写接口要求 `user` 或 `admin`；
-站点/用户/DNS provider 写接口要求 `admin`；`view` 只读。
+所有接口需要面板会话 JWT（登录后由 `wg_session` HttpOnly Cookie 自动携带）或服务令牌
+（`DASHBOARD_API_TOKEN` / `DASHBOARD_API_TOKENS`，`Authorization: Bearer <token>`）。
+证书写接口要求 `user` 或 `admin`；站点/用户/DNS provider 写接口要求 `admin`；`view` 只读。
 
 ### 2.1 手动上传
 

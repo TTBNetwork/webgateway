@@ -289,3 +289,35 @@
   - Alt-Svc 单测覆盖值格式；TLS 场景未单独 E2E。
 - 测试：gateway 37、dashboard 10、shared 14 + 3 集成；clippy/fmt 通过。
 - 文档：`gateway.md` 2.1/5.2/5.3、`gateway/config.example.toml`、`issue.md` B-07/B-12、F-51/F-52。
+
+### 面板会话安全 + 安全响应头 + API 错误脱敏（分支 `feat/dashboard-session-security`）
+- 会话改为 HttpOnly Cookie：`POST /api/auth/login` 不再在 JSON 返回 JWT，而是设置
+  `wg_session`（HttpOnly、SameSite=Strict、Path=/、Max-Age=会话 TTL）；JWT 不再进入
+  localStorage，XSS 无法读取。面板启动时调用 `GET /api/auth/me` 恢复会话。
+- `DASHBOARD_TOKEN_EXPIRES`（默认 7 天）改为配置项 `session_ttl_secs`，clamp 到
+  300..2592000 秒；签发时同时写入 JWT `exp` 与 Cookie `Max-Age`。
+- 服务令牌支持轮换：`[server].api_tokens` / `DASHBOARD_API_TOKENS`（逗号分隔）可与旧
+  `api_token` / `DASHBOARD_API_TOKEN` 并存；逐个恒定时间比较（不提前返回），便于新旧令牌重叠过渡。
+- 安全响应头（所有 /health 与 /api 响应）：CSP
+  `default-src 'none'; frame-ancestors 'none'; base-uri 'none'; form-action 'none'`、
+  `X-Content-Type-Options: nosniff`、`X-Frame-Options: DENY`、`Referrer-Policy: no-referrer`、
+  `Cache-Control: no-store`、`Permissions-Policy`；`X-Forwarded-Proto: https` 时追加 HSTS 与 Cookie `Secure`。
+- 认证失败：带无效/过期/已撤销 Cookie 的 401 同时下发清除 Cookie（Max-Age=0），浏览器不再反复重放失效会话。
+- API 错误脱敏：`internal()` 记录完整错误 + `error_id`，客户端只收到
+  `{"error":"internal server error","error_id":...}`；`/health` 数据库故障不再返回驱动错误；
+  用户/证书接口的校验错误保留原文，数据库错误按 500 脱敏（检测 anyhow 链中的 `sqlx::Error`）。
+- 前端：移除 localStorage token 与 Authorization 头，改用同源 Cookie；新增启动引导
+  （`session.ready`）避免登录页闪烁；设置页文案更新为 HttpOnly 会话。
+- 实测（beta DB，端口 13000）：
+  - 登录 200 返回 `user` + `expires_in`，`Set-Cookie` 含 HttpOnly/SameSite=Strict/Max-Age=600，HTTP 下无 Secure；
+  - 带 Cookie `GET /api/auth/me` 200；无凭证 401；
+  - `X-Forwarded-Proto: https` 时 Cookie 带 Secure 且响应带 HSTS；
+  - 两个服务令牌均 200，错误令牌 401；重启后只保留新令牌 → 旧令牌 401、新令牌 200（轮换）；
+  - 退出后旧 Cookie 401 且响应清除 Cookie（token_version 提升，该用户所有会话失效）；
+  - 校验错误仍返回 400 原文（无效角色、重复用户名）。
+- 测试：dashboard 20（新增 router 8 + config 2）、gateway 37、shared 14 + 3 集成；
+  fmt/clippy 通过；前端 format/lint/type-check/build 通过。
+- 限制：Cookie 认证要求面板与 API 同源（需反向代理）；未实现 refresh token / 每用户 API Key /
+  服务令牌过期；面板静态 HTML 的安全头由托管层负责；CSRF 依赖 SameSite=Strict，未额外做 Origin 校验。
+- 文档：`issue.md` B-15/B-16/B-27/B-30、F-53、P-09；`dashboard/frontend/README.md`；
+  `dashboard/backend/config.example.toml`；`certificates.md` API 认证说明。
