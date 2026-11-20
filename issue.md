@@ -79,6 +79,9 @@
 | F-63 | 面板 UX 批量改造 | ✅ | 登录 TOTP 提示改为 ? 悬浮、顶部居中 Toast、分组导航 + DNS 服务商页、结构化站点表单、访问日志详情弹窗、全页面自动刷新、自定义下拉 |
 | F-64 | 证书申请代理 | ✅ | 设置页保存加密的 ACME HTTP(S) 代理；ACME 客户端经代理，DNS API 直连 |
 | F-65 | 网关默认端口 | ✅ | 默认监听 80/443；systemd 使用 CAP_NET_BIND_SERVICE，Docker 用非 root 端口 sysctl |
+| F-66 | 面板证书凭据/多 zone | ✅ | DNS 凭据只从面板 provider 读取（禁用 from_env）；provider 可配置多个 zone，同一证书可覆盖多个 zone/通配符 |
+| F-67 | HTTPS 上游自签名 | ✅ | `GATEWAY_UPSTREAM_INSECURE=true` 可跳过上游校验（优先 CA 文件）；目标机 Proxmox 8006 已验证 200 |
+| F-68 | 访问日志完整性 | ✅ | path 含 query；流式/chunked 响应按实际字节在 body 结束时记录（不再 NULL）；writer 关闭 drain 后 flush |
 
 ### 1.5 测试
 
@@ -373,7 +376,7 @@
 
 - 主线：master（de1da22，已快进合并全部 31 个 feature 分支）；旧原型：v1（7ee8c9a）；
   远端只保留 master 与 v1，feature 分支已删除（2026-11-20）。
-- 测试：网关 53、dashboard 26、shared 19 + 3 集成（含 crypto、stats 回填/分区回收）；前端 format/lint/type-check/build 通过
+- 测试：网关 53、dashboard 27、shared 19 + 3 集成（含 crypto、stats 回填/分区回收）；前端 format/lint/type-check/build 通过
 - 数据库：schema v6；2026-11-20 全部联调/统计/证书/CRUD/可靠性/资源上限/CONNECT/会话安全/健康检查/h3/缓存/统计验证的
   临时数据已清理（users/websites/certificates/gateways/logs/stats = 0）
 - 管理面：站点/网关/用户 CRUD + admin/user/view RBAC + token_version 撤销；面板站点/用户编辑页完成；
@@ -382,9 +385,10 @@
   dashboard/gateway 提供 Prometheus `/metrics`（默认回环）
 - 运维：`webgateway-mnt` 本地 Unix socket 获取管理员 TOTP（默认验证码，`--secret` 输出 secret+URI）；
   仓库提供 Dockerfile / docker-compose.yml / docker.env.example
-- 面板：登录 TOTP 提示（? 悬浮）+ 顶部 Toast；分组导航；DNS 服务商页；站点结构化表单（cache/health/backends）；
+- 面板：登录 TOTP 提示（? 悬浮）+ 顶部 Toast；v1 风格可折叠左侧菜单；DNS 服务商页；站点结构化表单（cache/health/backends）；
   访问日志详情弹窗；所有列表自动刷新；自定义 Select；设置页可配 ACME 代理。
 - 网关数据面：默认监听 80/443；每 IP 令牌桶限流、站点级上游健康检查/失败摘除、HTTP/3 流式响应与停机 drain、
+  自签名 HTTPS 上游可配置跳过校验；访问日志记录 query 与实际流式响应字节；
   缓存 Vary/HEAD/304、资源上限（连接/header/body）、CONNECT 白名单与 Alt-Svc
 - 证书：手动上传 + ACME（Let's Encrypt 实测签发；ZeroSSL 需 EAB）→ 网关 SNI 加载验证通过，见 `certificates.md`
 - 实时协议：Nezha gRPC（h2c/TLS/双向流）与 MCSManager WS（101/鉴权/长连接）已用真实软件验证，见 `e2e-realtime.md`
@@ -427,7 +431,7 @@
 
 - 仓库主线：master（de1da22）+ v1（7ee8c9a），31 个 feature 分支已合并删除；默认分支 master。
 - 四个历史 head CI 均绿：a5aee76 / 30ac6b0 / 88b0191 / b22c12b。
-- 最终全量：gateway 53、dashboard 26、shared 19 + 3 集成；前端 format/lint/type-check/build 通过。
+- 最终全量：gateway 53、dashboard 27、shared 19 + 3 集成；前端 format/lint/type-check/build 通过。
 - 叠加 smoke 通过（加密证书 + h3 + 缓存 + 健康检查 + 面板托管 + 指标 + 双端 SIGTERM）。
 
 **结论**：代码层面已具备生产部署条件（单 dashboard 实例、TLS 反向代理、所有节点同一 `SECRET_ENCRYPTION_KEY`、

@@ -59,6 +59,8 @@ max_tracked_ips = 100000
 [upstream_tls]
 # 额外的 PEM CA，用于 https 后端；webpki 根证书始终受信
 # ca_file = "/etc/webgateway/upstream-ca.pem"
+# 实验环境可跳过上游证书校验（不推荐生产）
+# insecure = false
 ````
 
 | 环境变量 | 覆盖项 |
@@ -69,6 +71,7 @@ max_tracked_ips = 100000
 | `GATEWAY_PORTS` | 逗号分隔的 TCP 监听端口 |
 | `GATEWAY_HTTP3_PORTS` | 逗号分隔的 UDP 端口（HTTP/3） |
 | `GATEWAY_UPSTREAM_CA_FILE` | https 后端的额外 CA PEM |
+| `GATEWAY_UPSTREAM_INSECURE` | `true` 时跳过上游证书校验（自签名实验后端） |
 | `GATEWAY_BIND` | 监听地址 |
 | `GATEWAY_MAX_CONNECTIONS` | 并发连接上限 |
 | `GATEWAY_MAX_HEADER_BYTES` | header 上限（最小 8192） |
@@ -157,6 +160,8 @@ max_tracked_ips = 100000
   - 当前**不做失败自动切换**（备用组不是健康检查故障转移）。
 - 上游支持 `http://` 与 `https://`；https 使用 webpki 根 + 可选 `[upstream_tls].ca_file`，gRPC 与
   WebSocket 升级（wss）同样支持 TLS，WebSocket 还会拼接后端 base path。
+- 自签名上游（如 Proxmox 8006）可设 `GATEWAY_UPSTREAM_INSECURE=true` 跳过校验；生产建议改用
+  `ca_file` 指向该服务的 CA。
 
 ## 4. 请求头（站点级配置）
 
@@ -218,11 +223,13 @@ max_tracked_ips = 100000
 - 每个请求写 `access_request_logs` + `access_response_logs`；请求/响应字节数 > 0 时再写
   `access_request_size_logs` / `access_response_size_logs`（按秒，`ON CONFLICT` 累加）。
 - 后台 writer 每 500ms（或满 256 条）批量写一个事务；所有时间取 PostgreSQL `now()`，与主控时钟一致。
-- 字段：Host、method、path、headers（JSON 对象）、HTTP 版本、客户端 IP（`get_request_ip` 解析后的）、
-  `website_id`、status、响应字节（Content-Length）。
+- 字段：Host、method、**path（含 query）**、headers（JSON 对象）、HTTP 版本、客户端 IP
+  （`get_request_ip` 解析后的）、`website_id`、status、响应字节。
+- 响应字节现在按**实际流式传输**计数：chunked/未知长度响应在 body 结束（或客户端断开）时写日志，
+  不再是 NULL；请求字节仍优先取 Content-Length（chunked 请求暂为 0）。
 - 网关自己生成的 404/502/504 也会记录（body_length 为固定错误文本长度）。
-- 限制：正文长度取 Content-Length，chunked/未知请求为 0、响应为 NULL；writer 关闭时直接 abort，
-  最后一批可能丢。统计聚合由主控 stats 任务负责（见 database.md 5.4）；原始日志保留 7 天。
+- 后台 writer 关闭时先 drain 队列再 flush；统计聚合由主控 stats 任务负责（见 database.md 5.4）；
+  原始日志保留 7 天。
 
 ### 5.2 WebSocket 与 CONNECT
 
@@ -230,7 +237,7 @@ max_tracked_ips = 100000
   - 服务端使用 `serve_connection_with_upgrades`；
   - 到上游做原始 HTTP/1.1 握手，客户端连接启用 `.with_upgrades()`；
   - 上游返回 101 后双向桥接；非 101 按普通响应回传；
-  - 访问日志记录 101。
+  - 访问日志记录 101（升级时的请求/响应头）；之后的双向字节没有单独的关闭记录。
 - **CONNECT**：
   - authority 的 host 必须命中已配置站点，否则 403；
   - authority 的端口必须在 `[server].connect_ports`（默认 `[443, 80]`）中，否则 403；

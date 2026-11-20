@@ -19,7 +19,6 @@ const showForm = ref(false)
 const name = ref('')
 const domains = ref('')
 const kind = ref('tencent')
-const fromEnv = ref(false)
 const secretId = ref('')
 const secretKey = ref('')
 const submitting = ref(false)
@@ -46,7 +45,6 @@ function openCreate(): void {
   name.value = ''
   domains.value = ''
   kind.value = 'tencent'
-  fromEnv.value = false
   secretId.value = ''
   secretKey.value = ''
   formError.value = ''
@@ -69,9 +67,9 @@ async function submit(): Promise<void> {
       name: name.value.trim() || undefined,
       domains: domainList,
       kind: kind.value,
-      from_env: fromEnv.value,
-      secret_id: fromEnv.value ? undefined : secretId.value.trim() || undefined,
-      secret_key: fromEnv.value ? undefined : secretKey.value.trim() || undefined,
+      from_env: false,
+      secret_id: secretId.value.trim() || undefined,
+      secret_key: secretKey.value.trim() || undefined,
     })
     showForm.value = false
     notifySuccess(t('dns.created'))
@@ -182,24 +180,15 @@ async function remove(item: DnsProvider): Promise<void> {
           <span class="field-label">{{ t('dns.domains') }}</span>
           <input v-model="domains" class="input" :placeholder="t('dns.domainsHint')" />
         </label>
-        <label class="field field-wide checkbox-row">
-          <input v-model="fromEnv" type="checkbox" />
-          <span>
-            <strong>{{ t('dns.fromEnv') }}</strong>
-            <small class="muted">{{ t('dns.fromEnvHint') }}</small>
-          </span>
+        <label class="field">
+          <span class="field-label">{{ t('dns.secretId') }}</span>
+          <input v-model="secretId" class="input" autocomplete="off" />
         </label>
-        <template v-if="!fromEnv">
-          <label class="field">
-            <span class="field-label">{{ t('dns.secretId') }}</span>
-            <input v-model="secretId" class="input" autocomplete="off" />
-          </label>
-          <label class="field">
-            <span class="field-label">{{ t('dns.secretKey') }}</span>
-            <input v-model="secretKey" class="input" type="password" autocomplete="new-password" />
-          </label>
-          <p class="muted small-text field-wide">{{ t('dns.secretHint') }}</p>
-        </template>
+        <label class="field">
+          <span class="field-label">{{ t('dns.secretKey') }}</span>
+          <input v-model="secretKey" class="input" type="password" autocomplete="new-password" />
+        </label>
+        <p class="muted small-text field-wide">{{ t('dns.secretHint') }}</p>
         <div v-if="formError" class="form-error field-wide">{{ formError }}</div>
       </div>
       <template #footer>

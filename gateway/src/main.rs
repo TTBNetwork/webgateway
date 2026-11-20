@@ -86,6 +86,7 @@ async fn run() -> anyhow::Result<()> {
         certs,
         log_sender,
         upstream_ca_file,
+        config.upstream_tls.insecure,
         StateLimits {
             cache_max_size_bytes: config.server.cache_max_size_bytes,
             max_request_body_bytes: config.server.max_request_body_bytes,

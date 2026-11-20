@@ -22,6 +22,8 @@ pub struct Config {
 pub struct UpstreamTlsConfig {
     /// Extra PEM CA certificates trusted for https backends.
     pub ca_file: Option<String>,
+    /// Disable upstream certificate verification (self-signed lab backends).
+    pub insecure: bool,
 }
 
 #[derive(Debug, Clone, Default, Deserialize)]
@@ -93,6 +95,12 @@ impl Config {
         overlay_string("GATEWAY_NODE_CITY", &mut config.node.city);
         overlay_string("GATEWAY_NODE_ADDRESS", &mut config.node.address);
         overlay_string("GATEWAY_UPSTREAM_CA_FILE", &mut config.upstream_tls.ca_file);
+        if let Ok(raw) = std::env::var("GATEWAY_UPSTREAM_INSECURE") {
+            config.upstream_tls.insecure = matches!(
+                raw.trim().to_ascii_lowercase().as_str(),
+                "1" | "true" | "yes" | "on"
+            );
+        }
         if let Ok(bind) = std::env::var("GATEWAY_METRICS_BIND") {
             config.server.metrics_bind = bind;
         }

@@ -12,3 +12,8 @@
 6. 取消掉快速入口，尝试分类好菜单（可以加上二级菜单）
 7. 去掉所有刷新操作，改为自动刷新
 8. `select options` 操作有点偏向原生 UI，不要原生 UI 设计
+9. 现在的 UI 我看的有点晕，你根据我的 v1 UI 设计风格来，先改左侧菜单
+
+## 3. 证书签发
+1. `hostname *.local.atxa.top is not inside the DNS zone txit.top` 但是我的域名有 `txit.top,atxa.top,ttb-network.top`，`zerossl` 支持批发从 `ttb-network.top` 为开头的通用证书，如 `*.ttb-network.top;*.txit.top;*.atxa.top` 的
+2. 不要从环境中读取，因为都上生产环境了 

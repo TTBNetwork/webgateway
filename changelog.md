@@ -498,7 +498,7 @@
   `feat/production-deploy`（ac74a83/340d3c4/27b92f6）→ `feat/observability`（a54eb85）→
   `feat/rate-limit`（ad4196f）→ `feat/health-checks`（9fb72f1）→ `feat/h3-streaming`（30ac6b0）→
   `feat/cache-vary`（61d6c0b）→ `feat/stats-accuracy`（4a0450b）。
-- 最终验证：gateway 53、dashboard 26、shared 19 + 3 集成；fmt/clippy 通过；
+- 最终验证：gateway 53、dashboard 27、shared 19 + 3 集成；fmt/clippy 通过；
   前端 format/lint/type-check/build 通过；四个 head CI 全绿；
   叠加 smoke（加密证书 + h3 流式 + 缓存 + 健康检查 + 面板静态托管 + 指标 + 双端 SIGTERM）通过。
 - 生产清单：`deployment.md` 第 9/12 节、`issue.md` 第 7 节。
@@ -536,4 +536,16 @@
 - 验证：frontend format/lint/type-check/build 通过；backend 26/53/19+3 测试通过；目标机新面板资源加载正常，
   /api/logs 返回 headers，ACME 代理设置可读写且密文以 enc:v1: 存储，80/443 返回 404（无匹配站点）而面板 200。
 - 文档：deployment.md 第 6/12/13/14 节、issue.md F-63/F-64/F-65。
+
+### 证书多 zone / HTTPS 上游 / 访问日志 / v1 菜单（2026-11-20）
+- 证书 DNS 凭据只从面板 `dns_providers` 读取；`from_env` provider 直接拒绝，旧环境变量（TENCENT_* 等）不再参与签发。
+- provider 可配置多个 zone；同一证书的 hostnames 可跨 zone（如 `*.ttb-network.top;*.txit.top;*.local.atxa.top`），
+  按每个 identifier 所属 zone 生成 DNS-01 记录；`dns_zone` 仅作单 zone 提示，跨 zone 时自动留空。
+- gateway 新增 `GATEWAY_UPSTREAM_INSECURE=true`（或 `[upstream_tls].insecure`）跳过上游证书校验；
+  目标机 Proxmox `https://192.168.2.254:8006` 由 502 变为 200（生产建议改用 `ca_file`）。
+- 访问日志：path 记录 query；流式/chunked 响应在 body 结束或断开时按实际字节写日志，响应大小不再 NULL。
+- 左侧菜单改为 v1 风格可折叠菜单：统计 / 网站管理（站点/证书/DNS/日志）/ 节点管理 / 系统设置，二级菜单缩进。
+- 前端：证书表单必须选择 DNS provider；DNS 表单移除 from-env 选项；证书 zone 提示更新。
+- 校验：Rust 27/53/19+3 测试通过，clippy/fmt 通过；前端 format/lint/type-check/build 通过；
+  目标机新面板加载、from_env 拒绝、无 provider/跨 zone 错误、流式日志大小、Proxmox 200 均已实测。
 

@@ -51,3 +51,5 @@ ports = [80, 443]
 [upstream_tls]
 # Extra PEM CA certificates for https backends (webpki roots are always trusted).
 # ca_file = "/etc/webgateway/upstream-ca.pem"
+# Skip upstream certificate verification for self-signed lab backends.
+# insecure = false

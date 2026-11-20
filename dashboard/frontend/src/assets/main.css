@@ -1,6 +1,6 @@
 :root {
   color-scheme: dark;
-  --sidebar-width: 252px;
+  --sidebar-width: 228px;
   --radius: 16px;
   --radius-sm: 10px;
   --font:
@@ -1420,29 +1420,51 @@ tbody tr:hover {
   }
 }
 
-/* ---- grouped navigation ---- */
+/* ---- v1-style collapsible navigation ---- */
 .nav {
-  gap: 3px;
+  gap: 2px;
   overflow-y: auto;
 }
-.nav-group {
+.nav-block {
   display: grid;
-  gap: 3px;
-  padding: 4px 0 2px;
+  gap: 2px;
+  padding: 2px 0;
 }
-.nav-group + .nav-group {
-  margin-top: 10px;
-  border-top: 1px solid var(--border);
-  padding-top: 12px;
+.nav-parent .nav-caret {
+  margin-left: auto;
+  opacity: 0.55;
+  transition: transform 0.18s ease;
 }
-.nav-group-label {
-  padding: 0 10px 5px;
+.nav-parent[aria-expanded='true'] .nav-caret {
+  transform: rotate(90deg);
+}
+.nav-sub {
+  display: grid;
+  gap: 2px;
+  margin: 2px 0 4px 15px;
+  padding-left: 10px;
+  border-left: 1px solid var(--border);
+}
+.nav-subitem {
+  display: flex;
+  gap: 8px;
+  padding: 7px 10px;
   color: var(--muted);
-  font-size: 10px;
-  font-weight: 700;
-  letter-spacing: 0.12em;
-  text-transform: uppercase;
-  opacity: 0.72;
+  font-size: 13px;
+}
+.nav-subitem:hover {
+  color: var(--text);
+}
+.nav-subitem.active {
+  color: var(--text);
+  background: var(--panel-soft);
+}
+.nav-subitem.active::before {
+  content: '';
+  width: 3px;
+  height: 14px;
+  border-radius: 2px;
+  background: var(--accent);
 }
 
 /* ---- label + info tooltip ---- */

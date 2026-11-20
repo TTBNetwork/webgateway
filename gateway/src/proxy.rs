@@ -3,7 +3,9 @@
 use std::{
     convert::Infallible,
     net::{IpAddr, SocketAddr},
+    pin::Pin,
     sync::Arc,
+    task::{Context as TaskContext, Poll},
     time::Duration,
 };
 
@@ -12,6 +14,7 @@ use bytes::Bytes;
 use http::{
     HeaderMap, HeaderName, HeaderValue, Request, Response, StatusCode, Uri, Version, header,
 };
+use http_body::{Body, Frame, SizeHint};
 use http_body_util::{BodyExt, Full, Limited};
 use hyper::body::Incoming;
 use tracing::{Level, event};
@@ -62,7 +65,11 @@ pub async fn handle(
     }
 
     let raw_host = request_host(&request);
-    let path = request.uri().path().to_string();
+    let path = request
+        .uri()
+        .path_and_query()
+        .map(|value| value.as_str().to_string())
+        .unwrap_or_else(|| "/".to_string());
     let method_label = request.method().as_str().to_string();
     let query = request.uri().query().map(str::to_string);
     let user_agent = request
@@ -381,22 +388,21 @@ pub async fn handle(
         return full_response(status, version, response_headers, bytes);
     }
 
-    let response_length = response_headers
-        .get(header::CONTENT_LENGTH)
-        .map(|_| crate::access::content_length(&response_headers));
-    log_event(
-        &state,
-        &request_log,
-        status,
-        &response_headers,
-        response_length,
-        version,
-    );
-
+    // Count bytes while streaming and only write the access row when the body
+    // ends (or the client disconnects). Chunked responses then have a real size
+    // instead of NULL, and the log is not emitted before the transfer ends.
     let body = upstream_response
         .into_body()
         .map_err(|error| -> BoxError { Box::new(error) })
         .boxed();
+    let body = logged_stream_body(
+        state.clone(),
+        request_log,
+        status,
+        response_headers.clone(),
+        version,
+        body,
+    );
 
     let mut response = Response::new(body);
     *response.status_mut() = status;
@@ -420,7 +426,10 @@ pub async fn handle_buffered(
     } = request;
 
     let raw_host = parts_host(&headers, &uri);
-    let path = uri.path().to_string();
+    let path = uri
+        .path_and_query()
+        .map(|value| value.as_str().to_string())
+        .unwrap_or_else(|| "/".to_string());
     let query = uri.query().map(str::to_string);
     let user_agent = headers
         .get(header::USER_AGENT)
@@ -570,17 +579,16 @@ pub async fn handle_buffered(
         response_headers.insert(HeaderName::from_static("x-webgateway-node"), value);
     }
 
-    log_event(
-        &state,
-        &request_log,
-        status,
-        &response_headers,
-        Some(crate::access::content_length(&response_headers)),
-        version,
-    );
-
     // Stream the upstream body; HTTP/3 no longer buffers the full response.
-    let mut response = Response::new(upstream_response.into_body());
+    let body = logged_stream_body(
+        state.clone(),
+        request_log,
+        status,
+        response_headers.clone(),
+        version,
+        upstream_response.into_body(),
+    );
+    let mut response = Response::new(body);
     *response.status_mut() = status;
     *response.version_mut() = version;
     *response.headers_mut() = response_headers;
@@ -805,6 +813,103 @@ pub(crate) fn log_event(
         crate::access::record_dropped();
         tracing::debug!(%error, "dropping access log event");
     }
+}
+
+/// Streams a body while counting bytes, then writes one access-log row.
+///
+/// Logging on completion (instead of before streaming) records the real body
+/// size for chunked responses. A client disconnect still logs the bytes read so
+/// far via `Drop`.
+struct LoggedBody {
+    inner: Pin<Box<GatewayBody>>,
+    state: Arc<AppState>,
+    request: access::RequestLog,
+    status: StatusCode,
+    headers: HeaderMap,
+    version: Version,
+    bytes: u64,
+    logged: bool,
+}
+
+impl LoggedBody {
+    fn finish(&mut self) {
+        if self.logged {
+            return;
+        }
+        self.logged = true;
+        log_event(
+            &self.state,
+            &self.request,
+            self.status,
+            &self.headers,
+            Some(self.bytes),
+            self.version,
+        );
+    }
+}
+
+impl Body for LoggedBody {
+    type Data = Bytes;
+    type Error = BoxError;
+
+    fn poll_frame(
+        self: Pin<&mut Self>,
+        cx: &mut TaskContext<'_>,
+    ) -> Poll<Option<Result<Frame<Self::Data>, Self::Error>>> {
+        let this = self.get_mut();
+        match this.inner.as_mut().poll_frame(cx) {
+            Poll::Ready(Some(Ok(frame))) => {
+                if let Some(data) = frame.data_ref() {
+                    this.bytes = this.bytes.saturating_add(data.len() as u64);
+                }
+                Poll::Ready(Some(Ok(frame)))
+            }
+            Poll::Ready(Some(Err(error))) => {
+                this.finish();
+                Poll::Ready(Some(Err(error)))
+            }
+            Poll::Ready(None) => {
+                this.finish();
+                Poll::Ready(None)
+            }
+            Poll::Pending => Poll::Pending,
+        }
+    }
+
+    fn is_end_stream(&self) -> bool {
+        self.inner.as_ref().is_end_stream()
+    }
+
+    fn size_hint(&self) -> SizeHint {
+        self.inner.as_ref().size_hint()
+    }
+}
+
+impl Drop for LoggedBody {
+    fn drop(&mut self) {
+        self.finish();
+    }
+}
+
+fn logged_stream_body(
+    state: Arc<AppState>,
+    request: access::RequestLog,
+    status: StatusCode,
+    headers: HeaderMap,
+    version: Version,
+    body: GatewayBody,
+) -> GatewayBody {
+    LoggedBody {
+        inner: Box::pin(body),
+        state,
+        request,
+        status,
+        headers,
+        version,
+        bytes: 0,
+        logged: false,
+    }
+    .boxed()
 }
 
 fn is_grpc(headers: &HeaderMap) -> bool {

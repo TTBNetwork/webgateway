@@ -217,6 +217,7 @@ HTTP/TCP 与 HTTP/3 请求、flush 访问日志并标记 offline。
 | `GATEWAY_MAX_HEADER_BYTES` | 请求头上限，默认 32 KiB（最小 8 KiB） |
 | `GATEWAY_MAX_REQUEST_BODY` / `GATEWAY_MAX_RESPONSE_BODY` | 请求/响应体上限，默认 64 MiB |
 | `GATEWAY_UPSTREAM_CA_FILE` | 额外信任的上游 CA PEM |
+| `GATEWAY_UPSTREAM_INSECURE` | `true` 时跳过上游证书校验（仅可信实验环境；优先用 CA 文件） |
 | `GATEWAY_METRICS_PORT` | Prometheus 指标端口；不设则不启用 |
 | `GATEWAY_METRICS_BIND` | 指标监听地址，默认 `127.0.0.1` |
 | `GATEWAY_RATE_LIMIT_RPS` | 每客户端 IP 每秒请求数；>0 时启用限流 |
@@ -388,6 +389,10 @@ groups:
 | 面板 UX 批量改造 | ✅ | 本轮 master（00b1955 之后） | Toast/提示、分组菜单、DNS 页、结构化站点表单、日志详情、自动刷新、自定义 Select |
 | 证书申请代理 | ✅ | 本轮 master | 设置页保存（加密）、ACME 客户端经代理；DNS API 直连 |
 | 网关默认 80/443 | ✅ | 本轮 master | systemd AmbientCapabilities、Docker 80/443 + 非 root 端口 sysctl |
+| 证书多 zone / 仅面板凭据 | ✅ | 本轮 master | provider domains 跨 zone；from_env 拒绝；多通配符 hostnames |
+| HTTPS 上游自签名 | ✅ | 本轮 master | `GATEWAY_UPSTREAM_INSECURE`；目标机 Proxmox 8006 返回 200 |
+| 访问日志完整性 | ✅ | 本轮 master | path 含 query、流式/chunked 实际响应字节 |
+| v1 风格左侧菜单 | ✅ | 本轮 master | 折叠二级菜单：统计/网站管理/节点管理/系统设置 |
 
 **最终验证**（2026-11-20）：
 

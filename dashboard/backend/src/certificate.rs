@@ -4,10 +4,12 @@
 //! as a pending ACME order. The background scheduler claims pending/expiring
 //! rows through certificates.signing_started_at and signs one at a time.
 //!
-//! ACME uses DNS-01 with Tencent Cloud DNSPod. Credentials are read from the
-//! environment (scripts/source-dnsprovider.sh loads .secrets/dnsprovider) or
-//! from a dns_providers row. ZeroSSL is tried first when EAB credentials are
-//! configured, otherwise Let's Encrypt is used.
+//! ACME uses DNS-01 with Tencent Cloud DNSPod. Credentials MUST come from a
+//! dns_providers row managed in the panel; environment credentials are not
+//! accepted. A provider can list several zones, so one certificate may cover
+//! hostnames from multiple zones (for example *.atxa.top + *.txit.top).
+//! ZeroSSL is tried first when EAB credentials are configured, otherwise
+//! Let's Encrypt is used.
 
 use std::{env, io::Cursor, sync::Arc, time::Duration};
 
@@ -30,20 +32,6 @@ const TICK_SECS: u64 = 60;
 const MAX_CONCURRENT_SIGNINGS: usize = 2;
 const ZEROSSL_DIRECTORY: &str = "https://acme.zerossl.com/v2/DV90";
 const LETSENCRYPT_DIRECTORY: &str = "https://acme-v02.api.letsencrypt.org/directory";
-
-/// Environment pairs accepted for Tencent Cloud DNSPod credentials.
-const TENCENT_ENV_PAIRS: &[(&str, &str)] = &[
-    // .secrets/dnsprovider uses the v1 panel labels: KEY is the SecretId and
-    // SECRET is the SecretKey.
-    ("TENCENT_KEY", "TENCENT_SECRET"),
-    ("TENCENT_KEY", "TENCENT_SECRET_KEY"),
-    ("TENCENT_KEY", "TENCENT_SECRETKEY"),
-    ("TENCENTCLOUD_SECRET_ID", "TENCENTCLOUD_SECRET_KEY"),
-    ("TENCENT_SECRET_ID", "TENCENT_SECRET_KEY"),
-    ("TENCENT_DNSPOD_SECRET_ID", "TENCENT_DNSPOD_SECRET_KEY"),
-    ("DNSPOD_SECRET_ID", "DNSPOD_SECRET_KEY"),
-    ("Tencent_SecretId", "Tencent_SecretKey"),
-];
 
 /// Environment pairs accepted for ZeroSSL External Account Binding.
 const ZEROSSL_EAB_PAIRS: &[(&str, &str)] = &[
@@ -78,7 +66,7 @@ struct DnsProviderConfig {
 struct DnsCredentials {
     secret_id: String,
     secret_key: String,
-    zone: String,
+    zones: Vec<String>,
     source: String,
 }
 
@@ -283,7 +271,7 @@ async fn sign_inner(
             Level::INFO,
             certificate = %certificate.id,
             ca = candidate.name,
-            zone = %credentials.zone,
+            zones = ?credentials.zones,
             dns_source = %credentials.source,
             "requesting certificate"
         );
@@ -387,7 +375,10 @@ async fn issue_with_ca(
         String::new(),
     ));
     let mut registry = ChallengeSolverRegistry::new();
-    registry.register(Dns01Solver::new(provider, credentials.zone.clone()));
+    registry.register(Dns01Solver::new(
+        provider,
+        credentials.zones.first().cloned().unwrap_or_default(),
+    ));
 
     let result = client
         .issue_certificate(hostnames.to_vec(), &mut registry)
@@ -443,67 +434,78 @@ async fn resolve_dns(
     hostnames: &[String],
     dns_zone: Option<&str>,
 ) -> anyhow::Result<DnsCredentials> {
-    let mut explicit = None;
-    let mut provider_zone = None;
-    let mut source = String::from("environment");
-
-    if let Some(provider_id) = dns_provider_id {
-        let row = sqlx::query(
-            "SELECT provider::text AS provider, domains FROM dns_providers WHERE id = $1",
-        )
-        .bind(provider_id)
-        .fetch_optional(database.pool())
-        .await
-        .context("failed to load the DNS provider")?
-        .with_context(|| format!("DNS provider {provider_id} does not exist"))?;
-        let raw: String = row.try_get("provider")?;
-        let domains: Vec<String> = row.try_get("domains")?;
-        let config: DnsProviderConfig =
-            serde_json::from_str(&raw).context("invalid dns_providers.provider JSON")?;
-        if let Some(kind) = config.kind.as_deref()
-            && kind != "tencent"
-        {
-            bail!("unsupported DNS provider kind: {kind}");
-        }
-        if !config.from_env
-            && let (Some(secret_id), Some(secret_key)) = (config.secret_id, config.secret_key)
-        {
-            explicit = Some((
-                shared::crypto::open(&secret_id)
-                    .context("failed to decrypt the DNS provider secret id")?,
-                shared::crypto::open(&secret_key)
-                    .context("failed to decrypt the DNS provider secret key")?,
-            ));
-            source = String::from("dns_providers row");
-        }
-        provider_zone = domains.into_iter().next();
+    let provider_id = dns_provider_id
+        .filter(|value| !value.trim().is_empty())
+        .context(
+            "select a DNS provider in the panel; certificate issuance no longer reads DNS credentials from the environment",
+        )?;
+    let row =
+        sqlx::query("SELECT provider::text AS provider, domains FROM dns_providers WHERE id = $1")
+            .bind(provider_id)
+            .fetch_optional(database.pool())
+            .await
+            .context("failed to load the DNS provider")?
+            .with_context(|| format!("DNS provider {provider_id} does not exist"))?;
+    let raw: String = row.try_get("provider")?;
+    let domains: Vec<String> = row.try_get("domains")?;
+    let config: DnsProviderConfig =
+        serde_json::from_str(&raw).context("invalid dns_providers.provider JSON")?;
+    if let Some(kind) = config.kind.as_deref()
+        && kind != "tencent"
+    {
+        bail!("unsupported DNS provider kind: {kind}");
     }
-
-    let (secret_id, secret_key) = match explicit {
-        Some(credentials) => credentials,
-        None => {
-            let (id_name, key_name, secret_id, secret_key) =
-                env_pair(TENCENT_ENV_PAIRS).context(
-                    "Tencent Cloud DNS credentials are not configured; source .secrets/dnsprovider (scripts/source-dnsprovider.sh) or set TENCENTCLOUD_SECRET_ID / TENCENTCLOUD_SECRET_KEY",
-                )?;
-            source = format!("environment ({id_name}/{key_name})");
-            (secret_id, secret_key)
-        }
+    if config.from_env {
+        bail!(
+            "DNS provider {provider_id} uses environment credentials; create a panel provider with SecretId/SecretKey instead"
+        );
+    }
+    let (secret_id, secret_key) = match (config.secret_id, config.secret_key) {
+        (Some(secret_id), Some(secret_key)) => (
+            shared::crypto::open(&secret_id)
+                .context("failed to decrypt the DNS provider secret id")?,
+            shared::crypto::open(&secret_key)
+                .context("failed to decrypt the DNS provider secret key")?,
+        ),
+        _ => bail!(
+            "DNS provider {provider_id} has no SecretId/SecretKey; add them in the DNS provider page"
+        ),
     };
 
-    let zone = dns_zone
-        .map(str::to_string)
-        .or(provider_zone)
-        .or_else(|| derive_zone(hostnames.first().map(String::as_str).unwrap_or_default()).ok())
-        .context("could not derive the DNS zone; set dns_zone explicitly")?;
-    let zone = normalize_zone(&zone)?;
-    ensure_hostnames_in_zone(hostnames, &zone)?;
+    let mut zones: Vec<String> = domains
+        .iter()
+        .map(|zone| normalize_zone(zone))
+        .collect::<anyhow::Result<Vec<_>>>()?;
+    if zones.is_empty() {
+        bail!("DNS provider {provider_id} has no zones");
+    }
+
+    // `dns_zone` is a hint for the single-zone case. A certificate may span
+    // several provider zones (for example *.atxa.top + *.txit.top); in that case
+    // the provider's domain list decides where each TXT record goes.
+    if let Some(zone) = dns_zone.filter(|value| !value.trim().is_empty()) {
+        let zone = normalize_zone(zone)?;
+        if !zones.iter().any(|candidate| candidate == &zone) {
+            bail!("DNS zone {zone} is not configured on the selected DNS provider");
+        }
+        if hostnames_within_zone(hostnames, &zone) {
+            zones = vec![zone];
+        } else {
+            event!(
+                Level::WARN,
+                certificate = %hostnames.first().map(String::as_str).unwrap_or_default(),
+                zone = %zone,
+                "dns_zone does not cover every hostname; using the provider domains instead"
+            );
+        }
+    }
+    ensure_hostnames_in_zones(hostnames, &zones)?;
 
     Ok(DnsCredentials {
         secret_id,
         secret_key,
-        zone,
-        source,
+        zones,
+        source: String::from("dns_providers row"),
     })
 }
 
@@ -539,6 +541,7 @@ fn normalize_zone(zone: &str) -> anyhow::Result<String> {
 /// Derive the parent zone by dropping the leftmost label. This mirrors the
 /// DNSPod provider and works for zones such as atxa.top; pass dns_zone for
 /// multi-label public suffixes.
+#[cfg(test)]
 pub fn derive_zone(hostname: &str) -> anyhow::Result<String> {
     let host = hostname.trim().trim_start_matches("*.");
     let labels: Vec<&str> = host.split('.').filter(|label| !label.is_empty()).collect();
@@ -548,14 +551,35 @@ pub fn derive_zone(hostname: &str) -> anyhow::Result<String> {
     Ok(labels[labels.len() - 2..].join(".").to_ascii_lowercase())
 }
 
-fn ensure_hostnames_in_zone(hostnames: &[String], zone: &str) -> anyhow::Result<()> {
+fn hostname_body(hostname: &str) -> String {
+    hostname
+        .trim()
+        .trim_start_matches("*.")
+        .trim_end_matches('.')
+        .to_ascii_lowercase()
+}
+
+fn hostname_in_zone(hostname: &str, zone: &str) -> bool {
+    let host = hostname_body(hostname);
+    host == zone || host.ends_with(&format!(".{zone}"))
+}
+
+fn hostnames_within_zone(hostnames: &[String], zone: &str) -> bool {
+    hostnames
+        .iter()
+        .all(|hostname| hostname_in_zone(hostname, zone))
+}
+
+/// Validate that every hostname belongs to at least one of the provider zones.
+/// The zones are independent: DNS-01 can solve each authorization in its own
+/// parent zone even for a multi-domain certificate.
+fn ensure_hostnames_in_zones(hostnames: &[String], zones: &[String]) -> anyhow::Result<()> {
     for hostname in hostnames {
-        let host = hostname
-            .trim()
-            .trim_start_matches("*.")
-            .to_ascii_lowercase();
-        if host != zone && !host.ends_with(&format!(".{zone}")) {
-            bail!("hostname {hostname} is not inside the DNS zone {zone}");
+        if !zones.iter().any(|zone| hostname_in_zone(hostname, zone)) {
+            bail!(
+                "hostname {hostname} is not inside any DNS zone configured on the selected provider ({})",
+                zones.join(", ")
+            );
         }
     }
     Ok(())
@@ -743,27 +767,36 @@ pub async fn create_pending(
         bail!("at least one hostname is required");
     }
 
-    let zone = match dns_zone.filter(|value| !value.trim().is_empty()) {
-        Some(zone) => normalize_zone(&zone)?,
-        None => {
-            let provider_zone: Option<String> = match dns_provider_id.as_deref() {
-                Some(provider_id) => {
-                    sqlx::query_scalar("SELECT domains[1] FROM dns_providers WHERE id = $1")
-                        .bind(provider_id)
-                        .fetch_optional(database.pool())
-                        .await
-                        .context("failed to load the DNS provider")?
-                        .flatten()
-                }
-                None => None,
-            };
-            provider_zone
-                .map(|zone| normalize_zone(&zone))
-                .transpose()?
-                .unwrap_or(derive_zone(&hostnames[0])?)
-        }
-    };
-    ensure_hostnames_in_zone(&hostnames, &zone)?;
+    let provider_id = dns_provider_id
+        .filter(|value| !value.trim().is_empty())
+        .context(
+            "select a DNS provider in the panel; certificates are no longer issued with environment DNS credentials",
+        )?;
+    let domains: Vec<String> =
+        sqlx::query_scalar("SELECT domains FROM dns_providers WHERE id = $1")
+            .bind(&provider_id)
+            .fetch_optional(database.pool())
+            .await
+            .context("failed to load the DNS provider")?
+            .with_context(|| format!("DNS provider {provider_id} does not exist"))?;
+    let zones: Vec<String> = domains
+        .iter()
+        .map(|zone| normalize_zone(zone))
+        .collect::<anyhow::Result<Vec<_>>>()?;
+    ensure_hostnames_in_zones(&hostnames, &zones)?;
+
+    let requested_zone = dns_zone
+        .filter(|value| !value.trim().is_empty())
+        .map(|zone| normalize_zone(&zone))
+        .transpose()?;
+    if let Some(zone) = requested_zone.as_deref()
+        && !zones.iter().any(|candidate| candidate == zone)
+    {
+        bail!("DNS zone {zone} is not configured on the selected DNS provider");
+    }
+    // Store a zone only when it covers the whole certificate; multi-zone certs
+    // leave dns_zone empty and resolve each authorization from the provider list.
+    let stored_zone = requested_zone.filter(|zone| hostnames_within_zone(&hostnames, zone));
 
     let id = new_id()?;
     let name = name
@@ -778,9 +811,9 @@ pub async fn create_pending(
     .bind(&id)
     .bind(&name)
     .bind(&hostnames)
-    .bind(dns_provider_id.filter(|value| !value.is_empty()))
+    .bind(Some(provider_id))
     .bind(email.filter(|value| !value.trim().is_empty()))
-    .bind(&zone)
+    .bind(&stored_zone)
     .execute(database.pool())
     .await
     .context("failed to create the pending certificate")?;
@@ -881,21 +914,24 @@ pub async fn create_dns_provider(
     if kind != "tencent" {
         bail!("unsupported DNS provider kind: {kind}");
     }
-    let provider = if from_env {
-        serde_json::json!({ "kind": kind, "from_env": true })
-    } else {
-        match (
-            secret_id.filter(|value| !value.is_empty()),
-            secret_key.filter(|value| !value.is_empty()),
-        ) {
-            (Some(secret_id), Some(secret_key)) => serde_json::json!({
-                "kind": kind,
-                "from_env": false,
-                "secret_id": shared::crypto::seal(&secret_id)?,
-                "secret_key": shared::crypto::seal(&secret_key)?,
-            }),
-            _ => bail!("secret_id and secret_key are required when from_env is false"),
-        }
+    if from_env {
+        bail!(
+            "environment-backed DNS credentials are disabled; enter SecretId and SecretKey in the panel"
+        );
+    }
+    let provider = match (
+        secret_id.filter(|value| !value.is_empty()),
+        secret_key.filter(|value| !value.is_empty()),
+    ) {
+        (Some(secret_id), Some(secret_key)) => serde_json::json!({
+            "kind": kind,
+            "from_env": false,
+            "secret_id": shared::crypto::seal(&secret_id)?,
+            "secret_key": shared::crypto::seal(&secret_key)?,
+        }),
+        _ => bail!(
+            "secret_id and secret_key are required; environment credentials are not supported"
+        ),
     };
 
     let id = new_id()?;
@@ -945,6 +981,19 @@ mod tests {
         assert!(!hostname_matches("*.example.com", "a.b.example.com"));
         assert!(!hostname_matches("*.example.com", "example.com"));
         assert!(hostname_matches("example.com", "EXAMPLE.com"));
+    }
+
+    #[test]
+    fn accepts_hostnames_from_multiple_provider_zones() {
+        let hostnames = vec![
+            "*.atxa.top".to_string(),
+            "*.txit.top".to_string(),
+            "*.local.atxa.top".to_string(),
+        ];
+        let zones = vec!["atxa.top".to_string(), "txit.top".to_string()];
+        assert!(ensure_hostnames_in_zones(&hostnames, &zones).is_ok());
+        assert!(hostname_in_zone("*.local.atxa.top", "atxa.top"));
+        assert!(!hostname_in_zone("*.other.com", "atxa.top"));
     }
 
     #[test]

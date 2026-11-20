@@ -67,14 +67,19 @@ POST /api/certificates/issue
   "name": "acme-test",
   "hostnames": ["cert-test2.atxa.top"],
   "email": "admin@atxa.top",
-  "dns_provider_id": null,
-  "dns_zone": "atxa.top"
+  "dns_provider_id": "a4eb63ccbeaf2e0d8422aab8",
+  "dns_zone": null
 }
 ```
 
 - 创建 `auto_renew = TRUE` 的 pending 行并立即触发；响应 `{ "id": ..., "status": "queued" }`。
-- `dns_zone` 可省略：优先取 `dns_provider.domains[0]`，否则按“去掉最左 label”推导（`cert-test.atxa.top` → `atxa.top`）。
-- 一个证书的所有 hostname 必须在同一个 zone 内；多 zone 证书当前拒绝。
+- **必须**选择面板中创建的 DNS provider；不再从环境变量读取 DNS 凭据。
+- `dns_zone` 是可选的单 zone 提示：留空时按 provider 的 `domains` 自动匹配每个 hostname；
+  证书跨多个 zone 时（如 `*.atxa.top` + `*.txit.top`）必须留空或填 provider 中的zone，
+  平台会为每个 authorization 在对应 zone 创建 TXT 记录。
+- 一个证书可以覆盖多个 provider zone；provider 的 `domains` 应包含所有相关 zone。
+- 例：provider `domains = ["txit.top", "atxa.top", "ttb-network.top"]`，hostnames
+  `["*.ttb-network.top", "*.txit.top", "*.atxa.top"]` 可以放在同一张证书中。
 - 重新签发：`POST /api/certificates/{id}/issue`（只允许 `auto_renew` 行）。
 - 删除：`DELETE /api/certificates/{id}`。
 
@@ -84,55 +89,34 @@ POST /api/certificates/issue
 GET  /api/dns-providers
 POST /api/dns-providers
 {
-  "name": "atxa-top",
-  "domains": ["atxa.top"],
+  "name": "multi-zone",
+  "domains": ["txit.top", "atxa.top", "ttb-network.top"],
   "kind": "tencent",
-  "from_env": true
+  "from_env": false,
+  "secret_id": "...",
+  "secret_key": "..."
 }
 DELETE /api/dns-providers/{id}
 ```
 
-- `from_env: true` 表示运行时从环境读取 Secrets，接口与数据库都不保存密钥。
-- 也支持 `from_env: false` + `secret_id`/`secret_key`（会落库，接口不会回显）。
-- 目前只实现 `tencent`（腾讯云 DNSPod / DNSPod v3 API）。
+- 凭据只能来自面板；`from_env: true` 现在返回 400（生产环境不允许隐式读取服务器环境）。
+- `secret_id`/`secret_key` 会以 AES-256-GCM 加密落库，接口不回显。
+- `domains` 可以列多个 zone，用于同一张多域名/多 zone 证书。
+- 目前只实现 `tencent`（腾讯云 DNSPod / DNSPod v3 API）；没有编辑接口，轮换凭据可删除后重建。
 
-## 3. DNS 凭据与 `.secrets/dnsprovider`
+## 3. DNS 凭据（仅面板）
 
-密钥文件被 `.gitignore` 忽略，**不进入仓库、不会上传、日志不打印值**。文件格式是简单的
-`NAME = value`（允许空格与引号；`export` 可选）：
+DNS-01 凭据只从面板的 **DNS 服务商** 页面读取（`dns_providers` 表）：
 
-```
-TENCENT_KEY = <SecretId>
-TENCENT_SECRET = <SecretKey>
-# 可选：启用 ZeroSSL（优先于 Let's Encrypt）
-ZEROSSL_EAB_KID = ...
-ZEROSSL_EAB_HMAC_KEY = ...
-```
+- 新增时填写名称、一个或多个 zone、类型和 `SecretId`/`SecretKey`；
+- 凭据使用 `SECRET_ENCRYPTION_KEY` 加密后落库，接口不回显；
+- `from_env` 已禁用：旧 provider 如果带 `from_env=true`，签发会提示重新在面板录入；
+- `.secrets/dnsprovider` / `TENCENT_*` / `TENCENTCLOUD_*` 不再参与证书签发。
 
-应用方式（不读取/打印值）：
+多 zone 证书：provider 的 `domains` 列全所有相关 zone，证书 hostnames 可跨这些 zone；
+DNS-01 会按每个 identifier 所属 zone 写入对应解析记录。
 
-```bash
-# 方式一：source 到当前 shell
-. scripts/source-dnsprovider.sh
-
-# 方式二：直接启动主控（内部自动 source）
-DATABASE_URL=... scripts/run-dashboard.sh
-```
-
-主控识别的腾讯云变量对（按顺序匹配）：
-
-```
-TENCENT_KEY / TENCENT_SECRET
-TENCENT_KEY / TENCENT_SECRET_KEY
-TENCENT_KEY / TENCENT_SECRETKEY
-TENCENTCLOUD_SECRET_ID / TENCENTCLOUD_SECRET_KEY
-TENCENT_SECRET_ID / TENCENT_SECRET_KEY
-TENCENT_DNSPOD_SECRET_ID / TENCENT_DNSPOD_SECRET_KEY
-DNSPOD_SECRET_ID / DNSPOD_SECRET_KEY
-Tencent_SecretId / Tencent_SecretKey
-```
-
-其它环境变量：
+其它环境变量（仅 ACME，不用于 DNS 凭据）：
 
 | 变量 | 说明 |
 |---|---|
@@ -176,10 +160,12 @@ Tencent_SecretId / Tencent_SecretKey
 ## 6. 限制
 
 - DNS provider 只有腾讯云 DNSPod；没有 HTTP-01 / TLS-ALPN-01 / 其他 DNS 服务商。
-- 一个证书只能覆盖一个 DNS zone；多 zone 需拆成多张证书。
+- 多 zone / 多通配符证书已支持（provider `domains` 覆盖所有 hostname）；实际签发仍取决于
+  CA 对 SAN 组合的策略，建议先在测试域名验证。
 - ZeroSSL 必须提供 EAB；否则自动回退 Let's Encrypt。
-- 通配符证书（`*.example.com`）代码按 identifier 生成 `_acme-challenge.example.com`，但尚未实测。
-- ACME account 私钥、证书私钥均为明文入库；后续需要加密存储与轮换。
+- 通配符 DNS-01 记录名为 `_acme-challenge.<base>`；多 zone 时按每个 identifier 所属 zone 写入。
+- ACME account 私钥与证书私钥均使用 `SECRET_ENCRYPTION_KEY` 加密入库；密钥轮换仍只能靠 `_PREVIOUS` 解密。
+- 证书申请代理可在面板“设置 → 证书申请代理”配置（仅 ACME CA 请求；DNSPod API 直连）。
 - ACME HTTP 请求 60s 轮询、失败约 10 分钟后重试；没有更细的退避/告警。
 - 面板按钮使用当前登录 JWT；证书写接口按 `user`/`admin` 授权（`view` 只读）。
 

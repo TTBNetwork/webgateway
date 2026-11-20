@@ -39,7 +39,13 @@ pub type BufferedUpstreamClient = Client<UpstreamConnector, Full<Bytes>>;
 ///
 /// HTTP clients let hyper-rustls configure ALPN; the WebSocket upgrade path
 /// derives its own config with ALPN fixed to http/1.1.
-pub fn upstream_tls_config(ca_file: Option<&Path>) -> anyhow::Result<rustls::ClientConfig> {
+///
+/// `insecure` disables certificate verification for lab/self-signed upstreams;
+/// prefer adding the CA with `upstream_ca_file` when possible.
+pub fn upstream_tls_config(
+    ca_file: Option<&Path>,
+    insecure: bool,
+) -> anyhow::Result<rustls::ClientConfig> {
     let mut roots = rustls::RootCertStore::empty();
     roots.extend(webpki_roots::TLS_SERVER_ROOTS.iter().cloned());
 
@@ -58,12 +64,59 @@ pub fn upstream_tls_config(ca_file: Option<&Path>) -> anyhow::Result<rustls::Cli
     }
 
     let provider = Arc::new(rustls::crypto::ring::default_provider());
-    let tls = rustls::ClientConfig::builder_with_provider(provider)
+    let mut tls = rustls::ClientConfig::builder_with_provider(provider)
         .with_safe_default_protocol_versions()
         .context("failed to select TLS protocol versions")?
         .with_root_certificates(roots)
         .with_no_client_auth();
+    if insecure {
+        tracing::warn!(
+            "upstream TLS verification is disabled (GATEWAY_UPSTREAM_INSECURE); use only for trusted lab backends"
+        );
+        tls.dangerous()
+            .set_certificate_verifier(Arc::new(NoCertificateVerification(
+                rustls::crypto::ring::default_provider().signature_verification_algorithms,
+            )));
+    }
     Ok(tls)
+}
+
+#[derive(Debug)]
+struct NoCertificateVerification(rustls::crypto::WebPkiSupportedAlgorithms);
+
+impl rustls::client::danger::ServerCertVerifier for NoCertificateVerification {
+    fn verify_server_cert(
+        &self,
+        _end_entity: &rustls::pki_types::CertificateDer<'_>,
+        _intermediates: &[rustls::pki_types::CertificateDer<'_>],
+        _server_name: &rustls::pki_types::ServerName<'_>,
+        _ocsp_response: &[u8],
+        _now: rustls::pki_types::UnixTime,
+    ) -> Result<rustls::client::danger::ServerCertVerified, rustls::Error> {
+        Ok(rustls::client::danger::ServerCertVerified::assertion())
+    }
+
+    fn verify_tls12_signature(
+        &self,
+        message: &[u8],
+        cert: &rustls::pki_types::CertificateDer<'_>,
+        dss: &rustls::DigitallySignedStruct,
+    ) -> Result<rustls::client::danger::HandshakeSignatureValid, rustls::Error> {
+        rustls::crypto::verify_tls12_signature(message, cert, dss, &self.0)
+    }
+
+    fn verify_tls13_signature(
+        &self,
+        message: &[u8],
+        cert: &rustls::pki_types::CertificateDer<'_>,
+        dss: &rustls::DigitallySignedStruct,
+    ) -> Result<rustls::client::danger::HandshakeSignatureValid, rustls::Error> {
+        rustls::crypto::verify_tls13_signature(message, cert, dss, &self.0)
+    }
+
+    fn supported_verify_schemes(&self) -> Vec<rustls::SignatureScheme> {
+        self.0.supported_schemes()
+    }
 }
 
 /// Build the Alt-Svc value that advertises the HTTP/3 UDP port.
@@ -126,6 +179,7 @@ impl AppState {
         certs: Arc<RwLock<Arc<CertStore>>>,
         logs: mpsc::Sender<AccessEvent>,
         upstream_ca_file: Option<&Path>,
+        insecure_upstream_tls: bool,
         limits: StateLimits,
     ) -> anyhow::Result<Self> {
         let StateLimits {
@@ -137,7 +191,7 @@ impl AppState {
             rate_limit,
         } = limits;
         let tls_acceptor = crate::tls::acceptor(certs.clone())?;
-        let upstream_tls = upstream_tls_config(upstream_ca_file)?;
+        let upstream_tls = upstream_tls_config(upstream_ca_file, insecure_upstream_tls)?;
         let connector = upstream_connector(upstream_tls.clone());
         let client: UpstreamClient =
             Client::builder(hyper_util::rt::TokioExecutor::new()).build(connector.clone());

@@ -30,14 +30,13 @@ const submitting = ref(false)
 const formError = ref('')
 const formSuccess = ref('')
 
-const providerOptions = computed(() => [
-  { value: '', label: t('certs.dnsProviderEnv') },
-  ...providers.value.map((provider) => ({
+const providerOptions = computed(() =>
+  providers.value.map((provider) => ({
     value: provider.id,
     label: provider.name || provider.domains.join(', ') || provider.id,
     hint: provider.domains.join(', '),
   })),
-])
+)
 
 function providerLabel(item: Certificate): string {
   const provider = providers.value.find((value) => value.id === item.dns_provider_id)
@@ -94,6 +93,8 @@ function resetForm(): void {
 
 function openForm(): void {
   resetForm()
+  const firstProvider = providers.value[0]
+  if (providers.value.length === 1 && firstProvider) dnsProviderId.value = firstProvider.id
   showForm.value = true
 }
 
@@ -120,6 +121,9 @@ async function submit(): Promise<void> {
     if (mode.value === 'auto') {
       if (hostnames.length === 0) {
         throw new Error(t('certs.hostsRequired'))
+      }
+      if (!dnsProviderId.value) {
+        throw new Error(t('certs.providerRequired'))
       }
       await api.issueCertificate({
         name: name.value.trim() || undefined,

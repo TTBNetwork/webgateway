@@ -1,5 +1,5 @@
 <script setup lang="ts">
-import { computed, ref } from 'vue'
+import { computed, ref, watch } from 'vue'
 import AppIcon from '../components/AppIcon.vue'
 import CertificatesView from '../views/CertificatesView.vue'
 import DashboardView from '../views/DashboardView.vue'
@@ -19,37 +19,41 @@ import { clearSession, session } from '../session'
 interface NavItem {
   path: string
   key: MessageKey
-  icon: string
 }
 
 interface NavGroup {
   key: MessageKey
+  icon: string
   items: NavItem[]
 }
 
-const allGroups: NavGroup[] = [
+const menuGroups: NavGroup[] = [
   {
     key: 'nav.groupOverview',
-    items: [{ path: '/', key: 'nav.dashboard', icon: 'dashboard' }],
+    icon: 'dashboard',
+    items: [{ path: '/', key: 'nav.dashboard' }],
   },
   {
     key: 'nav.groupTraffic',
+    icon: 'websites',
     items: [
-      { path: '/websites', key: 'nav.websites', icon: 'websites' },
-      { path: '/certificates', key: 'nav.certificates', icon: 'certificates' },
-      { path: '/dns', key: 'nav.dns', icon: 'dns' },
-      { path: '/logs', key: 'nav.logs', icon: 'logs' },
+      { path: '/websites', key: 'nav.websites' },
+      { path: '/certificates', key: 'nav.certificates' },
+      { path: '/dns', key: 'nav.dns' },
+      { path: '/logs', key: 'nav.logs' },
     ],
   },
   {
     key: 'nav.groupInfra',
-    items: [{ path: '/gateways', key: 'nav.gateways', icon: 'gateways' }],
+    icon: 'gateways',
+    items: [{ path: '/gateways', key: 'nav.gateways' }],
   },
   {
     key: 'nav.groupSystem',
+    icon: 'settings',
     items: [
-      { path: '/users', key: 'nav.users', icon: 'users' },
-      { path: '/settings', key: 'nav.settings', icon: 'settings' },
+      { path: '/users', key: 'nav.users' },
+      { path: '/settings', key: 'nav.settings' },
     ],
   },
 ]
@@ -68,7 +72,7 @@ const views = {
 const menuOpen = ref(false)
 const isAdmin = computed(() => ['admin', 'service'].includes(session.user?.role ?? ''))
 const groups = computed<NavGroup[]>(() =>
-  allGroups
+  menuGroups
     .map((group) => ({
       ...group,
       items: group.items.filter((item) => item.path !== '/users' || isAdmin.value),
@@ -79,9 +83,39 @@ const navigation = computed(() => groups.value.flatMap((group) => group.items))
 const current = computed(() => navigation.value.find((item) => item.path === route.path))
 const title = computed(() => (current.value ? t(current.value.key) : t('notFound.title')))
 const activeView = computed(() => views[route.path as keyof typeof views] ?? NotFoundView)
+const activeGroup = computed(
+  () => groups.value.find((group) => group.items.some((item) => item.path === route.path))?.key,
+)
+const openMenu = ref<MessageKey | null>(null)
+
+watch(
+  activeGroup,
+  (key) => {
+    if (key && groups.value.find((group) => group.key === key)?.items.length === 1) {
+      openMenu.value = null
+    } else if (key) {
+      openMenu.value = key
+    }
+  },
+  { immediate: true },
+)
+
+function groupForPath(path: string): NavGroup | undefined {
+  return groups.value.find((group) => group.items.some((item) => item.path === path))
+}
+
+function firstItem(group: NavGroup): NavItem {
+  return group.items[0] as NavItem
+}
+
+function toggleGroup(key: MessageKey): void {
+  openMenu.value = openMenu.value === key ? null : key
+}
 
 function go(path: string): void {
   menuOpen.value = false
+  const group = groupForPath(path)
+  if (group && group.items.length > 1) openMenu.value = group.key
   navigate(path)
 }
 
@@ -116,20 +150,45 @@ async function logout(): Promise<void> {
       </button>
 
       <nav class="nav" aria-label="Main navigation">
-        <div v-for="group in groups" :key="group.key" class="nav-group">
-          <p class="nav-group-label">{{ t(group.key) }}</p>
+        <div v-for="group in groups" :key="group.key" class="nav-block">
           <button
-            v-for="item in group.items"
-            :key="item.path"
+            v-if="group.items.length === 1"
             type="button"
             class="nav-item"
-            :class="{ active: route.path === item.path }"
-            :aria-current="route.path === item.path ? 'page' : undefined"
-            @click="go(item.path)"
+            :class="{ active: route.path === firstItem(group).path }"
+            :aria-current="route.path === firstItem(group).path ? 'page' : undefined"
+            @click="go(firstItem(group).path)"
           >
-            <AppIcon :name="item.icon" :size="19" />
-            <span>{{ t(item.key) }}</span>
+            <AppIcon :name="group.icon" :size="19" />
+            <span>{{ t(group.key) }}</span>
           </button>
+
+          <template v-else>
+            <button
+              type="button"
+              class="nav-item nav-parent"
+              :class="{ active: group.items.some((item) => item.path === route.path) }"
+              :aria-expanded="openMenu === group.key"
+              @click="toggleGroup(group.key)"
+            >
+              <AppIcon :name="group.icon" :size="19" />
+              <span>{{ t(group.key) }}</span>
+              <AppIcon class="nav-caret" name="chevron" :size="14" />
+            </button>
+            <div v-if="openMenu === group.key" class="nav-sub">
+              <button
+                v-for="item in group.items"
+                :key="item.path"
+                type="button"
+                class="nav-item nav-subitem"
+                :class="{ active: route.path === item.path }"
+                :aria-current="route.path === item.path ? 'page' : undefined"
+                @click="go(item.path)"
+              >
+                <span>{{ t(item.key) }}</span>
+              </button>
+            </div>
+          </template>
         </div>
       </nav>
 
