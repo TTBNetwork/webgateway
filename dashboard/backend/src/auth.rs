@@ -88,14 +88,14 @@ pub async fn ensure_default_admin(database: &Database) -> anyhow::Result<()> {
 
     let username = env::var("DASHBOARD_ADMIN_USERNAME").unwrap_or_else(|_| "admin".to_string());
     let totp_secret = match env::var("DASHBOARD_ADMIN_TOTP_SECRET") {
-        Ok(secret) => {
+        Ok(secret) if !secret.trim().is_empty() => {
             let secret = secret.trim().to_ascii_uppercase();
             if build_totp(&secret).is_none() {
                 bail!("DASHBOARD_ADMIN_TOTP_SECRET is not valid base32");
             }
             secret
         }
-        Err(_) => {
+        _ => {
             let mut bytes = [0u8; 20];
             getrandom::fill(&mut bytes)
                 .map_err(|error| anyhow::anyhow!("randomness failed: {error}"))?;

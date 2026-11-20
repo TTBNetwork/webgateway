@@ -3,6 +3,7 @@
 .agents
 .tools
 .secrets
+.env
 target
 old_project
 postgresql-dockerfile
