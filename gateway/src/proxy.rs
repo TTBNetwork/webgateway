@@ -1,6 +1,11 @@
 //! HTTP reverse proxy.
 
-use std::{convert::Infallible, net::SocketAddr, sync::Arc, time::Duration};
+use std::{
+    convert::Infallible,
+    net::{IpAddr, SocketAddr},
+    sync::Arc,
+    time::Duration,
+};
 
 use anyhow::Context;
 use bytes::Bytes;
@@ -26,6 +31,8 @@ pub struct BufferedRequest {
     pub body: Bytes,
     pub peer: SocketAddr,
 }
+
+const RATE_LIMIT_BODY: &str = "Too Many Requests";
 
 const HOP_BY_HOP: &[&str] = &[
     "connection",
@@ -99,6 +106,10 @@ pub async fn handle(
         .resolve(peer, proxy_source, request.headers());
     request_log.remote_addr = client_ip.to_string();
     request_log.website_id = Some(site.id.clone());
+
+    if let Some(response) = rate_limit_response(&state, &request_log, client_ip, request_version) {
+        return response;
+    }
 
     if let Some(length) = request
         .headers()
@@ -431,6 +442,10 @@ pub async fn handle_buffered(
     request_log.remote_addr = client_ip.to_string();
     request_log.website_id = Some(site.id.clone());
 
+    if let Some(response) = buffered_rate_limit_response(&state, &request_log, client_ip, version) {
+        return response;
+    }
+
     let context = MatchContext {
         path: &path,
         query: query.as_deref(),
@@ -594,7 +609,15 @@ fn buffered_error(
         Some(message.len() as u64),
         version,
     );
+    buffered_text_response(state, status, message, version)
+}
 
+fn buffered_text_response(
+    state: &AppState,
+    status: StatusCode,
+    message: &'static str,
+    version: Version,
+) -> Response<Bytes> {
     let mut response = Response::new(Bytes::from_static(message.as_bytes()));
     *response.status_mut() = status;
     *response.version_mut() = version;
@@ -825,6 +848,80 @@ fn remove_hop_by_hop(headers: &mut HeaderMap) {
     for name in HOP_BY_HOP {
         headers.remove(*name);
     }
+}
+
+/// Shared decision + access log for a rejected request. Returns the number of
+/// seconds to advertise in Retry-After, or None when the request may proceed.
+fn rate_limit_decision(
+    state: &AppState,
+    request_log: &crate::access::RequestLog,
+    client_ip: IpAddr,
+    version: Version,
+) -> Option<u64> {
+    let decision = state.rate_limiter.check(client_ip)?;
+    if decision.allowed {
+        return None;
+    }
+    crate::metrics::record_rate_limited();
+    event!(
+        Level::DEBUG,
+        client = %client_ip,
+        retry_after_secs = decision.retry_after_secs,
+        "request rate limited"
+    );
+    let mut extra = HeaderMap::new();
+    if let Ok(value) = HeaderValue::from_str(&decision.retry_after_secs.to_string()) {
+        extra.insert(header::RETRY_AFTER, value);
+    }
+    log_event(
+        state,
+        request_log,
+        StatusCode::TOO_MANY_REQUESTS,
+        &extra,
+        Some(RATE_LIMIT_BODY.len() as u64),
+        version,
+    );
+    Some(decision.retry_after_secs)
+}
+
+fn retry_after_header(seconds: u64) -> Option<HeaderValue> {
+    HeaderValue::from_str(&seconds.to_string()).ok()
+}
+
+/// Reject a request with 429 when the per-client-IP token bucket is empty.
+/// Returns None when the request may proceed (including when limiting is off).
+pub(crate) fn rate_limit_response(
+    state: &AppState,
+    request_log: &crate::access::RequestLog,
+    client_ip: IpAddr,
+    version: Version,
+) -> Option<Response<ProxyBody>> {
+    let retry_after = rate_limit_decision(state, request_log, client_ip, version)?;
+    let mut response = text_response(StatusCode::TOO_MANY_REQUESTS, RATE_LIMIT_BODY, state);
+    if let Some(value) = retry_after_header(retry_after) {
+        response.headers_mut().insert(header::RETRY_AFTER, value);
+    }
+    Some(response)
+}
+
+/// HTTP/3 variant: the buffered path returns a byte body instead of a stream.
+fn buffered_rate_limit_response(
+    state: &AppState,
+    request_log: &crate::access::RequestLog,
+    client_ip: IpAddr,
+    version: Version,
+) -> Option<Response<Bytes>> {
+    let retry_after = rate_limit_decision(state, request_log, client_ip, version)?;
+    let mut response = buffered_text_response(
+        state,
+        StatusCode::TOO_MANY_REQUESTS,
+        RATE_LIMIT_BODY,
+        version,
+    );
+    if let Some(value) = retry_after_header(retry_after) {
+        response.headers_mut().insert(header::RETRY_AFTER, value);
+    }
+    Some(response)
 }
 
 pub(crate) fn text_response(

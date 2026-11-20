@@ -86,6 +86,10 @@ pub async fn handle_websocket(
     request_log.remote_addr = client_ip.to_string();
     request_log.website_id = Some(site.id.clone());
 
+    if let Some(response) = proxy::rate_limit_response(&state, &request_log, client_ip, version) {
+        return response;
+    }
+
     let context = MatchContext {
         path: &path,
         query: query.as_deref(),
@@ -339,6 +343,12 @@ pub async fn handle_connect(
         .resolve(peer, proxy_source, request.headers());
     request_log.remote_addr = client_ip.to_string();
     request_log.website_id = Some(site.id.clone());
+
+    if let Some(response) =
+        proxy::rate_limit_response(&state, &request_log, client_ip, request.version())
+    {
+        return response;
+    }
 
     let client_upgrade = hyper::upgrade::on(&mut request);
 

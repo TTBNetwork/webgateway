@@ -49,6 +49,13 @@ max_response_body_bytes = 67108864
 # CONNECT 目标端口白名单；空列表表示全部拒绝
 connect_ports = [443, 80]
 
+# 每客户端 IP 限流（令牌桶），默认关闭
+[server.rate_limit]
+enabled = true
+requests_per_second = 20.0
+burst = 40
+max_tracked_ips = 100000
+
 [upstream_tls]
 # 额外的 PEM CA，用于 https 后端；webpki 根证书始终受信
 # ca_file = "/etc/webgateway/upstream-ca.pem"
@@ -70,6 +77,9 @@ connect_ports = [443, 80]
 | `GATEWAY_CONNECT_PORTS` | 逗号分隔的 CONNECT 目标端口白名单 |
 | `GATEWAY_METRICS_PORT` | Prometheus 指标监听端口（默认关闭） |
 | `GATEWAY_METRICS_BIND` | 指标监听地址（默认 `127.0.0.1`） |
+| `GATEWAY_RATE_LIMIT_RPS` | 每客户端 IP 每秒请求数；>0 时自动启用限流 |
+| `GATEWAY_RATE_LIMIT_BURST` | 令牌桶容量（默认 `ceil(rps)`） |
+| `GATEWAY_RATE_LIMIT_MAX_TRACKED` | 跟踪的客户端 IP 上限（默认 100000） |
 
 ### 2.1 资源限制
 
@@ -99,6 +109,20 @@ connect_ports = [443, 80]
   - 配置：`config_sync_success_total`、`config_sync_failures_total`、`route_hosts`、`certificate_hosts`；
   - 构建信息：`webgateway_info{machine_id,node,version}`。
 - 计数器为进程内 AtomicU64，重启归零；抓取与告警示例见 `deployment.md` 第 11 节。
+
+### 2.3 每 IP 限流
+
+- `[server.rate_limit]`（`GATEWAY_RATE_LIMIT_RPS` / `_BURST` / `_MAX_TRACKED`）启用后，
+  按**客户端 IP**做令牌桶限流：速率 `requests_per_second`，桶容量 `burst`（0 表示 `ceil(rps)`）。
+- 客户端 IP 使用站点 `client_ip` 配置解析（raw / proxyProtocol / xForwardedFor / xRealIP），
+  与访问日志的 `remote_addr` 一致；限流在站点命中后、缓存/上游之前执行。
+- 超限返回 **429 Too Many Requests** 与 `Retry-After: <秒>`，并写访问日志（status=429）；
+  HTTP/1.1、HTTP/2、HTTP/3、WebSocket 与 CONNECT 共用同一套桶。
+- 状态保存在进程内 16 个分片（`Mutex<HashMap<IpAddr, Bucket>>`），跟踪表中过期条目
+  （>60s 未访问）在表满时清理；表满且都是活跃客户端时**放行**（fail-open），避免误伤全部流量。
+- 指标：`webgateway_rate_limited_total`、`webgateway_rate_limit_tracked_ips`。
+- 限流是**单节点**的：多节点部署时每个节点独立计数；如需全局配额需在边缘之外实现。
+  另外限流配置变更需重启 gateway（不在 NOTIFY 同步范围内）。
 
 ## 3. 路由
 

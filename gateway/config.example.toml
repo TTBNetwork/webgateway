@@ -40,6 +40,14 @@ ports = [80, 443]
 # metrics_port = 9102
 # metrics_bind = "127.0.0.1"
 
+# Per-client-IP token bucket. Disabled by default; setting
+# GATEWAY_RATE_LIMIT_RPS enables it without a config file.
+# [server.rate_limit]
+# enabled = true
+# requests_per_second = 20.0
+# burst = 40
+# max_tracked_ips = 100000
+
 [upstream_tls]
 # Extra PEM CA certificates for https backends (webpki roots are always trusted).
 # ca_file = "/etc/webgateway/upstream-ca.pem"

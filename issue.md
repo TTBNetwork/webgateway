@@ -70,6 +70,7 @@
 | F-54 | 生产部署基础 | ✅ | dashboard 静态托管 + SPA 回退（`DASHBOARD_STATIC_DIR`）、路径穿越防护与资源缓存策略、SIGTERM/Ctrl-C 优雅停机（30s）、`deployment.md` 部署指南 |
 | F-55 | 密钥静态加密 | ✅ | AES-256-GCM + `enc:v1:` 前缀；`SECRET_ENCRYPTION_KEY`/`_PREVIOUS`；覆盖 TOTP/JWT/客户端 secret、证书私钥、ACME account key、DNS 凭据；启动幂等加密存量明文；gateway 读取时解密 |
 | F-56 | Prometheus 指标 | ✅ | dashboard/gateway 独立回环 `/metrics`：请求、h3/WS/CONNECT、缓存命中/eviction/占用、连接/在途、访问日志丢弃与队列、配置同步、证书/路由数、统计水位、登录/API 错误；deployment.md 含抓取与告警示例 |
+| F-57 | 每 IP 限流 | ✅ | 令牌桶（rps + burst，16 分片、全局 IP 上限、过期清理、满表 fail-open）；按站点 client_ip 解析客户端 IP；HTTP/1/2/3/WS/CONNECT 统一；429 + Retry-After + 访问日志；指标 `rate_limited_total`/`rate_limit_tracked_ips` |
 
 ### 1.5 测试
 
@@ -124,7 +125,7 @@
 - U-02 JWT refresh token / 短期令牌、每用户 API Key 管理（用户管理、RBAC、撤销已完成）
 - U-05 审计日志、操作记录、配置回滚
 - U-06 IP / User-Agent 拦截（按用户要求暂缓）
-- U-07 限流、WAF、CC 防护
+- U-07 限流（每 IP 令牌桶已实现）；WAF/CC/UA 规则与全局配额未实现
 - U-08 请求体/头大小限制、连接数限制
 - U-09 上游 mTLS、客户端证书
 - U-10 面板安全头（API/health 已实现；面板静态 HTML 仍由托管层配置）
@@ -344,13 +345,13 @@
 
 ## 5. 当前状态
 
-- 最新分支：feat/observability（叠加在 feat/production-deploy 之后）
-- 测试：网关 39、dashboard 25、shared 18 + 3 集成（含 crypto、stats 回填/分区回收）；前端 format/lint/type-check/build 通过
+- 最新分支：feat/rate-limit（叠加在 feat/observability 之后）
+- 测试：网关 45、dashboard 25、shared 18 + 3 集成（含 crypto、stats 回填/分区回收）；前端 format/lint/type-check/build 通过
 - 数据库：schema v6；2026-11-20 联调/统计/证书/CRUD/可靠性/资源上限/CONNECT/会话安全验证的临时数据已清理（websites/gateways/users/logs/stats = 0；测试证书已删除）
 - 管理面：站点/网关/用户 CRUD + admin/user/view RBAC + token_version 撤销；面板站点/用户编辑页完成；
   会话改为 HttpOnly Cookie + 安全响应头，服务令牌可多值轮换，内部错误统一脱敏；
   dashboard 可直接托管面板（SIGTERM 30s drain），控制面 secret 支持 AES-256-GCM 静态加密；
-  dashboard/gateway 提供 Prometheus `/metrics`（默认回环）
+  dashboard/gateway 提供 Prometheus `/metrics`（默认回环）；gateway 支持每 IP 令牌桶限流
 - 证书：手动上传 + ACME（Let's Encrypt 实测签发；ZeroSSL 需 EAB）→ 网关 SNI 加载验证通过，见 `certificates.md`
 - 实时协议：Nezha gRPC（h2c/TLS/双向流）与 MCSManager WS（101/鉴权/长连接）已用真实软件验证，见 `e2e-realtime.md`
 - 面板：TOTP + JWT 登录；默认缓存 16 MiB（可配）；Vite 代理 /api → 127.0.0.1:3000
@@ -362,5 +363,5 @@
    ~~B-31/P-13（密钥静态加密）~~ ✅（剩 refresh token / 每用户 API Key / 服务令牌过期 / 自动重加密）
 3. ~~B-03~~ ✅ / ~~B-05~~ ✅ / ~~B-06~~ ✅ / ~~B-11~~ ✅ / ~~B-07~~ ✅ / ~~B-12~~ ✅ / B-04：h3 限制（body 上限已完成，仍缺缓存/流式）
 4. U-11/U-13：h3 流式/Alt-Svc、h2 extended CONNECT
-5. ~~U-19 metrics~~ ✅；U-17/U-23：上游健康检查、缓存持久化/single-flight
+5. ~~U-19 metrics~~ ✅；~~U-07 每 IP 限流~~ ✅（WAF/CC 未做）；U-17/U-23：上游健康检查、缓存持久化/single-flight
 6. B-21：合并分支、清理 PR 栈

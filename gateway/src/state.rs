@@ -26,6 +26,7 @@ use url::Url;
 use crate::access::AccessEvent;
 use crate::cache::{Cache, CacheConfig};
 use crate::node::NodeInfo;
+use crate::ratelimit::{RateLimitConfig, RateLimiter};
 
 pub type UpstreamConnector = HttpsConnector<HttpConnector>;
 pub type BoxError = Box<dyn std::error::Error + Send + Sync>;
@@ -89,6 +90,7 @@ pub struct StateLimits {
     pub max_response_body_bytes: u64,
     pub connect_ports: Vec<u16>,
     pub h3_port: Option<u16>,
+    pub rate_limit: RateLimitConfig,
 }
 
 pub struct AppState {
@@ -111,6 +113,8 @@ pub struct AppState {
     pub connect_ports: Arc<[u16]>,
     /// Alt-Svc header advertised on TLS responses when HTTP/3 is enabled.
     pub alt_svc: Option<HeaderValue>,
+    /// Per-client-IP rate limiter (disabled by default).
+    pub rate_limiter: RateLimiter,
 }
 
 impl AppState {
@@ -127,6 +131,7 @@ impl AppState {
             max_response_body_bytes,
             connect_ports,
             h3_port,
+            rate_limit,
         } = limits;
         let tls_acceptor = crate::tls::acceptor(certs.clone())?;
         let upstream_tls = upstream_tls_config(upstream_ca_file)?;
@@ -152,6 +157,7 @@ impl AppState {
             buffered_client,
             websocket_tls: Arc::new(websocket_tls),
             cache: Cache::new(cache_max_size_bytes),
+            rate_limiter: RateLimiter::new(rate_limit),
             logs,
             node,
             max_request_body_bytes,

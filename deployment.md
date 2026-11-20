@@ -216,6 +216,9 @@ HTTP/TCP、flush 访问日志并标记 offline（HTTP/3 在途请求尚未 drain
 | `GATEWAY_UPSTREAM_CA_FILE` | 额外信任的上游 CA PEM |
 | `GATEWAY_METRICS_PORT` | Prometheus 指标端口；不设则不启用 |
 | `GATEWAY_METRICS_BIND` | 指标监听地址，默认 `127.0.0.1` |
+| `GATEWAY_RATE_LIMIT_RPS` | 每客户端 IP 每秒请求数；>0 时启用限流 |
+| `GATEWAY_RATE_LIMIT_BURST` | 令牌桶容量，默认 `ceil(rps)` |
+| `GATEWAY_RATE_LIMIT_MAX_TRACKED` | 跟踪的客户端 IP 上限，默认 100000 |
 | `SECRET_ENCRYPTION_KEY` | 与 dashboard 相同的密钥；读取已加密的证书私钥时必须设置 |
 | `SECRET_ENCRYPTION_KEY_PREVIOUS` | 轮换期间用于解密旧密文 |
 | `RUST_LOG` | 建议 `gateway=info,shared=info` |
@@ -245,7 +248,7 @@ HTTP/TCP、flush 访问日志并标记 offline（HTTP/3 在途请求尚未 drain
 | P1 | HTTP/3 全缓冲 | 大响应占内存、无缓存、停机不 drain（B-04/P-01） |
 | P1 | 缓存正确性 | 无 `Vary`/single-flight/HEAD/If-None-Match: *（B-09） |
 | P1 | 无上游健康检查 | priority 是静态备用组，失败不会自动摘除（P-10/U-17） |
-| P1 | 无限流/WAF | 无按 IP 的连接/请求限速（U-07） |
+| P1 | 无 WAF/CC 规则 | 已有每客户端 IP 令牌桶限流（429 + Retry-After）；无 WAF/CC 规则与全局配额（U-07 部分修复） |
 | P2 | 统计偏差 | `total_ips` 跨秒重复、保留期硬编码、面板按 UTC 日（B-08/B-14） |
 | P2 | 登录限流单实例 | 进程内计数，多实例不共享（B-29） |
 | P2 | CI 无 DB E2E | shared 集成测试在 CI 中跳过；h3/WS/gRPC 仅本地验证（U-31/B-22） |
@@ -262,6 +265,8 @@ HTTP/TCP、flush 访问日志并标记 offline（HTTP/3 在途请求尚未 drain
 - 缓存：任意配置/证书 NOTIFY 会清空节点缓存，属预期行为。
 - 升级：先 dashboard 后 gateway；gateway 滚动重启会 drain 10s，h3 连接直接断开。
 - 指标：dashboard 与 gateway 各自在独立回环端口暴露 `/metrics`，见第 11 节。
+- 限流：`GATEWAY_RATE_LIMIT_RPS` 启用每客户端 IP 令牌桶；超限返回 429 + `Retry-After`，
+  计数见 `webgateway_rate_limited_total`。单节点计数，多节点需在边缘外做全局配额。
 ## 11. 监控与告警
 
 两个进程都暴露 Prometheus 文本指标。指标监听默认只绑定回环地址，不经过公网 listener：

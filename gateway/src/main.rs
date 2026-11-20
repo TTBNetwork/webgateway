@@ -13,6 +13,7 @@ mod node;
 mod notify;
 mod proxy;
 mod proxy_protocol;
+mod ratelimit;
 mod state;
 mod sync;
 mod tls;
@@ -90,6 +91,7 @@ async fn run() -> anyhow::Result<()> {
             max_response_body_bytes: config.server.max_response_body_bytes,
             connect_ports: config.server.connect_ports.clone(),
             h3_port: config.server.http3_ports.first().copied(),
+            rate_limit: config.server.rate_limit.clone(),
         },
     )?);
 

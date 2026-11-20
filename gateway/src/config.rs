@@ -6,6 +6,8 @@ use anyhow::{Context, bail};
 use serde::Deserialize;
 use shared::database::DatabaseConfig;
 
+use crate::ratelimit::RateLimitConfig;
+
 #[derive(Debug, Clone, Default, Deserialize)]
 #[serde(default)]
 pub struct Config {
@@ -54,6 +56,8 @@ pub struct ServerConfig {
     pub metrics_port: Option<u16>,
     /// Bind address for the metrics listener (loopback by default).
     pub metrics_bind: String,
+    /// Per-client-IP token bucket; disabled unless configured.
+    pub rate_limit: RateLimitConfig,
 }
 
 impl Default for ServerConfig {
@@ -70,6 +74,7 @@ impl Default for ServerConfig {
             connect_ports: vec![443, 80],
             metrics_port: None,
             metrics_bind: "127.0.0.1".to_string(),
+            rate_limit: RateLimitConfig::default(),
         }
     }
 }
@@ -98,6 +103,27 @@ impl Config {
                 .with_context(|| "GATEWAY_METRICS_PORT is not a valid port")?;
             config.server.metrics_port = Some(port);
         }
+        if let Ok(raw) = std::env::var("GATEWAY_RATE_LIMIT_RPS") {
+            let requests_per_second: f64 = raw
+                .trim()
+                .parse()
+                .with_context(|| "GATEWAY_RATE_LIMIT_RPS is not a number")?;
+            config.server.rate_limit.requests_per_second = requests_per_second;
+            config.server.rate_limit.enabled = requests_per_second > 0.0;
+        }
+        if let Ok(raw) = std::env::var("GATEWAY_RATE_LIMIT_BURST") {
+            config.server.rate_limit.burst = raw
+                .trim()
+                .parse()
+                .with_context(|| "GATEWAY_RATE_LIMIT_BURST is not a number")?;
+        }
+        if let Ok(raw) = std::env::var("GATEWAY_RATE_LIMIT_MAX_TRACKED") {
+            config.server.rate_limit.max_tracked_ips = raw
+                .trim()
+                .parse()
+                .with_context(|| "GATEWAY_RATE_LIMIT_MAX_TRACKED is not a number")?;
+        }
+        config.server.rate_limit = config.server.rate_limit.clone().sanitized()?;
 
         if let Ok(bind) = std::env::var("GATEWAY_BIND") {
             config.server.bind = bind;

@@ -42,6 +42,7 @@ static CONNECTIONS_ACTIVE: AtomicU64 = AtomicU64::new(0);
 static REQUESTS_IN_FLIGHT: AtomicU64 = AtomicU64::new(0);
 static SYNC_SUCCESS: AtomicU64 = AtomicU64::new(0);
 static SYNC_FAILURES: AtomicU64 = AtomicU64::new(0);
+static RATE_LIMITED: AtomicU64 = AtomicU64::new(0);
 
 fn bump(counter: &AtomicU64) {
     counter.fetch_add(1, Ordering::Relaxed);
@@ -69,6 +70,10 @@ pub fn record_sync_result(success: bool) {
     } else {
         bump(&SYNC_FAILURES);
     }
+}
+
+pub fn record_rate_limited() {
+    bump(&RATE_LIMITED);
 }
 
 pub fn cache_hit() {
@@ -155,6 +160,8 @@ pub(crate) struct Snapshot {
     access_queue_available: u64,
     sync_success: u64,
     sync_failures: u64,
+    rate_limited: u64,
+    rate_limit_tracked: u64,
     route_hosts: u64,
     certificate_hosts: u64,
 }
@@ -262,6 +269,11 @@ pub(crate) fn format_metrics(snapshot: &Snapshot) -> String {
         "webgateway_config_sync_failures_total",
         snapshot.sync_failures,
     );
+    counter(
+        &mut out,
+        "webgateway_rate_limited_total",
+        snapshot.rate_limited,
+    );
     gauge(&mut out, "webgateway_cache_entries", snapshot.cache_entries);
     gauge(&mut out, "webgateway_cache_bytes", snapshot.cache_bytes);
     gauge(
@@ -283,6 +295,11 @@ pub(crate) fn format_metrics(snapshot: &Snapshot) -> String {
         &mut out,
         "webgateway_access_log_queue_available",
         snapshot.access_queue_available,
+    );
+    gauge(
+        &mut out,
+        "webgateway_rate_limit_tracked_ips",
+        snapshot.rate_limit_tracked,
     );
     gauge(&mut out, "webgateway_route_hosts", snapshot.route_hosts);
     gauge(
@@ -321,6 +338,8 @@ fn snapshot(state: &AppState) -> Snapshot {
         access_queue_available: state.logs.capacity() as u64,
         sync_success: SYNC_SUCCESS.load(Ordering::Relaxed),
         sync_failures: SYNC_FAILURES.load(Ordering::Relaxed),
+        rate_limited: RATE_LIMITED.load(Ordering::Relaxed),
+        rate_limit_tracked: state.rate_limiter.tracked_ips() as u64,
         route_hosts: state
             .routing
             .read()
@@ -411,6 +430,8 @@ mod tests {
             access_queue_available: 255,
             sync_success: 9,
             sync_failures: 2,
+            rate_limited: 4,
+            rate_limit_tracked: 8,
             route_hosts: 6,
             certificate_hosts: 4,
         }
@@ -423,6 +444,8 @@ mod tests {
         assert!(text.contains("webgateway_cache_hits_total 3\n"));
         assert!(text.contains("webgateway_cache_bytes 42\n"));
         assert!(text.contains("webgateway_access_log_failed_batches_total 1\n"));
+        assert!(text.contains("webgateway_rate_limited_total 4\n"));
+        assert!(text.contains("webgateway_rate_limit_tracked_ips 8\n"));
         assert!(text.contains("webgateway_route_hosts 6\n"));
         assert!(text.contains(
             "webgateway_info{machine_id=\"abc-123\",node=\"CN-Shanghai\",version=\"0.1.0\"} 1"

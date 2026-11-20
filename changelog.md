@@ -385,3 +385,25 @@
 - 测试：gateway 39（+2）、dashboard 25（+2）；fmt/clippy 通过。
 - 文档：`deployment.md` 环境变量/限制/监控章节、`gateway.md` 2.2、两个 `config.example.toml`、
   `issue.md` B-25/P-12/U-19、F-56。
+
+### 每客户端 IP 限流（分支 `feat/rate-limit`）
+- 新增 `gateway/src/ratelimit.rs`：令牌桶限流，配置 `[server.rate_limit]`
+  （`enabled` / `requests_per_second` / `burst` / `max_tracked_ips`），
+  环境变量 `GATEWAY_RATE_LIMIT_RPS`（>0 自动启用）、`_BURST`、`_MAX_TRACKED`。
+- 客户端 IP 使用站点 `client_ip` 配置解析（raw / proxyProtocol / xForwardedFor / xRealIP），
+  与访问日志 `remote_addr` 一致；在站点命中后、缓存/上游之前执行。
+- HTTP/1.1、HTTP/2、HTTP/3、WebSocket、CONNECT 全部接入；超限返回 **429** +
+  `Retry-After: <秒>`，并写访问日志（status=429）。
+- 状态：16 个分片 `Mutex<HashMap<IpAddr, Bucket>>`，全局 tracked 计数；表满时先清理
+  >60s 未访问条目，仍满则放行（fail-open），避免误伤全部流量。`burst=0` 默认 `ceil(rps)`，
+  `max_tracked_ips` 下限 1024；非法配置启动失败。
+- 指标：新增 `webgateway_rate_limited_total`、`webgateway_rate_limit_tracked_ips`。
+- 实测（GATEWAY_RATE_LIMIT_RPS=1、BURST=2）：
+  - 同一 IP 连续 4 次 → 200/200/429/429，429 带 `Retry-After: 1`；
+  - 换源 IP（127.0.0.2）→ 200，说明桶按 IP 隔离；
+  - 指标 `rate_limited_total 3`、`tracked_ips 2`，访问日志出现 status=429。
+- 测试：gateway 39 → 45（限流 6 个单测：burst/refill、IP 隔离、全局跟踪、过期清理、配置校验）；
+  fmt/clippy 通过。
+- 限制：单节点计数，多节点需在边缘外做全局配额；限流配置不支持 NOTIFY 热更新。
+- 文档：`gateway.md` 2.3 与配置/环境变量、`deployment.md`、`config.example.toml`、
+  `issue.md` U-07/F-57。
