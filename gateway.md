@@ -236,7 +236,7 @@ max_tracked_ips = 100000
   headers 中包含总字节、上行/下行字节和 `x-webgateway-tunnel-duration-ms`；该行 body_length 为空，
   不污染 HTTP body 流量统计。
 - gRPC 响应的 `grpc-status` / `grpc-message` trailer 会合并进响应的访问日志 headers。
-- 仍未记录：重复请求头会被 JSON 对象覆盖。
+- 重复请求头不再被覆盖：同一 header 名多次出现时，JSON 值保存为数组。
 - 网关自己生成的 404/502/504 也会记录（body_length 为固定错误文本长度）。
 - 后台 writer 关闭时先 drain 队列再 flush；统计聚合由主控 stats 任务负责（见 database.md 5.4）；
   原始日志保留 7 天。
@@ -311,7 +311,8 @@ max_tracked_ips = 100000
 - HEAD 不写入缓存，但会从缓存的 GET 响应返回：保留（GET 的）`Content-Length` 等响应头、无 body；
   HEAD + `If-None-Match` 同样可返回 304。
 - 配置同步（NOTIFY）时清空缓存。
-- 限制：不缓存 POST、不支持 `stale-while-revalidate`/single-flight、无持久化/多级缓存；
+- 同一 cache key 的并发 miss 会合并：一个请求负责回源填充，其余等待后重查缓存（最多 5s）。
+- 限制：不缓存 POST、不支持 `stale-while-revalidate`、无持久化/多级缓存；
   `If-Modified-Since` 已支持（无 `If-None-Match` 时按缓存响应的 `Last-Modified` 返回 304）。
 
 ### 5.5 上游健康检查

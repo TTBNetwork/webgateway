@@ -266,7 +266,7 @@ HTTP/TCP 与 HTTP/3 请求、flush 访问日志并标记 offline。
 | P2 | 健康状态为单节点 | 站点级主动探测 + 被动失败标记已实现；无跨节点健康状态、无熔断/半开（P-10/U-17 部分修复） |
 | P3 | WAF/CC 暂缓 | 已有每客户端 IP 令牌桶限流（429 + Retry-After）；WAF/CC/UA 规则按用户要求暂缓，全局配额未实现 |
 | P2 | HTTP/3 请求体仍缓冲 | 响应已流式、已参与停机 drain；请求体仍整体缓冲（上限 max_request_body_bytes），h3 无缓存（B-04/P-01 部分修复） |
-| P2 | 缓存增强 | `Vary`/HEAD/`If-None-Match`/`If-Modified-Since` 已支持；无 single-flight、stale-while-revalidate、持久化（B-09 部分修复） |
+| P2 | 缓存增强 | `Vary`/HEAD/`If-None-Match`/`If-Modified-Since`/并发 miss 合并已支持；无 stale-while-revalidate、持久化（B-09 部分修复） |
 | P2 | 登录限流单实例 | 进程内计数，多实例不共享（B-29） |
 | P2 | CI 无 DB E2E | shared 集成测试在 CI 中跳过；h3/WS/gRPC 仅本地验证（U-31/B-22） |
 | P2 | 版本与分页 | 面板版本/schema 硬编码、列表无服务端分页（B-17/B-18） |

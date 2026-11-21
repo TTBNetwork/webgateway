@@ -117,7 +117,7 @@
 | P-02 | gRPC | 已在 Nezha 上验证；`grpc-status`/`grpc-message` trailer 已写入访问日志 headers；无 gRPC-Web |
 | P-03 | WebSocket | 握手后关闭时会追加带总/上行/下行字节与持续时间的关闭记录；无 mTLS / SNI 覆盖；wss 与后端 base path 已支持（2026-11-19） |
 | P-04 | CONNECT | 仅 h1；已修复 400/403 日志与端口白名单；无鉴权 / mTLS；无 HTTP/2 extended CONNECT |
-| P-05 | 缓存 | 仅 h1/h2；`Vary`/HEAD/`If-None-Match`/`If-Modified-Since` 已支持；仍无持久化/single-flight/stale-while-revalidate；配置同步清空全部 |
+| P-05 | 缓存 | 仅 h1/h2；`Vary`/HEAD/`If-None-Match`/`If-Modified-Since`/并发 miss 合并已支持；仍无持久化/stale-while-revalidate；配置同步清空全部 |
 | P-06 | 访问日志 | chunked 请求/响应按实际字节记录；WS/CONNECT 关闭行记录字节/时长；headers 重复键仍会被覆盖；已修复 writer 退出 flush |
 | P-07 | 统计 | 分钟/日 `total_ips` 已从原始日志去重；原始保留期可配（7..90 天）；sizes 仍依赖日志 Content-Length；边界分区仍逐行 DELETE |
 | P-08 | 上游 TLS | 只信 webpki + ca_file，不读系统 native roots；无 mTLS/SNI 覆盖 |
@@ -156,7 +156,7 @@
 - U-20 配置热加载（证书/CA 目前需重启或 NOTIFY）
 - U-21 统计保留期配置化（分区自动创建/删除已实现）
 - U-22 访问日志落盘/导出指标（已实现重试 3 次 + 丢弃计数，未落盘/未暴露 /metrics）
-- U-23 缓存持久化、多级缓存、single-flight、命中率
+- U-23 缓存持久化、多级缓存、命中率（single-flight 已实现）
 - U-24 OpenAPI / API 文档
 
 ### 3.4 前端
@@ -260,8 +260,9 @@
   `min(cache.max_entry_size, max_response_body_bytes)` 时收集；chunked 响应流式转发、不缓存。
 - 已修复（本轮）：`Vary` 变体缓存（`Vary: *` 不缓存）；HEAD 从缓存的 GET 返回
   （保留 Content-Length、无 body）；`If-None-Match` 对 GET/HEAD 返回 304。
-- 已修复：`If-Modified-Since`（无 If-None-Match 时按 Last-Modified 返回 304）。
-- 仍存在：任意配置/证书 NOTIFY 清空全部缓存；无 single-flight；不支持 stale-while-revalidate/持久化。
+- 已修复：`If-Modified-Since`（无 If-None-Match 时按 Last-Modified 返回 304）；
+  同一 cache key 的并发 miss 由单飞 leader 填充，follower 等待后重查。
+- 仍存在：任意配置/证书 NOTIFY 清空全部缓存；不支持 stale-while-revalidate/持久化。
 - 实测：gzip/br/无编码三个变体分别 MISS 并缓存各自 body，gzip 重复请求 HIT；
   HEAD 命中返回 HIT + Content-Length=8 且无 body；GET/HEAD + If-None-Match 均 304。
 - 位置：gateway/src/cache.rs、gateway/src/proxy.rs
@@ -405,10 +406,10 @@
    ~~B-04 h3 流式响应 + drain~~ ✅（剩 h3 缓存、请求体流式）
 4. U-11/U-13：h3 流式/Alt-Svc、h2 extended CONNECT
 5. ~~U-19 metrics~~ ✅；~~U-07 每 IP 限流~~ ✅（WAF/CC 未做）；~~U-17 站点级健康检查~~ ✅（熔断未做）；
-   U-23：缓存持久化/single-flight
+   U-23：缓存持久化（single-flight 已完成）
 6. ~~B-08/B-14 统计准确性 + 时区~~ ✅（sizes 精度仍为 CL 估算）；
 7. ~~B-21：合并分支、清理 PR 栈~~ ✅（master / v1 重整完成，feature 分支已删除）
-8. 剩余增强：B-30 refresh token / 每用户 API Key / 服务令牌过期；缓存 single-flight；
+8. 剩余增强：B-30 refresh token / 每用户 API Key / 服务令牌过期；缓存持久化/stale-while-revalidate；
    h3 缓存与请求体流式；WAF/CC（按用户要求暂缓）、跨节点健康状态/熔断；CI DB E2E；
    统计 sizes 精度（含 chunked 实际字节统计，v1 已实现——下一编码批次）
 ---

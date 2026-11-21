@@ -392,7 +392,24 @@ pub fn headers_json(headers: &HeaderMap) -> String {
             .to_str()
             .map(str::to_string)
             .unwrap_or_else(|_| String::from_utf8_lossy(value.as_bytes()).into_owned());
-        map.insert(name.as_str().to_string(), serde_json::Value::String(value));
+        match map.entry(name.as_str().to_string()) {
+            serde_json::map::Entry::Vacant(entry) => {
+                entry.insert(serde_json::Value::String(value));
+            }
+            serde_json::map::Entry::Occupied(mut entry) => match entry.get_mut() {
+                serde_json::Value::String(existing) => {
+                    let first = std::mem::take(existing);
+                    *entry.get_mut() = serde_json::Value::Array(vec![
+                        serde_json::Value::String(first),
+                        serde_json::Value::String(value),
+                    ]);
+                }
+                serde_json::Value::Array(values) => {
+                    values.push(serde_json::Value::String(value));
+                }
+                _ => {}
+            },
+        }
     }
     serde_json::Value::Object(map).to_string()
 }
@@ -443,6 +460,15 @@ mod tests {
         headers.insert("x-test", "value".parse().unwrap());
         let json = headers_json(&headers);
         assert!(json.contains("\"x-test\":\"value\""));
+    }
+
+    #[test]
+    fn duplicate_headers_are_preserved_as_an_array() {
+        let mut headers = HeaderMap::new();
+        headers.append("x-forwarded-for", "10.0.0.1".parse().unwrap());
+        headers.append("x-forwarded-for", "10.0.0.2".parse().unwrap());
+        let json = headers_json(&headers);
+        assert!(json.contains("[\"10.0.0.1\",\"10.0.0.2\"]"));
     }
 
     #[test]

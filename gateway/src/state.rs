@@ -6,7 +6,7 @@ use std::{
     net::{IpAddr, SocketAddr},
     path::{Path, PathBuf},
     sync::{
-        Arc, RwLock,
+        Arc, Mutex, RwLock,
         atomic::{AtomicUsize, Ordering},
     },
 };
@@ -19,7 +19,7 @@ use hyper_rustls::{HttpsConnector, HttpsConnectorBuilder};
 use hyper_util::client::legacy::Client;
 use hyper_util::client::legacy::connect::HttpConnector;
 use rustls::sign::CertifiedKey;
-use tokio::sync::mpsc;
+use tokio::sync::{mpsc, watch};
 use tokio_rustls::TlsAcceptor;
 use url::Url;
 
@@ -191,6 +191,8 @@ pub struct AppState {
     default_upstream_clients: Arc<UpstreamClients>,
     upstream_clients: RwLock<HashMap<UpstreamTlsProfile, Arc<UpstreamClients>>>,
     pub cache: Cache,
+    /// In-flight cache fills, keyed by cache key, for request coalescing.
+    cache_flights: Mutex<HashMap<String, watch::Sender<bool>>>,
     pub logs: mpsc::Sender<AccessEvent>,
     pub node: NodeInfo,
     pub max_request_body_bytes: u64,
@@ -244,6 +246,7 @@ impl AppState {
             default_upstream_clients,
             upstream_clients: RwLock::new(clients),
             cache: Cache::new(cache_max_size_bytes),
+            cache_flights: Mutex::new(HashMap::new()),
             rate_limiter: RateLimiter::new(rate_limit),
             backend_health: Arc::new(BackendHealth::default()),
             logs,
@@ -282,6 +285,32 @@ impl AppState {
 
     /// Return the cached upstream client set for a site, falling back to the
     /// process-wide default if a per-site CA cannot be loaded.
+    /// Start or join an in-flight cache fill. The leader must drop a
+    /// `CacheFlightGuard` when the fill finishes (success or failure).
+    pub fn begin_cache_flight(&self, key: &str) -> (watch::Receiver<bool>, bool) {
+        let mut flights = self
+            .cache_flights
+            .lock()
+            .expect("cache flight lock poisoned");
+        if let Some(sender) = flights.get(key) {
+            return (sender.subscribe(), false);
+        }
+        let (sender, receiver) = watch::channel(false);
+        flights.insert(key.to_string(), sender);
+        (receiver, true)
+    }
+
+    pub fn finish_cache_flight(&self, key: &str) {
+        let sender = self
+            .cache_flights
+            .lock()
+            .expect("cache flight lock poisoned")
+            .remove(key);
+        if let Some(sender) = sender {
+            let _ = sender.send(true);
+        }
+    }
+
     pub fn clients_for(&self, site: &Site) -> Arc<UpstreamClients> {
         self.clients_for_profile(site.upstream_tls.as_ref())
     }
@@ -589,6 +618,24 @@ fn parse_header_name(name: &str) -> Option<HeaderName> {
             tracing::warn!(header = %name, %error, "ignoring invalid proxy header name");
             None
         }
+    }
+}
+
+/// Releases a cache single-flight when the leader leaves the request path.
+pub struct CacheFlightGuard {
+    state: Arc<AppState>,
+    key: String,
+}
+
+impl CacheFlightGuard {
+    pub fn new(state: Arc<AppState>, key: String) -> Self {
+        Self { state, key }
+    }
+}
+
+impl Drop for CacheFlightGuard {
+    fn drop(&mut self) {
+        self.state.finish_cache_flight(&self.key);
     }
 }
 

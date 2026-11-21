@@ -586,8 +586,9 @@
 - 新增轻量 `/api/qps`，按浏览器 5s 墙钟边界（:02.5、:07.5…）轮询最近 5 分钟，
   前端固定补成 60 个槽位。
 
-### 网关：If-Modified-Since、HTTP/3 连接与并发流限制（2026-11-20）
-- 缓存命中现在支持 `If-Modified-Since`（无 `If-None-Match` 时按缓存的 `Last-Modified` 返回 304）。
-- HTTP/3 连接使用独立 `max_connections` 信号量；每个连接通过 QUIC transport 限制
-  `http3_max_concurrent_streams`（默认 100，环境变量可覆盖）。
-- 文档/示例配置同步；本次仍只提交代码，未部署目标机。
+### 网关：缓存 single-flight 与重复请求头保留（2026-11-20）
+- 同一 cache key 的并发 miss 合并：leader 回源填充，follower 等待后重查缓存，最多等待 5s。
+- 访问日志中重复请求头改为 JSON 数组，不再相互覆盖。
+- 目标机实测：首次 MISS、第二次 HIT；If-Modified-Since 返回 304 且 body 长度 0；
+  10 个并发请求全部 HIT；重复 X-Dup 记录为 `["one","two"]`。
+- issue.md 同步缓存/访问日志状态；本批已部署。

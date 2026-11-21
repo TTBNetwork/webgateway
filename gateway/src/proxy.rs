@@ -24,7 +24,7 @@ use tracing::{Level, event};
 
 use crate::access;
 use crate::cache::{CacheConfig, CachedResponse};
-use crate::state::{AppState, Backend, BoxError, GatewayBody, MatchContext};
+use crate::state::{AppState, Backend, BoxError, CacheFlightGuard, GatewayBody, MatchContext};
 
 pub type ProxyBody = GatewayBody;
 
@@ -171,6 +171,34 @@ pub async fn handle(
             method_label == "HEAD",
         );
     }
+
+    // Coalesce concurrent misses for the same cache key. A follower waits for
+    // the leader to fill the cache, then re-checks it; if the leader failed it
+    // proceeds upstream normally.
+    let mut cache_flight_guard = None;
+    if cache_lookup {
+        let (mut flight, leader) = state.begin_cache_flight(&cache_lookup_key);
+        if leader {
+            cache_flight_guard = Some(CacheFlightGuard::new(
+                state.clone(),
+                cache_lookup_key.clone(),
+            ));
+        } else if tokio::time::timeout(Duration::from_secs(5), flight.changed())
+            .await
+            .is_ok()
+            && let Some(cached) = state.cache.get(&cache_lookup_key, &cache_request_headers)
+        {
+            return cache_hit_response(
+                &state,
+                &request_log,
+                cached,
+                request.headers(),
+                request_version,
+                method_label == "HEAD",
+            );
+        }
+    }
+    let _cache_flight_guard = cache_flight_guard;
 
     let match_context = crate::state::MatchContext {
         path: &path,
