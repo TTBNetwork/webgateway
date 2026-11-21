@@ -251,6 +251,9 @@ max_tracked_ips = 100000
     headers 中包含 `x-webgateway-tunnel-close`、总/上行/下行字节和持续时间。
 - **CONNECT**：
   - authority 的 host 必须命中已配置站点，否则 403；
+  - 可选的站点级 `websites.config.connect` 可进一步收紧：
+    `{"enabled":false}` 完全禁用，或 `{"enabled":true,"ports":[443]}` 只允许指定端口；
+    未配置该块时沿用全局 `connect_ports`；
   - authority 的端口必须在 `[server].connect_ports`（默认 `[443, 80]`）中，否则 403；
     空列表表示拒绝全部 CONNECT；
   - 通过后连接 `host:port` 并返回 200，桥接原始 TCP；不是 TLS MITM，只做透传；

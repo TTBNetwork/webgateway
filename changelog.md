@@ -586,9 +586,8 @@
 - 新增轻量 `/api/qps`，按浏览器 5s 墙钟边界（:02.5、:07.5…）轮询最近 5 分钟，
   前端固定补成 60 个槽位。
 
-### 网关：缓存 single-flight 与重复请求头保留（2026-11-20）
-- 同一 cache key 的并发 miss 合并：leader 回源填充，follower 等待后重查缓存，最多等待 5s。
-- 访问日志中重复请求头改为 JSON 数组，不再相互覆盖。
-- 目标机实测：首次 MISS、第二次 HIT；If-Modified-Since 返回 304 且 body 长度 0；
-  10 个并发请求全部 HIT；重复 X-Dup 记录为 `["one","two"]`。
-- issue.md 同步缓存/访问日志状态；本批已部署。
+### 网关：站点级 CONNECT 策略（2026-11-20）
+- 站点 config 新增 `connect: {enabled, ports}`：可完全禁用 CONNECT，或只允许指定端口；
+  未配置时保持全局 `connect_ports` 行为。
+- 目标机实测：初始 200；`enabled:false` → 403；`enabled:true, ports:[443]` 访问 80 → 403；
+  恢复配置后 200。

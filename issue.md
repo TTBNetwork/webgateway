@@ -116,7 +116,7 @@
 | P-01 | HTTP/3 | 响应已流式、参与停机 drain；请求体仍整体缓冲；无 0-RTT/连接迁移；h3 不走缓存；WS/gRPC over h3 未实现；TLS h1/h2 已广播 Alt-Svc |
 | P-02 | gRPC | 已在 Nezha 上验证；`grpc-status`/`grpc-message` trailer 已写入访问日志 headers；无 gRPC-Web |
 | P-03 | WebSocket | 握手后关闭时会追加带总/上行/下行字节与持续时间的关闭记录；无 mTLS / SNI 覆盖；wss 与后端 base path 已支持（2026-11-19） |
-| P-04 | CONNECT | 仅 h1；已修复 400/403 日志与端口白名单；无鉴权 / mTLS；无 HTTP/2 extended CONNECT |
+| P-04 | CONNECT | 仅 h1；400/403 日志与全局端口白名单已实现；支持站点级 `connect.enabled/ports`；无鉴权 / mTLS；无 HTTP/2 extended CONNECT |
 | P-05 | 缓存 | 仅 h1/h2；`Vary`/HEAD/`If-None-Match`/`If-Modified-Since`/并发 miss 合并已支持；仍无持久化/stale-while-revalidate；配置同步清空全部 |
 | P-06 | 访问日志 | chunked 请求/响应按实际字节记录；WS/CONNECT 关闭行记录字节/时长；headers 重复键仍会被覆盖；已修复 writer 退出 flush |
 | P-07 | 统计 | 分钟/日 `total_ips` 已从原始日志去重；原始保留期可配（7..90 天）；sizes 仍依赖日志 Content-Length；边界分区仍逐行 DELETE |

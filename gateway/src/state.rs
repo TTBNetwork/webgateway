@@ -639,6 +639,15 @@ impl Drop for CacheFlightGuard {
     }
 }
 
+/// Optional per-site CONNECT policy. Absent preserves the gateway-wide
+/// allowlist behaviour; present requires an explicit enabled/ports decision.
+#[derive(Debug, Clone, Default, serde::Deserialize)]
+#[serde(default)]
+pub struct ConnectConfig {
+    pub enabled: bool,
+    pub ports: Vec<u16>,
+}
+
 #[derive(Debug)]
 pub struct Site {
     pub id: String,
@@ -653,6 +662,8 @@ pub struct Site {
     pub health_check: HealthCheckConfig,
     /// Optional per-site TLS override; None inherits the gateway default.
     pub upstream_tls: Option<UpstreamTlsProfile>,
+    /// Optional per-site CONNECT policy; None inherits the global allowlist.
+    pub connect: Option<ConnectConfig>,
     selector: AtomicUsize,
 }
 
@@ -669,6 +680,7 @@ impl Site {
         cache: CacheConfig,
         health_check: HealthCheckConfig,
         upstream_tls: Option<UpstreamTlsProfile>,
+        connect: Option<ConnectConfig>,
     ) -> Self {
         Self {
             id,
@@ -681,6 +693,7 @@ impl Site {
             cache,
             health_check,
             upstream_tls,
+            connect,
             selector: AtomicUsize::new(0),
         }
     }
@@ -971,6 +984,7 @@ mod tests {
             ClientIpMode::Raw,
             CacheConfig::default(),
             HealthCheckConfig::default(),
+            None,
             None,
         ))
     }

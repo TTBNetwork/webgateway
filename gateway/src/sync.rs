@@ -13,8 +13,8 @@ use url::Url;
 use crate::cache::CacheConfig;
 use crate::health::HealthCheckConfig;
 use crate::state::{
-    AppState, Backend, CertStore, ClientIpMode, MatchRules, ProxyHeaders, Routing, Site,
-    UpstreamTlsProfile,
+    AppState, Backend, CertStore, ClientIpMode, ConnectConfig, MatchRules, ProxyHeaders, Routing,
+    Site, UpstreamTlsProfile,
 };
 use shared::database::Database;
 
@@ -57,6 +57,8 @@ struct WebsiteConfigRow {
     health_check: HealthCheckConfig,
     #[serde(default)]
     upstream_tls: Option<SiteUpstreamTlsRow>,
+    #[serde(default)]
+    connect: Option<ConnectConfig>,
 }
 
 #[derive(Debug, serde::Deserialize, Default)]
@@ -221,6 +223,7 @@ pub async fn sync_once(
             config.cache,
             health_check,
             upstream_tls,
+            config.connect,
         ));
         event!(
             Level::DEBUG,

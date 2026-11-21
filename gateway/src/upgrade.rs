@@ -364,6 +364,24 @@ pub async fn handle_connect(
         return proxy::text_response(StatusCode::FORBIDDEN, "Forbidden", &state);
     };
 
+    if let Some(connect) = &site.connect {
+        if !connect.enabled {
+            event!(Level::WARN, site = %site.id, "CONNECT is disabled for this site");
+            log_failure(&state, &request_log, StatusCode::FORBIDDEN, 9);
+            return proxy::text_response(StatusCode::FORBIDDEN, "Forbidden", &state);
+        }
+        if !connect.ports.is_empty() && !connect.ports.contains(&port) {
+            event!(
+                Level::WARN,
+                site = %site.id,
+                port,
+                "CONNECT target port is not allowed for this site"
+            );
+            log_failure(&state, &request_log, StatusCode::FORBIDDEN, 9);
+            return proxy::text_response(StatusCode::FORBIDDEN, "Forbidden", &state);
+        }
+    }
+
     let client_ip = site
         .client_ip
         .resolve(peer, proxy_source, request.headers());
