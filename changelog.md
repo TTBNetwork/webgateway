@@ -585,17 +585,14 @@
 - Dashboard 不再整体 15s 轮询：summary 和 geo 只在进入页面时加载一次；只有 QPS 卡片自行刷新。
 - 新增轻量 `/api/qps`，按浏览器 5s 墙钟边界（:02.5、:07.5…）轮询最近 5 分钟，
   前端固定补成 60 个槽位。
-- 站点缓存/健康检查改为自定义 switch；健康检查默认开启，关闭时字段禁用。
-- light 背景固定 `#f8f8f8`，侧栏同色，卡片白色，禁用输入框不再灰底。
 
-### 数据统计按 v1 展示（2026-11-20）
-- 概览 KPI 改为 v1 统计口径：请求次数 / 独立 IP、后端错误数 / 后端错误率、
-  4xx 错误数 / 4xx 错误率、5xx 错误数 / 5xx 错误率，以及请求/响应流量。
-- 错误率统一以请求次数为分母；后端错误按 502/504 响应统计。
-
-### ECharts 2D 地图与图表（2026-11-20）
-- 复用 SafeLine 2D 统计页的 Apache ECharts 5.4.1 与 world.js 世界地图，
-  通过 EChart 组件加载；地图改为 ECharts geo + visualMap + effectScatter，
-  不再是手写 SVG。
-- QPS 柱状图和 24h 流量曲线同步换成 ECharts，保留 5s 轮询和主题色。
-- 地图保留来源排行、节点标记和内网/未配置提示；新增 2D 标识。
+### 网关：站点级上游 TLS、请求体日志与 HTTP/3 header 限制（2026-11-20）
+- 新增站点级 `websites.config.upstream_tls`：`ca_file` / `insecure`，按配置缓存独立 client；
+  普通代理、gRPC、WebSocket、HTTP/3 和健康探测都使用对应站点的 TLS 策略。
+- 目标机把 Proxmox 8006 切到站点级 `insecure:true`，删除全局 `GATEWAY_UPSTREAM_INSECURE`，
+  PVE 仍返回 200。
+- chunked/无 Content-Length 请求体现在按上游实际消费字节写入访问日志，不再固定 0。
+- HTTP/3 请求头按 `max_header_bytes` 检查，超限返回 431。
+- 健康检查默认启用（显式 enabled:false 仍可关闭），与面板默认一致。
+- 验证：gateway 53 tests、clippy/fmt 通过；目标 PVE 200、普通站点 200；
+  12,345 字节 chunked POST 访问日志 `request_size=12345`。

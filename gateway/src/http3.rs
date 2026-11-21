@@ -169,6 +169,27 @@ async fn handle_request(
         .await
         .context("HTTP/3 request failed")?;
 
+    let header_bytes: usize = request
+        .headers()
+        .iter()
+        .map(|(name, value)| name.as_str().len() + value.as_bytes().len() + 32)
+        .sum();
+    if header_bytes > state.max_header_bytes {
+        event!(
+            Level::WARN,
+            header_bytes,
+            limit = state.max_header_bytes,
+            "rejecting oversized HTTP/3 request headers"
+        );
+        reject(
+            &mut stream,
+            StatusCode::REQUEST_HEADER_FIELDS_TOO_LARGE,
+            "Request Header Fields Too Large",
+        )
+        .await?;
+        return Ok(());
+    }
+
     let declared_length = request
         .headers()
         .get(http::header::CONTENT_LENGTH)

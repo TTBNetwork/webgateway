@@ -145,6 +145,7 @@ pub async fn handle_websocket(
 
     // WebSocket upstreams may be https://; the raw TCP path above must be
     // wrapped in TLS before the HTTP/1.1 upgrade request is written.
+    let upstream_clients = state.clients_for(&site);
     let stream: BoxedUpstreamStream = if backend.url.scheme() == "https" {
         let server_name = match rustls::pki_types::ServerName::try_from(host.clone()) {
             Ok(server_name) => server_name,
@@ -154,7 +155,7 @@ pub async fn handle_websocket(
                 return proxy::text_response(StatusCode::BAD_GATEWAY, "Bad Gateway", &state);
             }
         };
-        let connector = tokio_rustls::TlsConnector::from(state.websocket_tls.clone());
+        let connector = tokio_rustls::TlsConnector::from(upstream_clients.websocket_tls.clone());
         match tokio::time::timeout(Duration::from_secs(10), connector.connect(server_name, tcp))
             .await
         {

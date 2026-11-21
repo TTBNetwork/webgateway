@@ -4,7 +4,10 @@ use std::{
     convert::Infallible,
     net::{IpAddr, SocketAddr},
     pin::Pin,
-    sync::Arc,
+    sync::{
+        Arc,
+        atomic::{AtomicU64, Ordering},
+    },
     task::{Context as TaskContext, Poll},
     time::Duration,
 };
@@ -221,7 +224,12 @@ pub async fn handle(
 
     let method = request.method().clone();
     let body_limit = usize::try_from(state.max_request_body_bytes).unwrap_or(usize::MAX);
-    let body = Limited::new(request.into_body(), body_limit).boxed();
+    let request_bytes = Arc::new(AtomicU64::new(request_log.body_length));
+    let body = CountingBody {
+        inner: Limited::new(request.into_body(), body_limit).boxed(),
+        bytes: request_bytes.clone(),
+    }
+    .boxed();
 
     let mut upstream_request = match Request::builder()
         .method(method)
@@ -248,10 +256,11 @@ pub async fn handle(
         }
     };
     *upstream_request.headers_mut() = headers;
+    let upstream_clients = state.clients_for(&site);
 
     let upstream_response = if grpc {
         // gRPC streams can be long-lived; do not apply the HTTP timeout here.
-        match state.grpc_client.request(upstream_request).await {
+        match upstream_clients.grpc_client.request(upstream_request).await {
             Ok(response) => {
                 crate::health::record_passive(&state, &site, backend, true);
                 response
@@ -273,7 +282,7 @@ pub async fn handle(
     } else {
         match tokio::time::timeout(
             Duration::from_secs(60),
-            state.client.request(upstream_request),
+            upstream_clients.client.request(upstream_request),
         )
         .await
         {
@@ -377,6 +386,9 @@ pub async fn handle(
         }
 
         response_headers.insert(cache_header(), HeaderValue::from_static("MISS"));
+        request_log.body_length = request_log
+            .body_length
+            .max(request_bytes.load(Ordering::Relaxed));
         log_event(
             &state,
             &request_log,
@@ -398,6 +410,7 @@ pub async fn handle(
     let body = logged_stream_body(
         state.clone(),
         request_log,
+        request_bytes.clone(),
         status,
         response_headers.clone(),
         version,
@@ -532,10 +545,11 @@ pub async fn handle_buffered(
         }
     };
     *upstream_request.headers_mut() = upstream_headers;
+    let upstream_clients = state.clients_for(&site);
 
     let upstream_response = match tokio::time::timeout(
         Duration::from_secs(60),
-        state.client.request(upstream_request),
+        upstream_clients.client.request(upstream_request),
     )
     .await
     {
@@ -580,9 +594,11 @@ pub async fn handle_buffered(
     }
 
     // Stream the upstream body; HTTP/3 no longer buffers the full response.
+    let request_bytes = Arc::new(AtomicU64::new(request_log.body_length));
     let body = logged_stream_body(
         state.clone(),
         request_log,
+        request_bytes,
         status,
         response_headers.clone(),
         version,
@@ -815,7 +831,44 @@ pub(crate) fn log_event(
     }
 }
 
-/// Streams a body while counting bytes, then writes one access-log row.
+/// Counts request-body bytes while the upstream client consumes them. Chunked
+/// requests have no Content-Length, so the access row is updated after the
+/// body finishes (or the stream is dropped).
+struct CountingBody {
+    inner: GatewayBody,
+    bytes: Arc<AtomicU64>,
+}
+
+impl Body for CountingBody {
+    type Data = Bytes;
+    type Error = BoxError;
+
+    fn poll_frame(
+        self: Pin<&mut Self>,
+        cx: &mut TaskContext<'_>,
+    ) -> Poll<Option<Result<Frame<Self::Data>, Self::Error>>> {
+        let this = self.get_mut();
+        match Pin::new(&mut this.inner).poll_frame(cx) {
+            Poll::Ready(Some(Ok(frame))) => {
+                if let Some(data) = frame.data_ref() {
+                    this.bytes.fetch_add(data.len() as u64, Ordering::Relaxed);
+                }
+                Poll::Ready(Some(Ok(frame)))
+            }
+            other => other,
+        }
+    }
+
+    fn is_end_stream(&self) -> bool {
+        self.inner.is_end_stream()
+    }
+
+    fn size_hint(&self) -> SizeHint {
+        self.inner.size_hint()
+    }
+}
+
+/// Streams a response body while counting bytes, then writes one access-log row.
 ///
 /// Logging on completion (instead of before streaming) records the real body
 /// size for chunked responses. A client disconnect still logs the bytes read so
@@ -824,6 +877,7 @@ struct LoggedBody {
     inner: Pin<Box<GatewayBody>>,
     state: Arc<AppState>,
     request: access::RequestLog,
+    request_bytes: Arc<AtomicU64>,
     status: StatusCode,
     headers: HeaderMap,
     version: Version,
@@ -837,6 +891,10 @@ impl LoggedBody {
             return;
         }
         self.logged = true;
+        self.request.body_length = self
+            .request
+            .body_length
+            .max(self.request_bytes.load(Ordering::Relaxed));
         log_event(
             &self.state,
             &self.request,
@@ -894,6 +952,7 @@ impl Drop for LoggedBody {
 fn logged_stream_body(
     state: Arc<AppState>,
     request: access::RequestLog,
+    request_bytes: Arc<AtomicU64>,
     status: StatusCode,
     headers: HeaderMap,
     version: Version,
@@ -903,6 +962,7 @@ fn logged_stream_body(
         inner: Box::pin(body),
         state,
         request,
+        request_bytes,
         status,
         headers,
         version,

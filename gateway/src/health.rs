@@ -45,7 +45,7 @@ pub struct HealthCheckConfig {
 impl Default for HealthCheckConfig {
     fn default() -> Self {
         Self {
-            enabled: false,
+            enabled: true,
             path: "/".to_string(),
             interval_secs: 10,
             timeout_secs: 2,
@@ -213,6 +213,7 @@ struct ProbeTarget {
     key: String,
     url: String,
     config: HealthCheckConfig,
+    site: Arc<Site>,
 }
 
 /// Run the probe scheduler until the task is aborted.
@@ -256,6 +257,7 @@ fn collect_targets(state: &AppState) -> Vec<ProbeTarget> {
                 key: backend_key(&site.id, backend.url.as_str()),
                 url: backend.url.to_string(),
                 config: site.health_check.clone(),
+                site: site.clone(),
             });
         }
     }
@@ -286,7 +288,9 @@ async fn run_probe(state: Arc<AppState>, target: ProbeTarget) {
     };
 
     let timeout = Duration::from_secs(target.config.timeout_secs.max(1));
-    let result = tokio::time::timeout(timeout, state.buffered_client.request(request)).await;
+    let upstream_clients = state.clients_for(&target.site);
+    let result =
+        tokio::time::timeout(timeout, upstream_clients.buffered_client.request(request)).await;
     let healthy = matches!(&result, Ok(Ok(response)) if response.status().as_u16() < 500);
     metrics::record_health_check(healthy);
     if healthy {

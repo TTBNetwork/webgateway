@@ -398,7 +398,7 @@ groups:
 | 证书申请代理 | ✅ | 本轮 master | 设置页保存（加密）、ACME 客户端经代理；DNS API 直连 |
 | 网关默认 80/443 | ✅ | 本轮 master | systemd AmbientCapabilities、Docker 80/443 + 非 root 端口 sysctl |
 | 证书多 zone / 仅面板凭据 | ✅ | 本轮 master | provider domains 跨 zone；from_env 拒绝；多通配符 hostnames |
-| HTTPS 上游自签名 | ✅ | 本轮 master | `GATEWAY_UPSTREAM_INSECURE`；目标机 Proxmox 8006 返回 200 |
+| HTTPS 上游自签名 | ✅ | 本轮 master | 站点级 `upstream_tls.insecure` / `ca_file`；目标机只给 Proxmox 站点配置 insecure，已移除全局 `GATEWAY_UPSTREAM_INSECURE`，8006 返回 200 |
 | 访问日志完整性 | ✅ | 本轮 master | path 含 query、流式/chunked 实际响应字节 |
 | v1 风格左侧菜单 | ✅ | 本轮 master | 折叠二级菜单：统计/网站管理/节点管理/系统设置 |
 

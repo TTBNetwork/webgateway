@@ -4,7 +4,7 @@ use std::{
     collections::{HashMap, HashSet},
     io::Cursor,
     net::{IpAddr, SocketAddr},
-    path::Path,
+    path::{Path, PathBuf},
     sync::{
         Arc, RwLock,
         atomic::{AtomicUsize, Ordering},
@@ -34,6 +34,41 @@ pub type BoxError = Box<dyn std::error::Error + Send + Sync>;
 pub type GatewayBody = BoxBody<Bytes, BoxError>;
 pub type UpstreamClient = Client<UpstreamConnector, GatewayBody>;
 pub type BufferedUpstreamClient = Client<UpstreamConnector, Full<Bytes>>;
+
+/// Per-site upstream TLS policy; the gateway caches one client set per policy.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub struct UpstreamTlsProfile {
+    pub ca_file: Option<PathBuf>,
+    pub insecure: bool,
+}
+
+pub struct UpstreamClients {
+    pub client: UpstreamClient,
+    pub grpc_client: UpstreamClient,
+    pub buffered_client: BufferedUpstreamClient,
+    pub websocket_tls: Arc<rustls::ClientConfig>,
+}
+
+fn build_upstream_clients(profile: &UpstreamTlsProfile) -> anyhow::Result<UpstreamClients> {
+    let tls = upstream_tls_config(profile.ca_file.as_deref(), profile.insecure)?;
+    let connector = upstream_connector(tls.clone());
+    let client = Client::builder(hyper_util::rt::TokioExecutor::new()).build(connector.clone());
+
+    let mut websocket_tls = tls;
+    websocket_tls.alpn_protocols = vec![b"http/1.1".to_vec()];
+
+    let mut grpc_builder = Client::builder(hyper_util::rt::TokioExecutor::new());
+    grpc_builder.http2_only(true);
+    let grpc_client = grpc_builder.build(connector.clone());
+    let buffered_client = Client::builder(hyper_util::rt::TokioExecutor::new()).build(connector);
+
+    Ok(UpstreamClients {
+        client,
+        grpc_client,
+        buffered_client,
+        websocket_tls: Arc::new(websocket_tls),
+    })
+}
 
 /// Build the upstream TLS client configuration (webpki roots + optional PEM CA).
 ///
@@ -142,6 +177,7 @@ pub struct StateLimits {
     pub cache_max_size_bytes: u64,
     pub max_request_body_bytes: u64,
     pub max_response_body_bytes: u64,
+    pub max_header_bytes: usize,
     pub connect_ports: Vec<u16>,
     pub h3_port: Option<u16>,
     pub rate_limit: RateLimitConfig,
@@ -151,18 +187,15 @@ pub struct AppState {
     pub routing: RwLock<Arc<Routing>>,
     pub certs: Arc<RwLock<Arc<CertStore>>>,
     pub tls_acceptor: TlsAcceptor,
-    pub client: UpstreamClient,
-    /// HTTP/2-only client used for gRPC backends (h2c).
-    pub grpc_client: UpstreamClient,
-    /// HTTP/1.1 client with a buffered body, used by the HTTP/3 path.
-    pub buffered_client: BufferedUpstreamClient,
-    /// TLS client configuration for WebSocket upgrades (ALPN http/1.1).
-    pub websocket_tls: Arc<rustls::ClientConfig>,
+    pub default_upstream_tls: UpstreamTlsProfile,
+    default_upstream_clients: Arc<UpstreamClients>,
+    upstream_clients: RwLock<HashMap<UpstreamTlsProfile, Arc<UpstreamClients>>>,
     pub cache: Cache,
     pub logs: mpsc::Sender<AccessEvent>,
     pub node: NodeInfo,
     pub max_request_body_bytes: u64,
     pub max_response_body_bytes: u64,
+    pub max_header_bytes: usize,
     /// Ports allowed as HTTP CONNECT tunnel targets.
     pub connect_ports: Arc<[u16]>,
     /// Alt-Svc header advertised on TLS responses when HTTP/3 is enabled.
@@ -186,33 +219,30 @@ impl AppState {
             cache_max_size_bytes,
             max_request_body_bytes,
             max_response_body_bytes,
+            max_header_bytes,
             connect_ports,
             h3_port,
             rate_limit,
         } = limits;
         let tls_acceptor = crate::tls::acceptor(certs.clone())?;
-        let upstream_tls = upstream_tls_config(upstream_ca_file, insecure_upstream_tls)?;
-        let connector = upstream_connector(upstream_tls.clone());
-        let client: UpstreamClient =
-            Client::builder(hyper_util::rt::TokioExecutor::new()).build(connector.clone());
-
-        let mut websocket_tls = upstream_tls;
-        websocket_tls.alpn_protocols = vec![b"http/1.1".to_vec()];
-
-        let mut grpc_builder = Client::builder(hyper_util::rt::TokioExecutor::new());
-        grpc_builder.http2_only(true);
-        let grpc_client: UpstreamClient = grpc_builder.build(connector.clone());
-        let buffered_client: BufferedUpstreamClient =
-            Client::builder(hyper_util::rt::TokioExecutor::new()).build(connector);
+        let default_upstream_tls = UpstreamTlsProfile {
+            ca_file: upstream_ca_file.map(Path::to_path_buf),
+            insecure: insecure_upstream_tls,
+        };
+        let default_upstream_clients = Arc::new(build_upstream_clients(&default_upstream_tls)?);
+        let mut clients = HashMap::new();
+        clients.insert(
+            default_upstream_tls.clone(),
+            default_upstream_clients.clone(),
+        );
 
         Ok(Self {
             routing: RwLock::new(Arc::new(Routing::default())),
             certs,
             tls_acceptor,
-            client,
-            grpc_client,
-            buffered_client,
-            websocket_tls: Arc::new(websocket_tls),
+            default_upstream_tls,
+            default_upstream_clients,
+            upstream_clients: RwLock::new(clients),
             cache: Cache::new(cache_max_size_bytes),
             rate_limiter: RateLimiter::new(rate_limit),
             backend_health: Arc::new(BackendHealth::default()),
@@ -220,6 +250,7 @@ impl AppState {
             node,
             max_request_body_bytes,
             max_response_body_bytes,
+            max_header_bytes,
             connect_ports: connect_ports.into(),
             alt_svc: h3_port.map(alt_svc_value),
         })
@@ -236,6 +267,64 @@ impl AppState {
         self.cache.clear();
         *self.routing.write().expect("routing lock poisoned") = routing;
         *self.certs.write().expect("certificate store lock poisoned") = certs;
+
+        // CA files may have changed on disk; keep the default client and
+        // rebuild per-site clients lazily on the next request.
+        let default_profile = self.default_upstream_tls.clone();
+        let default_clients = self.default_upstream_clients.clone();
+        let mut clients = self
+            .upstream_clients
+            .write()
+            .expect("upstream client lock poisoned");
+        clients.clear();
+        clients.insert(default_profile, default_clients);
+    }
+
+    /// Return the cached upstream client set for a site, falling back to the
+    /// process-wide default if a per-site CA cannot be loaded.
+    pub fn clients_for(&self, site: &Site) -> Arc<UpstreamClients> {
+        self.clients_for_profile(site.upstream_tls.as_ref())
+    }
+
+    pub fn clients_for_profile(
+        &self,
+        profile: Option<&UpstreamTlsProfile>,
+    ) -> Arc<UpstreamClients> {
+        let profile = profile
+            .cloned()
+            .unwrap_or_else(|| self.default_upstream_tls.clone());
+        if profile == self.default_upstream_tls {
+            return self.default_upstream_clients.clone();
+        }
+        if let Some(clients) = self
+            .upstream_clients
+            .read()
+            .expect("upstream client lock poisoned")
+            .get(&profile)
+            .cloned()
+        {
+            return clients;
+        }
+
+        match build_upstream_clients(&profile) {
+            Ok(clients) => {
+                let clients = Arc::new(clients);
+                self.upstream_clients
+                    .write()
+                    .expect("upstream client lock poisoned")
+                    .insert(profile, clients.clone());
+                clients
+            }
+            Err(error) => {
+                tracing::warn!(
+                    ca_file = ?profile.ca_file,
+                    insecure = profile.insecure,
+                    %error,
+                    "failed to build per-site upstream TLS clients; using default"
+                );
+                self.default_upstream_clients.clone()
+            }
+        }
     }
 }
 
@@ -513,8 +602,10 @@ pub struct Site {
     pub headers: ProxyHeaders,
     pub client_ip: ClientIpMode,
     pub cache: CacheConfig,
-    /// Upstream probing policy for this site (disabled by default).
+    /// Upstream probing policy for this site (enabled by default).
     pub health_check: HealthCheckConfig,
+    /// Optional per-site TLS override; None inherits the gateway default.
+    pub upstream_tls: Option<UpstreamTlsProfile>,
     selector: AtomicUsize,
 }
 
@@ -530,6 +621,7 @@ impl Site {
         client_ip: ClientIpMode,
         cache: CacheConfig,
         health_check: HealthCheckConfig,
+        upstream_tls: Option<UpstreamTlsProfile>,
     ) -> Self {
         Self {
             id,
@@ -541,6 +633,7 @@ impl Site {
             client_ip,
             cache,
             health_check,
+            upstream_tls,
             selector: AtomicUsize::new(0),
         }
     }
@@ -831,6 +924,7 @@ mod tests {
             ClientIpMode::Raw,
             CacheConfig::default(),
             HealthCheckConfig::default(),
+            None,
         ))
     }
 

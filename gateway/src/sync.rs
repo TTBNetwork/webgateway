@@ -2,6 +2,7 @@
 
 use std::{
     collections::{BTreeSet, HashMap},
+    path::PathBuf,
     sync::Arc,
 };
 
@@ -13,6 +14,7 @@ use crate::cache::CacheConfig;
 use crate::health::HealthCheckConfig;
 use crate::state::{
     AppState, Backend, CertStore, ClientIpMode, MatchRules, ProxyHeaders, Routing, Site,
+    UpstreamTlsProfile,
 };
 use shared::database::Database;
 
@@ -53,6 +55,16 @@ struct WebsiteConfigRow {
     cache: CacheConfig,
     #[serde(default)]
     health_check: HealthCheckConfig,
+    #[serde(default)]
+    upstream_tls: Option<SiteUpstreamTlsRow>,
+}
+
+#[derive(Debug, serde::Deserialize, Default)]
+struct SiteUpstreamTlsRow {
+    #[serde(default)]
+    ca_file: Option<String>,
+    #[serde(default)]
+    insecure: Option<bool>,
 }
 
 #[derive(Debug, serde::Deserialize, Default)]
@@ -156,6 +168,10 @@ pub async fn sync_once(
                 HealthCheckConfig::default()
             }
         };
+        let upstream_tls = config.upstream_tls.map(|value| UpstreamTlsProfile {
+            ca_file: value.ca_file.map(PathBuf::from),
+            insecure: value.insecure.unwrap_or(false),
+        });
 
         let mut backends = Vec::new();
         for spec in specs {
@@ -204,6 +220,7 @@ pub async fn sync_once(
             config.get_request_ip,
             config.cache,
             health_check,
+            upstream_tls,
         ));
         event!(
             Level::DEBUG,

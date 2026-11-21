@@ -91,6 +91,7 @@ async fn run() -> anyhow::Result<()> {
             cache_max_size_bytes: config.server.cache_max_size_bytes,
             max_request_body_bytes: config.server.max_request_body_bytes,
             max_response_body_bytes: config.server.max_response_body_bytes,
+            max_header_bytes: config.server.max_header_bytes,
             connect_ports: config.server.connect_ports.clone(),
             h3_port: config.server.http3_ports.first().copied(),
             rate_limit: config.server.rate_limit.clone(),

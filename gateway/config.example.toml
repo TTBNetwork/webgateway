@@ -49,7 +49,8 @@ ports = [80, 443]
 # max_tracked_ips = 100000
 
 [upstream_tls]
-# Extra PEM CA certificates for https backends (webpki roots are always trusted).
+# Gateway-wide fallback for https backends. Prefer per-site overrides:
+# websites.config.upstream_tls = {"ca_file":"/path/ca.pem"} or {"insecure":true}.
 # ca_file = "/etc/webgateway/upstream-ca.pem"
 # Skip upstream certificate verification for self-signed lab backends.
 # insecure = false

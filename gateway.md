@@ -71,7 +71,7 @@ max_tracked_ips = 100000
 | `GATEWAY_PORTS` | 逗号分隔的 TCP 监听端口 |
 | `GATEWAY_HTTP3_PORTS` | 逗号分隔的 UDP 端口（HTTP/3） |
 | `GATEWAY_UPSTREAM_CA_FILE` | https 后端的额外 CA PEM |
-| `GATEWAY_UPSTREAM_INSECURE` | `true` 时跳过上游证书校验（自签名实验后端） |
+| `GATEWAY_UPSTREAM_INSECURE` | 全局兜底：`true` 时跳过所有上游证书校验；生产优先用站点级 `upstream_tls` |
 | `GATEWAY_BIND` | 监听地址 |
 | `GATEWAY_MAX_CONNECTIONS` | 并发连接上限 |
 | `GATEWAY_MAX_HEADER_BYTES` | header 上限（最小 8192） |
@@ -89,13 +89,13 @@ max_tracked_ips = 100000
 - **连接数**：TCP 监听共享一个 `max_connections` 信号量；超出时新连接被直接关闭并 WARN，
   不进入 TLS/HTTP 处理。HTTP/3 连接暂未计入。
 - **Header**：HTTP/1 使用 hyper `max_buf_size`，HTTP/2 使用 `max_header_list_size`；
-  超限由 hyper 返回 431 或断开。HTTP/3 header 未单独限制。
+  超限由 hyper 返回 431 或断开；HTTP/3 在解析请求头后按同样的 `max_header_bytes` 返回 431。
 - **请求体**：有 `Content-Length` 且超过 `max_request_body_bytes` 时，网关在转发前返回
   **413 Payload Too Large**；chunked/无长度请求用 `Limited` 包装，达到上限后上游请求失败
   （客户端看到 502/连接错误），不会无限缓冲。
 - **响应体**：缓存只在响应带 `Content-Length` 且不超过
   `min(cache.max_entry_size, max_response_body_bytes)` 时启用；chunked 响应直接流式转发、不缓存。
-  HTTP/3 的响应仍完整缓冲，超过 `max_response_body_bytes` 返回 502。
+  HTTP/3 响应同样从上游流式转发，不完整缓冲；h3 请求体仍先缓冲，h3 不接入缓存。
 - **缓存**：HTTP/3 仍不接入缓存（请求走 `handle_buffered`）；HTTP/1/2 缓存行为不变。
 
 ### 2.2 监控指标（/metrics）
@@ -160,8 +160,11 @@ max_tracked_ips = 100000
   - 当前**不做失败自动切换**（备用组不是健康检查故障转移）。
 - 上游支持 `http://` 与 `https://`；https 使用 webpki 根 + 可选 `[upstream_tls].ca_file`，gRPC 与
   WebSocket 升级（wss）同样支持 TLS，WebSocket 还会拼接后端 base path。
-- 自签名上游（如 Proxmox 8006）可设 `GATEWAY_UPSTREAM_INSECURE=true` 跳过校验；生产建议改用
-  `ca_file` 指向该服务的 CA。
+- 站点级 `websites.config.upstream_tls` 可覆盖全局策略：
+  `{"ca_file":"/etc/webgateway/proxmox-ca.pem","insecure":false}`，或临时
+  `{"insecure":true}`。未配置时继承 `[upstream_tls]` / 环境变量。
+- 自签名上游（如 Proxmox 8006）优先把其 CA 写入站点 `upstream_tls.ca_file`；生产不建议长期使用
+  全局 `GATEWAY_UPSTREAM_INSECURE`。
 
 ## 4. 请求头（站点级配置）
 
@@ -226,7 +229,8 @@ max_tracked_ips = 100000
 - 字段：Host、method、**path（含 query）**、headers（JSON 对象）、HTTP 版本、客户端 IP
   （`get_request_ip` 解析后的）、`website_id`、status、响应字节。
 - 响应字节现在按**实际流式传输**计数：chunked/未知长度响应在 body 结束（或客户端断开）时写日志，
-  不再是 NULL；请求字节仍优先取 Content-Length（chunked 请求暂为 0）。
+  不再是 NULL；请求字节对 chunked/未知长度请求也在 body 被上游消费完后按实际字节写入。
+- 仍未记录：WebSocket / CONNECT 升级后的双向字节与关闭时长；重复请求头会被 JSON 对象覆盖。
 - 网关自己生成的 404/502/504 也会记录（body_length 为固定错误文本长度）。
 - 后台 writer 关闭时先 drain 队列再 flush；统计聚合由主控 stats 任务负责（见 database.md 5.4）；
   原始日志保留 7 天。
@@ -302,7 +306,7 @@ max_tracked_ips = 100000
 
 ### 5.5 上游健康检查
 
-站点通过 `websites.config.health_check` 开启（默认关闭）：
+站点通过 `websites.config.health_check` 配置，默认启用；显式 `enabled:false` 可关闭：
 
 ```json
 {
