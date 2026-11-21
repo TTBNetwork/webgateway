@@ -12,7 +12,7 @@ use anyhow::Context;
 use bytes::{Buf, Bytes, BytesMut};
 use http::StatusCode;
 use http_body_util::BodyExt;
-use tokio::task::JoinHandle;
+use tokio::{sync::Semaphore, task::JoinHandle};
 use tracing::{Level, event};
 
 use crate::{
@@ -57,22 +57,36 @@ pub fn spawn(
     ports: &[u16],
     state: Arc<AppState>,
     inflight: Inflight,
+    max_connections: usize,
+    max_concurrent_streams: u32,
 ) -> anyhow::Result<Http3> {
     let mut tasks = Vec::new();
     let mut endpoints = Vec::new();
+    let connection_limit = Arc::new(Semaphore::new(max_connections.max(1)));
 
     for &port in ports {
-        let config = tls::quic_server_config(state.certs.clone())?;
+        let mut config = tls::quic_server_config(state.certs.clone())?;
+        let mut transport = quinn::TransportConfig::default();
+        transport.max_concurrent_bidi_streams(max_concurrent_streams.max(1).into());
+        config.transport_config(Arc::new(transport));
+
         let addr = SocketAddr::new(bind, port);
         let endpoint = quinn::Endpoint::server(config, addr)
             .with_context(|| format!("failed to bind HTTP/3 listener on {addr}"))?;
-        event!(Level::INFO, port, "HTTP/3 listener started");
+        event!(
+            Level::INFO,
+            port,
+            max_connections,
+            max_concurrent_streams,
+            "HTTP/3 listener started"
+        );
 
         let state = state.clone();
         let inflight = inflight.clone();
         let accept_endpoint = endpoint.clone();
+        let connection_limit = connection_limit.clone();
         tasks.push(tokio::spawn(async move {
-            accept_loop(accept_endpoint, state, inflight).await;
+            accept_loop(accept_endpoint, state, inflight, connection_limit).await;
         }));
         endpoints.push(endpoint);
     }
@@ -80,11 +94,28 @@ pub fn spawn(
     Ok(Http3 { tasks, endpoints })
 }
 
-async fn accept_loop(endpoint: quinn::Endpoint, state: Arc<AppState>, inflight: Inflight) {
+async fn accept_loop(
+    endpoint: quinn::Endpoint,
+    state: Arc<AppState>,
+    inflight: Inflight,
+    connection_limit: Arc<Semaphore>,
+) {
     while let Some(incoming) = endpoint.accept().await {
+        let permit = match connection_limit.clone().try_acquire_owned() {
+            Ok(permit) => permit,
+            Err(_) => {
+                event!(
+                    Level::WARN,
+                    "HTTP/3 connection limit reached; dropping new connection"
+                );
+                drop(incoming);
+                continue;
+            }
+        };
         let state = state.clone();
         let inflight = inflight.clone();
         tokio::spawn(async move {
+            let _permit = permit;
             match incoming.await {
                 Ok(connection) => {
                     if let Err(error) = serve_connection(connection, state, inflight).await {

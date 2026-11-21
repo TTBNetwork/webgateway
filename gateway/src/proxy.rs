@@ -688,7 +688,7 @@ fn cache_hit_response(
     version: Version,
     head: bool,
 ) -> Response<ProxyBody> {
-    let not_modified = not_modified(request_headers, cached.etag.as_deref());
+    let not_modified = not_modified(request_headers, &cached.headers, cached.etag.as_deref());
     let status = if not_modified {
         StatusCode::NOT_MODIFIED
     } else {
@@ -719,20 +719,43 @@ fn cache_hit_response(
     full_response(status, version, cached.headers, cached.body)
 }
 
-fn not_modified(headers: &HeaderMap, etag: Option<&str>) -> bool {
-    let Some(etag) = etag else {
+fn not_modified(
+    request_headers: &HeaderMap,
+    cached_headers: &HeaderMap,
+    etag: Option<&str>,
+) -> bool {
+    // If-None-Match takes precedence over If-Modified-Since (RFC 9110).
+    if request_headers.contains_key(header::IF_NONE_MATCH) {
+        let Some(etag) = etag else {
+            return false;
+        };
+        let etag = etag.trim_start_matches("W/");
+        return request_headers
+            .get(header::IF_NONE_MATCH)
+            .and_then(|value| value.to_str().ok())
+            .is_some_and(|value| {
+                value
+                    .split(',')
+                    .any(|candidate| candidate.trim().trim_start_matches("W/") == etag)
+            });
+    }
+
+    let Some(if_modified_since) = request_headers
+        .get(header::IF_MODIFIED_SINCE)
+        .and_then(|value| value.to_str().ok())
+        .and_then(|value| httpdate::parse_http_date(value).ok())
+    else {
         return false;
     };
-    let etag = etag.trim_start_matches("W/");
-
-    headers
-        .get(header::IF_NONE_MATCH)
+    let Some(last_modified) = cached_headers
+        .get(header::LAST_MODIFIED)
         .and_then(|value| value.to_str().ok())
-        .is_some_and(|value| {
-            value
-                .split(',')
-                .any(|candidate| candidate.trim().trim_start_matches("W/") == etag)
-        })
+        .and_then(|value| httpdate::parse_http_date(value).ok())
+    else {
+        return false;
+    };
+
+    last_modified <= if_modified_since
 }
 
 fn response_cacheable(headers: &HeaderMap, config: &CacheConfig) -> bool {
@@ -1205,5 +1228,29 @@ mod tests {
                 .to_string(),
             "http://[::1]:9000/x"
         );
+    }
+
+    #[test]
+    fn respects_if_modified_since_and_etag_precedence() {
+        let mut cached = HeaderMap::new();
+        cached.insert(
+            header::LAST_MODIFIED,
+            HeaderValue::from_static("Wed, 21 Oct 2015 07:28:00 GMT"),
+        );
+        let mut request = HeaderMap::new();
+        request.insert(
+            header::IF_MODIFIED_SINCE,
+            HeaderValue::from_static("Wed, 21 Oct 2015 07:28:00 GMT"),
+        );
+        assert!(not_modified(&request, &cached, None));
+
+        request.insert(
+            header::IF_MODIFIED_SINCE,
+            HeaderValue::from_static("Tue, 20 Oct 2015 07:28:00 GMT"),
+        );
+        assert!(!not_modified(&request, &cached, None));
+
+        request.insert(header::IF_NONE_MATCH, HeaderValue::from_static("\"other\""));
+        assert!(!not_modified(&request, &cached, Some("\"cached\"")));
     }
 }

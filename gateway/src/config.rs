@@ -42,6 +42,8 @@ pub struct ServerConfig {
     pub ports: Vec<u16>,
     /// UDP ports for HTTP/3; empty disables the QUIC listener.
     pub http3_ports: Vec<u16>,
+    /// Maximum concurrent bidirectional streams per HTTP/3 connection.
+    pub http3_max_concurrent_streams: u32,
     /// Global in-memory cache limit in bytes.
     pub cache_max_size_bytes: u64,
     /// Maximum concurrently served TCP connections across all listeners.
@@ -68,6 +70,7 @@ impl Default for ServerConfig {
             bind: "0.0.0.0".to_string(),
             ports: vec![80, 443],
             http3_ports: Vec::new(),
+            http3_max_concurrent_streams: 100,
             cache_max_size_bytes: 16 * 1024 * 1024,
             max_connections: 4096,
             max_header_bytes: 32 * 1024,
@@ -151,6 +154,12 @@ impl Config {
                 .filter_map(|item| item.trim().parse().ok())
                 .collect();
         }
+        if let Ok(raw) = std::env::var("GATEWAY_HTTP3_MAX_CONCURRENT_STREAMS")
+            && let Ok(value) = raw.trim().parse::<u32>()
+            && value > 0
+        {
+            config.server.http3_max_concurrent_streams = value;
+        }
         if let Ok(raw) = std::env::var("GATEWAY_CACHE_MAX_SIZE")
             && let Ok(bytes) = raw.parse::<u64>()
             && bytes > 0
@@ -182,6 +191,8 @@ impl Config {
 
         // Keep values in a range the server/builder can actually use.
         config.server.max_connections = config.server.max_connections.max(1);
+        config.server.http3_max_concurrent_streams =
+            config.server.http3_max_concurrent_streams.clamp(1, 1_000);
         config.server.max_header_bytes = config.server.max_header_bytes.max(8192);
         config.server.max_request_body_bytes = config.server.max_request_body_bytes.max(1024);
         config.server.max_response_body_bytes = config.server.max_response_body_bytes.max(1024);

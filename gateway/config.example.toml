@@ -22,6 +22,8 @@ bind = "0.0.0.0"
 ports = [80, 443]
 # HTTP/3 over QUIC; empty disables the UDP listener.
 # http3_ports = [443]
+# HTTP/3 concurrent bidirectional streams per connection (default 100).
+# http3_max_concurrent_streams = 100
 # Global in-memory cache limit (default 16 MiB).
 # cache_max_size_bytes = 16777216
 # Concurrent TCP connections across all listeners (default 4096).

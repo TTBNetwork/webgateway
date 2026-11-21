@@ -15,6 +15,7 @@ h3-quinn = "0.0.10"
 http = "1.1.0"
 http-body = "1.1"
 http-body-util = "0.1.5"
+httpdate = "1.0"
 hyper = { version = "1.8.1", features = ["http1", "http2", "server", "client"] }
 hyper-rustls = { version = "0.27.10", default-features = false, features = ["http1", "http2", "webpki-roots", "ring", "tls12"] }
 hyper-util = { version = "0.1.20", features = [

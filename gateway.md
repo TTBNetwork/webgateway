@@ -70,6 +70,7 @@ max_tracked_ips = 100000
 | `GATEWAY_NODE_NAME` / `GATEWAY_NODE_COUNTRY` / `GATEWAY_NODE_CITY` / `GATEWAY_NODE_ADDRESS` | 节点信息 |
 | `GATEWAY_PORTS` | 逗号分隔的 TCP 监听端口 |
 | `GATEWAY_HTTP3_PORTS` | 逗号分隔的 UDP 端口（HTTP/3） |
+| `GATEWAY_HTTP3_MAX_CONCURRENT_STREAMS` | 每个 HTTP/3 连接的最大并发 bidi stream（默认 100） |
 | `GATEWAY_UPSTREAM_CA_FILE` | https 后端的额外 CA PEM |
 | `GATEWAY_UPSTREAM_INSECURE` | 全局兜底：`true` 时跳过所有上游证书校验；生产优先用站点级 `upstream_tls` |
 | `GATEWAY_BIND` | 监听地址 |
@@ -87,7 +88,8 @@ max_tracked_ips = 100000
 ### 2.1 资源限制
 
 - **连接数**：TCP 监听共享一个 `max_connections` 信号量；超出时新连接被直接关闭并 WARN，
-  不进入 TLS/HTTP 处理。HTTP/3 连接暂未计入。
+  不进入 TLS/HTTP 处理。HTTP/3 连接使用独立的 `max_connections` 信号量；每个 h3 连接通过
+  QUIC transport 限制并发 bidi stream。
 - **Header**：HTTP/1 使用 hyper `max_buf_size`，HTTP/2 使用 `max_header_list_size`；
   超限由 hyper 返回 431 或断开；HTTP/3 在解析请求头后按同样的 `max_header_bytes` 返回 431。
 - **请求体**：有 `Content-Length` 且超过 `max_request_body_bytes` 时，网关在转发前返回
@@ -266,6 +268,8 @@ max_tracked_ips = 100000
 ### 5.3 HTTP/3（QUIC）
 
 - 需要显式开启：`[server].http3_ports` 或 `GATEWAY_HTTP3_PORTS`（UDP）；为空不启动。
+- 连接数由独立 `max_connections` 信号量控制；每连接的并发 bidi stream 由
+  `http3_max_concurrent_streams`（默认 100）通过 QUIC transport 限制。
 - QUIC 使用 TLS 1.3 + ALPN `h3`，证书复用 TLS 的 SNI 存储（含默认自签证书）。
 - 请求体完整缓冲后，通过上游 client（HTTP/1.1）转发；**响应体从上游流式转发**，
   不再整体 collect，大文件下载的内存占用为单个 chunk。
@@ -308,7 +312,7 @@ max_tracked_ips = 100000
   HEAD + `If-None-Match` 同样可返回 304。
 - 配置同步（NOTIFY）时清空缓存。
 - 限制：不缓存 POST、不支持 `stale-while-revalidate`/single-flight、无持久化/多级缓存；
-  `If-Modified-Since` 尚未处理。
+  `If-Modified-Since` 已支持（无 `If-None-Match` 时按缓存响应的 `Last-Modified` 返回 304）。
 
 ### 5.5 上游健康检查
 

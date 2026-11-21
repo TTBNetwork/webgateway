@@ -586,8 +586,8 @@
 - 新增轻量 `/api/qps`，按浏览器 5s 墙钟边界（:02.5、:07.5…）轮询最近 5 分钟，
   前端固定补成 60 个槽位。
 
-### 网关：WS/CONNECT 关闭日志与 gRPC trailer（2026-11-20）
-- WebSocket 和 CONNECT 隧道关闭时追加一行访问记录，标记 `x-webgateway-tunnel-close: 1`，
-  并在 headers 中记录总字节、上行/下行字节和持续时间；关闭行 body_length 为空，不污染流量统计。
-- gRPC 上游 trailer 中的 `grpc-status` / `grpc-message` 合并进访问日志 headers。
-- 文档同步 gateway.md；本次仅代码与测试，未部署目标机。
+### 网关：If-Modified-Since、HTTP/3 连接与并发流限制（2026-11-20）
+- 缓存命中现在支持 `If-Modified-Since`（无 `If-None-Match` 时按缓存的 `Last-Modified` 返回 304）。
+- HTTP/3 连接使用独立 `max_connections` 信号量；每个连接通过 QUIC transport 限制
+  `http3_max_concurrent_streams`（默认 100，环境变量可覆盖）。
+- 文档/示例配置同步；本次仍只提交代码，未部署目标机。

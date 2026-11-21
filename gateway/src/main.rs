@@ -135,6 +135,8 @@ async fn run() -> anyhow::Result<()> {
             &config.server.http3_ports,
             state.clone(),
             listeners.inflight(),
+            config.server.max_connections,
+            config.server.http3_max_concurrent_streams,
         )?)
     };
 
