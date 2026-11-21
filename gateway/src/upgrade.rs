@@ -3,7 +3,12 @@
 use std::{
     convert::Infallible,
     net::SocketAddr,
-    sync::Arc,
+    pin::Pin,
+    sync::{
+        Arc,
+        atomic::{AtomicU64, Ordering},
+    },
+    task::{Context as TaskContext, Poll},
     time::{Duration, Instant},
 };
 
@@ -567,19 +572,73 @@ fn log_tunnel_close(
     proxy::log_event(state, &request, status, &headers, None, Version::HTTP_11);
 }
 
-async fn relay<A, B>(mut client: A, mut upstream: B) -> (u64, u64, Duration)
+struct CountingIo<S> {
+    inner: S,
+    read: Arc<AtomicU64>,
+    write: Arc<AtomicU64>,
+}
+
+impl<S: tokio::io::AsyncRead + Unpin> tokio::io::AsyncRead for CountingIo<S> {
+    fn poll_read(
+        self: Pin<&mut Self>,
+        cx: &mut TaskContext<'_>,
+        buf: &mut tokio::io::ReadBuf<'_>,
+    ) -> Poll<std::io::Result<()>> {
+        let this = self.get_mut();
+        let before = buf.filled().len();
+        let poll = Pin::new(&mut this.inner).poll_read(cx, buf);
+        if let Poll::Ready(Ok(())) = &poll {
+            this.read
+                .fetch_add((buf.filled().len() - before) as u64, Ordering::Relaxed);
+        }
+        poll
+    }
+}
+
+impl<S: tokio::io::AsyncWrite + Unpin> tokio::io::AsyncWrite for CountingIo<S> {
+    fn poll_write(
+        self: Pin<&mut Self>,
+        cx: &mut TaskContext<'_>,
+        buf: &[u8],
+    ) -> Poll<std::io::Result<usize>> {
+        let this = self.get_mut();
+        let poll = Pin::new(&mut this.inner).poll_write(cx, buf);
+        if let Poll::Ready(Ok(written)) = &poll {
+            this.write.fetch_add(*written as u64, Ordering::Relaxed);
+        }
+        poll
+    }
+
+    fn poll_flush(self: Pin<&mut Self>, cx: &mut TaskContext<'_>) -> Poll<std::io::Result<()>> {
+        Pin::new(&mut self.get_mut().inner).poll_flush(cx)
+    }
+
+    fn poll_shutdown(self: Pin<&mut Self>, cx: &mut TaskContext<'_>) -> Poll<std::io::Result<()>> {
+        Pin::new(&mut self.get_mut().inner).poll_shutdown(cx)
+    }
+}
+
+async fn relay<A, B>(client: A, mut upstream: B) -> (u64, u64, Duration)
 where
     A: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin,
     B: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin,
 {
     let started = Instant::now();
-    match copy_bidirectional(&mut client, &mut upstream).await {
-        Ok((upstream_bytes, client_bytes)) => (upstream_bytes, client_bytes, started.elapsed()),
-        Err(error) => {
-            event!(Level::DEBUG, %error, "upgraded connection closed with an error");
-            (0, 0, started.elapsed())
-        }
+    let read = Arc::new(AtomicU64::new(0));
+    let write = Arc::new(AtomicU64::new(0));
+    let mut client = CountingIo {
+        inner: client,
+        read: read.clone(),
+        write: write.clone(),
+    };
+    if let Err(error) = copy_bidirectional(&mut client, &mut upstream).await {
+        event!(Level::DEBUG, %error, "upgraded connection closed with an error");
     }
+    (
+        read.load(Ordering::Relaxed),
+        write.load(Ordering::Relaxed),
+        started.elapsed(),
+    )
 }
 
 #[cfg(test)]
