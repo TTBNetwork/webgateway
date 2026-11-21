@@ -1,6 +1,11 @@
 //! WebSocket upgrade proxying and HTTP CONNECT tunnels.
 
-use std::{convert::Infallible, net::SocketAddr, sync::Arc, time::Duration};
+use std::{
+    convert::Infallible,
+    net::SocketAddr,
+    sync::Arc,
+    time::{Duration, Instant},
+};
 
 use http::{
     HeaderMap, HeaderName, HeaderValue, Request, Response, StatusCode, Uri, Version, header,
@@ -274,7 +279,14 @@ pub async fn handle_websocket(
         Version::HTTP_11,
     );
 
-    spawn_upgrade_bridge(client_upgrade, upstream_upgrade, sender);
+    spawn_upgrade_bridge(
+        client_upgrade,
+        upstream_upgrade,
+        sender,
+        state.clone(),
+        request_log.clone(),
+        status,
+    );
 
     let mut response = Response::new(empty_body());
     *response.status_mut() = status;
@@ -389,7 +401,7 @@ pub async fn handle_connect(
         Version::HTTP_11,
     );
 
-    spawn_stream_bridge(client_upgrade, stream);
+    spawn_stream_bridge(client_upgrade, stream, state.clone(), request_log.clone());
 
     Response::builder()
         .status(StatusCode::OK)
@@ -459,35 +471,114 @@ fn spawn_upgrade_bridge(
     client: OnUpgrade,
     upstream: OnUpgrade,
     sender: hyper::client::conn::http1::SendRequest<Empty<Bytes>>,
+    state: Arc<AppState>,
+    request: access::RequestLog,
+    status: StatusCode,
 ) {
     tokio::spawn(async move {
         // Keep the request channel alive until the upgraded tunnel ends.
         let _sender = sender;
         match tokio::try_join!(client, upstream) {
             Ok((client, upstream)) => {
-                relay(TokioIo::new(client), TokioIo::new(upstream)).await;
+                let (upstream_bytes, client_bytes, elapsed) =
+                    relay(TokioIo::new(client), TokioIo::new(upstream)).await;
+                log_tunnel_close(
+                    &state,
+                    &request,
+                    status,
+                    upstream_bytes,
+                    client_bytes,
+                    elapsed,
+                );
             }
             Err(error) => event!(Level::DEBUG, %error, "websocket upgrade failed"),
         }
     });
 }
 
-fn spawn_stream_bridge(client: OnUpgrade, upstream: TcpStream) {
+fn spawn_stream_bridge(
+    client: OnUpgrade,
+    upstream: TcpStream,
+    state: Arc<AppState>,
+    request: access::RequestLog,
+) {
     tokio::spawn(async move {
         match client.await {
-            Ok(client) => relay(TokioIo::new(client), upstream).await,
+            Ok(client) => {
+                let (upstream_bytes, client_bytes, elapsed) =
+                    relay(TokioIo::new(client), upstream).await;
+                log_tunnel_close(
+                    &state,
+                    &request,
+                    StatusCode::OK,
+                    upstream_bytes,
+                    client_bytes,
+                    elapsed,
+                );
+            }
             Err(error) => event!(Level::DEBUG, %error, "CONNECT upgrade failed"),
         }
     });
 }
 
-async fn relay<A, B>(mut client: A, mut upstream: B)
+/// Write a second, clearly-marked access row when a WS/CONNECT tunnel closes.
+/// The handshake row is written immediately; this row carries the byte counts
+/// and duration in response headers so the HTTP body-size statistics are not
+/// polluted by tunnel traffic.
+fn log_tunnel_close(
+    state: &AppState,
+    request: &access::RequestLog,
+    status: StatusCode,
+    upstream_bytes: u64,
+    client_bytes: u64,
+    elapsed: Duration,
+) {
+    let mut request = request.clone();
+    request.id = access::next_id();
+
+    let mut headers = HeaderMap::new();
+    headers.insert(
+        HeaderName::from_static("x-webgateway-tunnel-close"),
+        HeaderValue::from_static("1"),
+    );
+    let total = upstream_bytes.saturating_add(client_bytes);
+    if let Ok(value) = HeaderValue::from_str(&total.to_string()) {
+        headers.insert(HeaderName::from_static("x-webgateway-tunnel-bytes"), value);
+    }
+    if let Ok(value) = HeaderValue::from_str(&upstream_bytes.to_string()) {
+        headers.insert(
+            HeaderName::from_static("x-webgateway-tunnel-up-bytes"),
+            value,
+        );
+    }
+    if let Ok(value) = HeaderValue::from_str(&client_bytes.to_string()) {
+        headers.insert(
+            HeaderName::from_static("x-webgateway-tunnel-down-bytes"),
+            value,
+        );
+    }
+    if let Ok(value) = HeaderValue::from_str(&elapsed.as_millis().to_string()) {
+        headers.insert(
+            HeaderName::from_static("x-webgateway-tunnel-duration-ms"),
+            value,
+        );
+    }
+
+    proxy::log_event(state, &request, status, &headers, None, Version::HTTP_11);
+}
+
+async fn relay<A, B>(mut client: A, mut upstream: B) -> (u64, u64, Duration)
 where
     A: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin,
     B: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin,
 {
-    if let Err(error) = copy_bidirectional(&mut client, &mut upstream).await {
-        event!(Level::DEBUG, %error, "upgraded connection closed with an error");
+    let started = Instant::now();
+    match copy_bidirectional(&mut client, &mut upstream).await {
+        Ok((upstream_bytes, client_bytes)) => (upstream_bytes, client_bytes, started.elapsed()),
+        Err(error) => {
+            event!(Level::DEBUG, %error, "upgraded connection closed with an error");
+            (0, 0, started.elapsed())
+        }
     }
 }
 

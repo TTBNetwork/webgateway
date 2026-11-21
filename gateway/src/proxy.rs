@@ -920,6 +920,18 @@ impl Body for LoggedBody {
                 if let Some(data) = frame.data_ref() {
                     this.bytes = this.bytes.saturating_add(data.len() as u64);
                 }
+                if let Some(trailers) = frame.trailers_ref() {
+                    // Preserve gRPC status for the access log; trailers are
+                    // normally invisible once the body is forwarded.
+                    if let Some(value) = trailers.get("grpc-status") {
+                        this.headers
+                            .insert(HeaderName::from_static("grpc-status"), value.clone());
+                    }
+                    if let Some(value) = trailers.get("grpc-message") {
+                        this.headers
+                            .insert(HeaderName::from_static("grpc-message"), value.clone());
+                    }
+                }
                 Poll::Ready(Some(Ok(frame)))
             }
             Poll::Ready(Some(Err(error))) => {

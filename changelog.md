@@ -586,13 +586,8 @@
 - 新增轻量 `/api/qps`，按浏览器 5s 墙钟边界（:02.5、:07.5…）轮询最近 5 分钟，
   前端固定补成 60 个槽位。
 
-### 网关：站点级上游 TLS、请求体日志与 HTTP/3 header 限制（2026-11-20）
-- 新增站点级 `websites.config.upstream_tls`：`ca_file` / `insecure`，按配置缓存独立 client；
-  普通代理、gRPC、WebSocket、HTTP/3 和健康探测都使用对应站点的 TLS 策略。
-- 目标机把 Proxmox 8006 切到站点级 `insecure:true`，删除全局 `GATEWAY_UPSTREAM_INSECURE`，
-  PVE 仍返回 200。
-- chunked/无 Content-Length 请求体现在按上游实际消费字节写入访问日志，不再固定 0。
-- HTTP/3 请求头按 `max_header_bytes` 检查，超限返回 431。
-- 健康检查默认启用（显式 enabled:false 仍可关闭），与面板默认一致。
-- 验证：gateway 53 tests、clippy/fmt 通过；目标 PVE 200、普通站点 200；
-  12,345 字节 chunked POST 访问日志 `request_size=12345`。
+### 网关：WS/CONNECT 关闭日志与 gRPC trailer（2026-11-20）
+- WebSocket 和 CONNECT 隧道关闭时追加一行访问记录，标记 `x-webgateway-tunnel-close: 1`，
+  并在 headers 中记录总字节、上行/下行字节和持续时间；关闭行 body_length 为空，不污染流量统计。
+- gRPC 上游 trailer 中的 `grpc-status` / `grpc-message` 合并进访问日志 headers。
+- 文档同步 gateway.md；本次仅代码与测试，未部署目标机。

@@ -230,7 +230,11 @@ max_tracked_ips = 100000
   （`get_request_ip` 解析后的）、`website_id`、status、响应字节。
 - 响应字节现在按**实际流式传输**计数：chunked/未知长度响应在 body 结束（或客户端断开）时写日志，
   不再是 NULL；请求字节对 chunked/未知长度请求也在 body 被上游消费完后按实际字节写入。
-- 仍未记录：WebSocket / CONNECT 升级后的双向字节与关闭时长；重复请求头会被 JSON 对象覆盖。
+- WebSocket / CONNECT 在握手行之外，隧道关闭时再写一行带 `x-webgateway-tunnel-close: 1` 的访问记录，
+  headers 中包含总字节、上行/下行字节和 `x-webgateway-tunnel-duration-ms`；该行 body_length 为空，
+  不污染 HTTP body 流量统计。
+- gRPC 响应的 `grpc-status` / `grpc-message` trailer 会合并进响应的访问日志 headers。
+- 仍未记录：重复请求头会被 JSON 对象覆盖。
 - 网关自己生成的 404/502/504 也会记录（body_length 为固定错误文本长度）。
 - 后台 writer 关闭时先 drain 队列再 flush；统计聚合由主控 stats 任务负责（见 database.md 5.4）；
   原始日志保留 7 天。
@@ -241,18 +245,20 @@ max_tracked_ips = 100000
   - 服务端使用 `serve_connection_with_upgrades`；
   - 到上游做原始 HTTP/1.1 握手，客户端连接启用 `.with_upgrades()`；
   - 上游返回 101 后双向桥接；非 101 按普通响应回传；
-  - 访问日志记录 101（升级时的请求/响应头）；之后的双向字节没有单独的关闭记录。
+  - 访问日志记录 101（升级时的请求/响应头），隧道关闭时追加一行关闭记录，
+    headers 中包含 `x-webgateway-tunnel-close`、总/上行/下行字节和持续时间。
 - **CONNECT**：
   - authority 的 host 必须命中已配置站点，否则 403；
   - authority 的端口必须在 `[server].connect_ports`（默认 `[443, 80]`）中，否则 403；
     空列表表示拒绝全部 CONNECT；
   - 通过后连接 `host:port` 并返回 200，桥接原始 TCP；不是 TLS MITM，只做透传；
   - 访问日志覆盖全部结果：400（authority 缺失/非法）、403（端口/站点不允许）、
-    502/504（上游失败/超时）、200（隧道建立），CONNECT 行记录 authority、状态与 website_id。
+    502/504（上游失败/超时）、200（隧道建立），CONNECT 行记录 authority、状态与 website_id；
+    隧道关闭时同样追加一行带字节/时长 headers 的关闭记录。
 - 上游支持 `http://` 与 `https://`：https 后端先用同一 TLS 配置（webpki 根 + 可选 ca_file）握手，
   ALPN 固定 `http/1.1`；后端 URL 的 base path 会拼到客户端 path 前（`/mc` + `/socket.io/...`）。
-- 限制：HTTP/2 extended CONNECT / WebSocket over h2 未实现；升级连接不计字节数（body_length 0）；
-  无 mTLS / SNI 覆盖。
+- 限制：HTTP/2 extended CONNECT / WebSocket over h2 未实现；升级连接本身不记录 body_length，
+  关闭行的字节数在 headers 中；无 mTLS / SNI 覆盖。
 - 已用 MCSManager v10.22.1（daemon 4.19.3）实测：明文 ws、wss（测试 CA）、带 base path 的 wss `/mc`
   三种场景均通过；升级 101、Socket.IO 握手、daemon key 鉴权、`info/overview` 与 engine.io ping/pong 正常。
   详见 `e2e-realtime.md`。
